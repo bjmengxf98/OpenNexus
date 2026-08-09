@@ -1,0 +1,91 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Runtime data and user files
+data/*
+!data/README.md
+temp/
+downloads/
+*.log
+*.stderr.log
+*.stdout.log
+*.bak
+*.bak.*
+*.backup
+*.backup*
+*.broken
+
+# Frontend dependencies and build artifacts
+node_modules/
+wechat-claude-code-main/node_modules/
+dist/
+
+# IDE and OS
+.idea/
+.vscode/
+.claude/
+.DS_Store
+Thumbs.db
+
+# Local WeChat bridge state
+wechat-claude-code-main/.wechat-claude-code/
+qrcode.png
+
+# Private/internal documentation and generated media
+/demo_screenshots/
+/*.docx
+/*.mp4
+/*.mp3
+/*.webm
+/architecture.html
+/dashboard_*.html
+/slides*.html
+/app_local*.txt
+/WPS附件上传问题咨询.txt
+/docs/*
+!/docs/用户帮助.md
+!/docs/WorkBuddy-MCP接入指南.md
+!/docs/User-Guide-EN.md
+!/docs/WorkBuddy-MCP-Guide-EN.md
+/*.md
+!/README.md
+!/README_EN.md
+!/CONTRIBUTING.md
+!/CONTRIBUTING_EN.md
+!/SECURITY.md
+!/SECURITY_EN.md
+!/THIRD_PARTY_NOTICES.md
+!/CODE_OF_CONDUCT.md
+!/AUTHORS.md
+!/CHANGELOG.md
+!/LAUNCH_KIT.md
+!/SUPPORT.md
+
+# Internal presentation/article generation utilities
+/compose_*.py
+/generate_narration.py
+/screenshot_slides.py
+/speedup_video.py
+/demo_record.py
+/gen_comparison_doc.js
+/scripts/gen_article.js
+
+# Abandoned local prototype (truncated and not imported by the application)
+/core/document_generator_new.py
+
+# Local credential/API diagnostic scripts (may read real tokens from data/app.db)
+/probe_wps_api.py
+/test_sheets_optype.py
+/test_sign.py
+/test_upload_debug.py
+/test_wps.py
+/test_wps_api.py
