@@ -1,0 +1,30 @@
+name: Feature request / 功能建议
+description: Propose a reusable improvement / 提出具有通用价值的改进
+title: "[Feature] "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: scenario
+    attributes:
+      label: Scenario / 使用场景
+      description: Describe the real problem, without confidential business details. / 请描述真实问题，但不要包含单位机密。
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution / 建议方案
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives / 其他方案
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope / 适用范围
+      options:
+        - label: This can benefit users beyond my organization. / 该功能不仅适用于我所在单位。
+          required: true

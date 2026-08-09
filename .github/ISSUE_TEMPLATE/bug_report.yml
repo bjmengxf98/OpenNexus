@@ -1,0 +1,60 @@
+name: Bug report / 缺陷报告
+description: Report a reproducible problem without private data / 报告可复现且不含隐私数据的问题
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for helping improve OpenNexus. Remove all credentials, real business data, names, and internal screenshots before submitting.
+
+        感谢帮助改进 OpenNexus。提交前请删除所有密钥、真实业务数据、姓名和内部截图。
+  - type: input
+    id: version
+    attributes:
+      label: Version / 版本
+      placeholder: "1.0.0 or commit ID / 1.0.0 或提交编号"
+    validations:
+      required: true
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Environment / 环境
+      options:
+        - Windows
+        - Linux
+        - macOS
+        - Mobile PWA / 手机 PWA
+        - Other / 其他
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Problem / 问题描述
+      description: What happened and what did you expect? / 实际发生了什么，预期是什么？
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps / 复现步骤
+      placeholder: "1. ...\n2. ...\n3. ..."
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs / 已脱敏日志
+      description: Do not include tokens, cookies, user data, or internal URLs. / 不得包含令牌、Cookie、用户数据和内部地址。
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety checklist / 安全确认
+      options:
+        - label: I removed all credentials and private data. / 我已删除所有密钥和隐私数据。
+          required: true
+        - label: I reproduced this on the latest public version. / 我已在最新公开版本复现。
+          required: true
