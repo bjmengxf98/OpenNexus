@@ -18,11 +18,26 @@ WPS_USER_URL = "https://openapi.wps.cn/oauthapi/v3/user/info"
 _ENV_APP_ID = os.environ.get("WPS_APP_ID", "").strip()
 _ENV_APP_SECRET = os.environ.get("WPS_APP_SECRET", "").strip()
 
-REDIRECT_URI = os.environ.get("WPS_REDIRECT_URI", "http://localhost:8000/oauth/callback")
+_LOCAL_REDIRECT_URI = "http://localhost:8000/oauth/callback"
+# 保留该常量供旧代码导入；授权和换 token 必须调用下面的动态函数。
+REDIRECT_URI = os.environ.get("WPS_REDIRECT_URI", "").strip() or _LOCAL_REDIRECT_URI
 
 
 def get_redirect_uri() -> str:
-    return os.environ.get("WPS_REDIRECT_URI", "http://localhost:8000/oauth/callback")
+    """Return the single canonical OAuth callback used by auth and token exchange.
+
+    Production should set ``WPS_REDIRECT_URI`` explicitly. ``APP_BASE_URL`` is a
+    safe fallback for deployments which only configure their public base URL.
+    """
+    explicit = os.environ.get("WPS_REDIRECT_URI", "").strip()
+    if explicit:
+        return explicit
+
+    app_base_url = os.environ.get("APP_BASE_URL", "").strip().rstrip("/")
+    if app_base_url:
+        return f"{app_base_url}/oauth/callback"
+
+    return _LOCAL_REDIRECT_URI
 
 
 def get_app_id() -> str:
@@ -59,10 +74,12 @@ _state_store: dict[str, int] = {}
 def build_auth_url(user_id: int) -> str:
     state = secrets.token_urlsafe(16)
     _state_store[state] = user_id
+    redirect_uri = get_redirect_uri()
+    logger.info("[WPS OAUTH] authorization redirect_uri=%s", redirect_uri)
     params = {
         "response_type": "code",
         "client_id": get_app_id(),
-        "redirect_uri": get_redirect_uri(),
+        "redirect_uri": redirect_uri,
         "scope": SCOPE,
         "state": state,
     }

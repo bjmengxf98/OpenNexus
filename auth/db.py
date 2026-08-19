@@ -2,6 +2,7 @@
 数据库模块 - SQLite用户管理
 """
 import sqlite3
+import json
 import bcrypt
 import secrets
 import hashlib
@@ -139,6 +140,12 @@ def init_db():
                 conn.execute(f"ALTER TABLE user_llm_keys ADD COLUMN {col} TEXT")
             except Exception:
                 pass
+        # 迁移：模型能力与高级请求参数（JSON，兼容未来继续扩展）
+        for col in ("advanced_config TEXT DEFAULT '{}'", "image_advanced_config TEXT DEFAULT '{}'"):
+            try:
+                conn.execute(f"ALTER TABLE user_llm_keys ADD COLUMN {col}")
+            except Exception:
+                pass
         # 迁移：用户活跃表格选择
         try:
             conn.execute("ALTER TABLE users ADD COLUMN active_file_ids TEXT DEFAULT ''")
@@ -196,6 +203,11 @@ def init_db():
             FOREIGN KEY(user_id) REFERENCES users(id)
         )
         """)
+        for table in ("user_provider_configs", "user_image_provider_configs"):
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN advanced_config TEXT DEFAULT '{{}}'")
+            except Exception:
+                pass
         # 迁移：知识库分类字段
         try:
             conn.execute("ALTER TABLE org_knowledge ADD COLUMN category TEXT DEFAULT '规章制度'")
@@ -547,49 +559,100 @@ def get_wps_user_id_by_name(name: str) -> str:
 
 # ── LLM Key（多提供商配置记忆）────────────────────────────
 
-def save_llm_key(user_id, provider, api_key, base_url, model):
+def _decode_advanced_config(raw) -> dict:
+    if isinstance(raw, dict):
+        return raw
+    try:
+        value = json.loads(raw or "{}")
+        return value if isinstance(value, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+def save_llm_key(user_id, provider, api_key, base_url, model, advanced_config=None):
     """保存主模型配置（同时保存到当前配置和提供商配置表）"""
     with get_conn() as conn:
         # 更新当前使用的配置
         conn.execute("""
-            INSERT INTO user_llm_keys (user_id, provider, api_key, base_url, model)
-            VALUES (?,?,?,?,?)
+            INSERT INTO user_llm_keys (user_id, provider, api_key, base_url, model, advanced_config)
+            VALUES (?,?,?,?,?,?)
             ON CONFLICT(user_id) DO UPDATE SET
                 provider=excluded.provider,
                 api_key=excluded.api_key,
                 base_url=excluded.base_url,
-                model=excluded.model
-        """, (user_id, provider, api_key, base_url, model))
+                model=excluded.model,
+                advanced_config=COALESCE(excluded.advanced_config, user_llm_keys.advanced_config)
+        """, (user_id, provider, api_key, base_url, model,
+              json.dumps(advanced_config, ensure_ascii=False) if advanced_config is not None else None))
 
         # 同时保存到提供商配置表（记忆功能）
         conn.execute("""
-            INSERT INTO user_provider_configs (user_id, provider, api_key, base_url, model)
-            VALUES (?,?,?,?,?)
+            INSERT INTO user_provider_configs (user_id, provider, api_key, base_url, model, advanced_config)
+            VALUES (?,?,?,?,?,?)
             ON CONFLICT(user_id, provider) DO UPDATE SET
                 api_key=excluded.api_key,
                 base_url=excluded.base_url,
-                model=excluded.model
-        """, (user_id, provider, api_key, base_url, model))
+                model=excluded.model,
+                advanced_config=COALESCE(excluded.advanced_config, user_provider_configs.advanced_config)
+        """, (user_id, provider, api_key, base_url, model,
+              json.dumps(advanced_config, ensure_ascii=False) if advanced_config is not None else None))
 
 
 def get_llm_key(user_id):
     """获取当前使用的主模型配置"""
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM user_llm_keys WHERE user_id=?", (user_id,)).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        result = dict(row)
+        result["advanced"] = _decode_advanced_config(result.get("advanced_config"))
+        return result
 
 
 def get_provider_config(user_id, provider):
     """获取指定提供商的已保存配置"""
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT api_key, base_url, model FROM user_provider_configs WHERE user_id=? AND provider=?",
+            "SELECT api_key, base_url, model, advanced_config FROM user_provider_configs WHERE user_id=? AND provider=?",
             (user_id, provider)
         ).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        result = dict(row)
+        result["advanced"] = _decode_advanced_config(result.get("advanced_config"))
+        return result
 
 
-def save_image_llm_key(user_id, provider, api_key, base_url, model):
+def list_custom_provider_configs(user_id, image: bool = False):
+    """列出用户保存的自定义 OpenAI 兼容模型档案（不返回密钥）。"""
+    table = "user_image_provider_configs" if image else "user_provider_configs"
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"""SELECT provider, base_url, model, advanced_config
+                FROM {table}
+                WHERE user_id=? AND provider LIKE 'custom_openai:%'
+                ORDER BY id DESC""",
+            (user_id,),
+        ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["advanced"] = _decode_advanced_config(item.pop("advanced_config", "{}"))
+            result.append(item)
+        return result
+
+
+def delete_custom_provider_config(user_id, provider, image: bool = False):
+    """删除指定自定义模型档案；调用方负责阻止删除当前正在使用的档案。"""
+    table = "user_image_provider_configs" if image else "user_provider_configs"
+    with get_conn() as conn:
+        conn.execute(
+            f"DELETE FROM {table} WHERE user_id=? AND provider=? AND provider LIKE 'custom_openai:%'",
+            (user_id, provider),
+        )
+
+
+def save_image_llm_key(user_id, provider, api_key, base_url, model, advanced_config=None):
     """保存图片模型配置（同时保存到当前配置和提供商配置表）"""
     with get_conn() as conn:
         # 确保 user_llm_keys 记录存在
@@ -598,26 +661,35 @@ def save_image_llm_key(user_id, provider, api_key, base_url, model):
         )
         # 更新当前使用的图片模型配置
         conn.execute(
-            "UPDATE user_llm_keys SET image_provider=?, image_api_key=?, image_base_url=?, image_model=? WHERE user_id=?",
-            (provider, api_key, base_url, model, user_id)
+            """UPDATE user_llm_keys
+               SET image_provider=?, image_api_key=?, image_base_url=?, image_model=?,
+                   image_advanced_config=COALESCE(?, image_advanced_config)
+               WHERE user_id=?""",
+            (provider, api_key, base_url, model,
+             json.dumps(advanced_config, ensure_ascii=False) if advanced_config is not None else None,
+             user_id)
         )
 
         # 同时保存到图片提供商配置表（记忆功能）
         conn.execute("""
-            INSERT INTO user_image_provider_configs (user_id, provider, api_key, base_url, model)
-            VALUES (?,?,?,?,?)
+            INSERT INTO user_image_provider_configs (user_id, provider, api_key, base_url, model, advanced_config)
+            VALUES (?,?,?,?,?,?)
             ON CONFLICT(user_id, provider) DO UPDATE SET
                 api_key=excluded.api_key,
                 base_url=excluded.base_url,
-                model=excluded.model
-        """, (user_id, provider, api_key, base_url, model))
+                model=excluded.model,
+                advanced_config=COALESCE(excluded.advanced_config, user_image_provider_configs.advanced_config)
+        """, (user_id, provider, api_key, base_url, model,
+              json.dumps(advanced_config, ensure_ascii=False) if advanced_config is not None else None))
 
 
 def get_image_llm_key(user_id):
     """获取当前使用的图片模型配置"""
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT image_provider, image_api_key, image_base_url, image_model FROM user_llm_keys WHERE user_id=?",
+            """SELECT image_provider, image_api_key, image_base_url, image_model,
+                      image_advanced_config
+               FROM user_llm_keys WHERE user_id=?""",
             (user_id,)
         ).fetchone()
         if not row or not row["image_api_key"]:
@@ -627,6 +699,7 @@ def get_image_llm_key(user_id):
             "api_key": row["image_api_key"],
             "base_url": row["image_base_url"],
             "model": row["image_model"],
+            "advanced": _decode_advanced_config(row["image_advanced_config"]),
         }
 
 
@@ -634,10 +707,14 @@ def get_image_provider_config(user_id, provider):
     """获取指定提供商的已保存图片模型配置"""
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT api_key, base_url, model FROM user_image_provider_configs WHERE user_id=? AND provider=?",
+            "SELECT api_key, base_url, model, advanced_config FROM user_image_provider_configs WHERE user_id=? AND provider=?",
             (user_id, provider)
         ).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        result = dict(row)
+        result["advanced"] = _decode_advanced_config(result.get("advanced_config"))
+        return result
 
 
 # ── 反馈 ───────────────────────────────────────────────────
