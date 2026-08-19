@@ -8,7 +8,8 @@ from pathlib import Path
 
 
 def parse_file(file_path: str, filename: str, api_key: str = None,
-               base_url: str = None, model: str = None) -> str:
+               base_url: str = None, model: str = None,
+               max_output_tokens: int = None) -> str:
     """
     解析文件，返回文本内容。
     图片类型需要多模态LLM，需传入api_key。
@@ -22,11 +23,11 @@ def parse_file(file_path: str, filename: str, api_key: str = None,
     elif suffix in (".xlsx", ".xls"):
         return _parse_excel(file_path)
     elif suffix == ".pdf":
-        return _parse_pdf(file_path, api_key, base_url, model)
+        return _parse_pdf(file_path, api_key, base_url, model, max_output_tokens)
     elif suffix in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"):
         if not api_key:
             return "[图片文件需要配置大模型API Key才能识别]"
-        return _parse_image(file_path, api_key, base_url, model)
+        return _parse_image(file_path, api_key, base_url, model, max_output_tokens)
     else:
         return f"[不支持的文件类型: {suffix}]"
 
@@ -81,7 +82,8 @@ def _parse_excel(file_path: str) -> str:
 
 
 def _parse_pdf(file_path: str, api_key: str = None,
-               base_url: str = None, model: str = None) -> str:
+               base_url: str = None, model: str = None,
+               max_output_tokens: int = None) -> str:
     try:
         import fitz  # pymupdf
         doc = fitz.open(file_path)
@@ -98,14 +100,15 @@ def _parse_pdf(file_path: str, api_key: str = None,
                 return full_text
         # 文字提取为空或内容极少 → 扫描件，尝试用视觉模型识别
         if api_key:
-            return _parse_pdf_as_images(file_path, api_key, base_url, model)
+            return _parse_pdf_as_images(file_path, api_key, base_url, model, max_output_tokens)
         return "[PDF内容为空：该文件可能是扫描件/图片型PDF。请在设置中配置图片识别模型，系统将自动用视觉AI识别扫描件内容。]"
     except Exception as e:
         return f"[PDF解析失败: {e}]"
 
 
 def _parse_pdf_as_images(file_path: str, api_key: str,
-                          base_url: str = None, model: str = None) -> str:
+                          base_url: str = None, model: str = None,
+                          max_output_tokens: int = None) -> str:
     """将PDF每页渲染为图片，调用视觉模型识别文字"""
     try:
         import fitz
@@ -118,7 +121,7 @@ def _parse_pdf_as_images(file_path: str, api_key: str,
             pix.save(tmp.name)
             tmp.close()
             try:
-                text = _parse_image(tmp.name, api_key, base_url, model)
+                text = _parse_image(tmp.name, api_key, base_url, model, max_output_tokens)
                 if text and not text.startswith("["):
                     results.append(f"[第{page_num + 1}页]\n{text}")
             finally:
@@ -135,7 +138,7 @@ def _parse_pdf_as_images(file_path: str, api_key: str,
 
 
 def _parse_image(file_path: str, api_key: str, base_url: str = None,
-                 model: str = None) -> str:
+                 model: str = None, max_output_tokens: int = None) -> str:
     """用多模态LLM识别图片内容"""
     import httpx
     import json
@@ -169,7 +172,7 @@ def _parse_image(file_path: str, api_key: str, base_url: str = None,
 
     payload = {
         "model": model,
-        "max_tokens": 2000,
+        "max_tokens": max(128, min(int(max_output_tokens or 2000), 262_144)),
         "messages": [{
             "role": "user",
             "content": [
