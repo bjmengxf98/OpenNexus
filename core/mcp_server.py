@@ -27,6 +27,7 @@ from starlette.responses import JSONResponse
 from auth import db
 from auth.wps_oauth import auto_refresh_token_for_user, is_token_expired
 from agent import assistant as assistant_module
+from core.context_memory import sanitize_memory_content
 
 
 _identity_var: ContextVar[dict | None] = ContextVar("mcp_identity", default=None)
@@ -147,10 +148,30 @@ async def _execute_special(name: str, args: dict, identity: dict) -> dict | None
     user_id = int(identity["user_id"])
     display_name = identity.get("display_name") or identity.get("username") or "OpenNexus"
     if name == "save_memory":
-        old = db.get_user_memory(user_id)
-        content = (args.get("content") or "").strip()
-        db.save_user_memory(user_id, (old + "\n- " + content) if old else "- " + content)
-        return {"ok": True, "message": f"已永久记住：{content}"}
+        content, rejected = sanitize_memory_content(args.get("content") or "")
+        if not content:
+            return {"error": "该内容属于实时 WPS 配置，不写入长期记忆"}
+        requested_scope = str(args.get("scope") or "global")
+        if requested_scope == "current_table":
+            file_id = str(args.get("file_id") or "")
+            allowed = {str(item.get("file_id") or "") for item in db.list_wps_files(user_id)}
+            if not file_id or file_id not in allowed:
+                return {"error": "请为 current_table 记忆提供当前用户已连接的 file_id"}
+            scope_type, scope_id, scope_label = "file", file_id, "数据源"
+        else:
+            # MCP 没有 OpenNexus 对话 ID；current_topic 不冒充全局记忆。
+            if requested_scope == "current_topic":
+                return {"error": "MCP 调用没有 OpenNexus 当前话题，请使用 global 或 current_table"}
+            scope_type, scope_id, scope_label = "global", "", "个人长期"
+        db.save_memory_item(
+            user_id, content, scope_type=scope_type, scope_id=scope_id,
+            category="explicit", source_type="mcp_explicit", confidence=1.0,
+        )
+        if scope_type == "global":
+            old = db.get_user_memory(user_id)
+            db.save_user_memory(user_id, (old + "\n- " + content) if old else "- " + content)
+        note = "；实时配置已忽略" if rejected else ""
+        return {"ok": True, "message": f"已保存为{scope_label}记忆：{content}{note}"}
     if name == "send_notification":
         return assistant_module._send_notification(args, sender_name=display_name)
     if name == "get_change_log":

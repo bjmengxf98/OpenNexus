@@ -167,6 +167,37 @@ def init_db():
             FOREIGN KEY(user_id) REFERENCES users(id)
         )
         """)
+        # 结构化上下文记忆。保留上方 user_memory 作为旧版本兼容与回退，
+        # 新数据按用户、话题和 WPS 数据源隔离，避免不同用户/业务互相污染。
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS memory_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            scope_type TEXT NOT NULL DEFAULT 'global',
+            scope_id TEXT NOT NULL DEFAULT '',
+            category TEXT NOT NULL DEFAULT 'general',
+            content TEXT NOT NULL,
+            source_type TEXT NOT NULL DEFAULT 'explicit',
+            source_id TEXT NOT NULL DEFAULT '',
+            confidence REAL NOT NULL DEFAULT 1.0,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_items_user_scope "
+            "ON memory_items(user_id, scope_type, scope_id, status)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_items_source "
+            "ON memory_items(user_id, source_type, source_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_history_user_role "
+            "ON chat_history(user_id, role, id DESC)"
+        )
         # 迁移：WPS 变更日志表（webhook 推送内容持久化）
         conn.execute("""
         CREATE TABLE IF NOT EXISTS wps_change_log (
@@ -798,6 +829,10 @@ def rename_conversation(conv_id: int, user_id: int, title: str):
 def delete_conversation(conv_id: int, user_id: int):
     with get_conn() as conn:
         conn.execute("DELETE FROM chat_history WHERE conversation_id=?", (conv_id,))
+        conn.execute(
+            "DELETE FROM memory_items WHERE user_id=? AND scope_type='conversation' AND scope_id=?",
+            (user_id, str(conv_id)),
+        )
         conn.execute("DELETE FROM conversations WHERE id=? AND user_id=?", (conv_id, user_id))
 
 
@@ -839,8 +874,16 @@ def clear_chat_history(user_id: int, conv_id: int = None):
     with get_conn() as conn:
         if conv_id is not None:
             conn.execute("DELETE FROM chat_history WHERE user_id=? AND conversation_id=?", (user_id, conv_id))
+            conn.execute(
+                "DELETE FROM memory_items WHERE user_id=? AND scope_type='conversation' AND scope_id=?",
+                (user_id, str(conv_id)),
+            )
         else:
             conn.execute("DELETE FROM chat_history WHERE user_id=?", (user_id,))
+            conn.execute(
+                "DELETE FROM memory_items WHERE user_id=? AND scope_type='conversation'",
+                (user_id,),
+            )
 
 
 def get_chat_count(user_id: int, conv_id: int = None) -> int:
@@ -1194,6 +1237,105 @@ def save_user_memory(user_id: int, memory_text: str):
                 memory_text=excluded.memory_text,
                 updated_at=excluded.updated_at
         """, (user_id, memory_text))
+
+
+def save_memory_item(user_id: int, content: str, *, scope_type: str = "global",
+                     scope_id: str = "", category: str = "general",
+                     source_type: str = "explicit", source_id: str = "",
+                     confidence: float = 1.0, replace_source: bool = False) -> int:
+    """保存一条有来源、可隔离的上下文记忆，返回记录 ID。
+
+    ``replace_source`` 用于话题摘要等单一派生结果；显式记忆和自动提取默认按
+    完整内容去重，以便保留证据而不重复堆叠。
+    """
+    allowed_scopes = {"global", "conversation", "file", "contact", "workspace"}
+    scope_type = scope_type if scope_type in allowed_scopes else "global"
+    scope_id = str(scope_id or "")
+    content = str(content or "").strip()
+    if not content:
+        return 0
+    try:
+        confidence = max(0.0, min(float(confidence), 1.0))
+    except (TypeError, ValueError):
+        confidence = 1.0
+
+    with get_conn() as conn:
+        row = None
+        if replace_source and source_type and source_id:
+            row = conn.execute(
+                "SELECT id FROM memory_items WHERE user_id=? AND scope_type=? AND scope_id=? "
+                "AND source_type=? AND source_id=? LIMIT 1",
+                (user_id, scope_type, scope_id, source_type, str(source_id)),
+            ).fetchone()
+        if not row:
+            row = conn.execute(
+                "SELECT id FROM memory_items WHERE user_id=? AND scope_type=? AND scope_id=? "
+                "AND category=? AND content=? AND status='active' LIMIT 1",
+                (user_id, scope_type, scope_id, category, content),
+            ).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE memory_items SET content=?, category=?, source_type=?, source_id=?, "
+                "confidence=?, status='active', updated_at=datetime('now') WHERE id=?",
+                (content, category, source_type, str(source_id or ""), confidence, row["id"]),
+            )
+            return int(row["id"])
+        cur = conn.execute(
+            "INSERT INTO memory_items "
+            "(user_id, scope_type, scope_id, category, content, source_type, source_id, confidence) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (user_id, scope_type, scope_id, category, content,
+             source_type, str(source_id or ""), confidence),
+        )
+        return int(cur.lastrowid)
+
+
+def list_memory_items(user_id: int, *, scope_type: str | None = None,
+                      scope_ids: list[str] | None = None, limit: int = 100) -> list:
+    """列出当前用户可用记忆；调用方必须明确传入用户，天然隔离租户。"""
+    clauses = ["user_id=?", "status='active'"]
+    params: list = [user_id]
+    if scope_type:
+        clauses.append("scope_type=?")
+        params.append(scope_type)
+    if scope_ids is not None:
+        normalized = [str(value) for value in scope_ids if str(value or "")]
+        if not normalized:
+            return []
+        placeholders = ",".join("?" for _ in normalized)
+        clauses.append(f"scope_id IN ({placeholders})")
+        params.extend(normalized)
+    params.append(max(1, min(int(limit), 500)))
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM memory_items WHERE " + " AND ".join(clauses)
+            + " ORDER BY confidence DESC, updated_at DESC, id DESC LIMIT ?",
+            params,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def get_memory_item_by_source(user_id: int, source_type: str, source_id: str) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM memory_items WHERE user_id=? AND source_type=? AND source_id=? "
+            "AND status='active' ORDER BY id DESC LIMIT 1",
+            (user_id, source_type, str(source_id)),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_user_chat_candidates(user_id: int, limit: int = 500) -> list:
+    """返回用于历史召回的用户原话；不返回 AI 回复，防止模型自我强化。"""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT h.id, h.conversation_id, h.content, h.created_at, "
+            "COALESCE(c.title, '') AS conversation_title "
+            "FROM chat_history h LEFT JOIN conversations c ON c.id=h.conversation_id "
+            "WHERE h.user_id=? AND h.role='user' ORDER BY h.id DESC LIMIT ?",
+            (user_id, max(1, min(int(limit), 2000))),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
 
 # ── 用户活跃表格选择 ─────────────────────────────────────────

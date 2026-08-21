@@ -31,6 +31,8 @@ from auth.db import (search_knowledge as _db_search_knowledge,
                      set_change_log_last_seen as _db_set_last_seen,
                      save_user_memory as _db_save_user_memory,
                      get_user_memory as _db_get_user_memory,
+                     save_memory_item as _db_save_memory_item,
+                     list_memory_items as _db_list_memory_items,
                      get_wps_user_id_by_name as _db_get_wps_uid,
                      list_users_for_ai as _db_list_users_for_ai,
                      add_wps_file as _db_add_wps_file,
@@ -45,6 +47,7 @@ from agent.wecom_client import send_wecom_webhook as _wecom_send
 from auth.db import get_system_config as _db_get_system_config
 from auth.db import get_wecom_userid as _db_get_wecom_userid
 from core.document_generator import generate_and_upload_document as _generate_document
+from core.context_memory import sanitize_memory_content
 
 LLM_PRESETS = {
     "scnet": {
@@ -356,6 +359,8 @@ content 参数是一个 JSON 对象（不是字符串），包含 sections 数�
 **绝对禁止说"我无法记忆""会话结束后会忘记""我没有长期记忆"等话**——这是错误的，系统已解决此问题。
 
 - 用户说「记住」「记下来」「下次也记得」「永久保存」等时，**立即调用 save_memory 工具**写入数据库，然后告知"已永久记住"
+- 个人偏好、身份和长期习惯使用 global；只适用于当前对话的内容使用 current_topic；只适用于当前 WPS 表格的业务规则使用 current_table
+- WPS 的 file_id、sheet_id、默认表选择等实时配置绝对不能写入记忆
 - 用户问"你能记忆吗"时，回答：能，你说的重要内容我会永久记住，下次对话也不会忘
 - 不要只说"好的我记住了"而不调用工具——必须真正调用工具写入
 
@@ -1162,6 +1167,15 @@ TOOLS = [
                     "content": {
                         "type": "string",
                         "description": "要永久记住的内容，简洁清晰，如：每周五下午3点开例会；李总分机号123",
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["global", "current_topic", "current_table"],
+                        "description": "记忆范围：个人长期信息用 global；仅当前话题用 current_topic；当前 WPS 表业务规则用 current_table。默认 global",
+                    },
+                    "file_id": {
+                        "type": "string",
+                        "description": "scope=current_table 时可指定已连接 WPS 文件；省略则使用当前默认表格",
                     },
                 },
                 "required": ["content"],
@@ -2237,7 +2251,8 @@ class Assistant:
             self.max_output_tokens = 8192
         self.max_output_tokens = max(128, min(self.max_output_tokens, 262_144))
 
-    async def _auto_learn(self, user_msg: str, ai_reply: str, uid: int, actual_model: str):
+    async def _auto_learn(self, user_msg: str, ai_reply: str, uid: int,
+                          actual_model: str, conv_id: int = 0):
         """
         后台自动学习（不阻塞主响应）：
         第一层 — 自动识别对话中的长期价值信息并存入记忆
@@ -2252,6 +2267,18 @@ class Assistant:
             return
 
         existing_memory = _db_get_user_memory(uid) or ""
+        if conv_id:
+            topic_items = _db_list_memory_items(
+                uid, scope_type="conversation", scope_ids=[str(conv_id)], limit=30,
+            )
+            if topic_items:
+                existing_memory += "\n" + "\n".join(
+                    str(item.get("content") or "") for item in topic_items
+                )
+        # 这一分支只提取明确的长期价值信息，继续按全局记忆保存，
+        # 保持旧版“跨话题记住习惯/偏好”能力。话题细节由独立话题摘要承载。
+        memory_scope = "global"
+        memory_scope_id = ""
 
         # ── 第二层：纠错记忆（优先）────────────────────────
         _CORRECTION_KW = ["不对", "不是", "错了", "不叫", "应该是", "不应该",
@@ -2264,7 +2291,6 @@ class Assistant:
                     messages=[{"role": "user", "content":
                         f"用户在纠正AI的错误。请提炼出需要永久记住的正确事实或规则。\n\n"
                         f"用户说：{user_msg}\n"
-                        f"AI原回复：{ai_reply[:200]}\n\n"
                         f"已有记忆（避免重复）：\n{existing_memory[:500] or '（空）'}\n\n"
                         f"要求：\n"
                         f"1. 提炼成一句简洁的话，格式：[纠错] 正确做法\n"
@@ -2274,10 +2300,18 @@ class Assistant:
                 )
                 item = resp.choices[0].message.content.strip()
                 if item and item not in ("无", "重复") and item.startswith("[纠错]"):
-                    merged = (existing_memory + "\n- " + item) if existing_memory else "- " + item
-                    _db_save_user_memory(uid, merged)
-                    print(f"[AUTO_LEARN] 纠错记忆已保存: {item}")
-                    return  # 本轮只写一条，纠错优先
+                    safe_item, _rejected = sanitize_memory_content(item)
+                    if safe_item:
+                        _db_save_memory_item(
+                            uid, safe_item, scope_type=memory_scope,
+                            scope_id=memory_scope_id, category="correction",
+                            source_type="user_correction", confidence=0.95,
+                        )
+                        old = _db_get_user_memory(uid)
+                        merged = (old + "\n- " + safe_item) if old else "- " + safe_item
+                        _db_save_user_memory(uid, merged)
+                        print(f"[AUTO_LEARN] 纠错记忆已保存: {safe_item}")
+                        return  # 本轮只写一条，纠错优先
             except Exception as e:
                 print(f"[AUTO_LEARN] 纠错检测失败: {e}")
 
@@ -2288,7 +2322,6 @@ class Assistant:
                 messages=[{"role": "user", "content":
                     f"分析下面这段对话，判断是否包含值得长期记忆的信息。\n\n"
                     f"用户说：{user_msg}\n"
-                    f"AI回复：{ai_reply[:300]}\n\n"
                     f"已有记忆（避免重复）：\n{existing_memory[:500] or '（空）'}\n\n"
                     f"【值得记忆的信息类型】\n"
                     f"✅ 工作习惯（如：每周五下午开例会）\n"
@@ -2306,9 +2339,17 @@ class Assistant:
             )
             item = resp.choices[0].message.content.strip()
             if item and item != "无" and item.startswith("[自动]"):
-                merged = (existing_memory + "\n- " + item) if existing_memory else "- " + item
-                _db_save_user_memory(uid, merged)
-                print(f"[AUTO_LEARN] 自动记忆已保存: {item}")
+                safe_item, _rejected = sanitize_memory_content(item)
+                if safe_item:
+                    _db_save_memory_item(
+                        uid, safe_item, scope_type=memory_scope,
+                        scope_id=memory_scope_id, category="automatic",
+                        source_type="user_statement", confidence=0.75,
+                    )
+                    old = _db_get_user_memory(uid)
+                    merged = (old + "\n- " + safe_item) if old else "- " + safe_item
+                    _db_save_user_memory(uid, merged)
+                    print(f"[AUTO_LEARN] 自动记忆已保存: {safe_item}")
         except Exception as e:
             print(f"[AUTO_LEARN] 自动记忆识别失败: {e}")
 
@@ -2323,10 +2364,11 @@ class Assistant:
             elif line.strip():
                 summarize_lines.append(line.strip())
 
+        # 只以用户原话为记忆证据。AI 回复可能包含推测，不能反过来固化为用户事实。
         conv_text = "\n".join(
-            f"{'用户' if m['role'] == 'user' else 'AI'}：{m['content'][:300]}"
+            f"用户：{m['content'][:300]}"
             for m in recent_messages
-            if m["role"] in ("user", "assistant")
+            if m["role"] == "user"
         )
         prompt = MEMORY_SUMMARIZE_PROMPT.format(
             existing_memory="\n".join(summarize_lines) or "（暂无）",
@@ -2354,7 +2396,7 @@ class Assistant:
                    on_tool_call=None, username: str = "用户",
                    role: str = "staff", default_file: dict = None,
                    all_files: list = None, memory: str = "",
-                   uid: int = 0) -> str:
+                   uid: int = 0, conv_id: int = 0) -> str:
         # 兼容旧测试、插件或外部代码通过 Assistant.__new__ 构造的实例；
         # 正常运行时这些值均由 __init__ 从高级配置写入。
         if not hasattr(self, "supports_tools"):
@@ -2719,7 +2761,9 @@ class Assistant:
                 # 后台自动学习：不阻塞响应，fire-and-forget
                 import asyncio as _asyncio
                 _asyncio.create_task(
-                    self._auto_learn(_last_user_content, reply, uid, _actual_model)
+                    self._auto_learn(
+                        _last_user_content, reply, uid, _actual_model, conv_id=conv_id,
+                    )
                 )
                 return reply
 
@@ -2778,11 +2822,42 @@ class Assistant:
                 try:
                     if name == "save_memory":
                         if uid:
-                            old = _db_get_user_memory(uid)
-                            new_content = args.get("content", "")
-                            merged = (old + "\n- " + new_content) if old else "- " + new_content
-                            _db_save_user_memory(uid, merged)
-                            result = {"ok": True, "message": f"已永久记住：{new_content}"}
+                            new_content, rejected = sanitize_memory_content(args.get("content", ""))
+                            if not new_content:
+                                result = {
+                                    "error": "该内容属于实时 WPS 配置，不写入长期记忆；系统会在每轮实时读取。"
+                                }
+                            else:
+                                requested_scope = str(args.get("scope") or "global")
+                                if requested_scope == "current_topic" and conv_id:
+                                    scope_type, scope_id = "conversation", str(conv_id)
+                                    scope_label = "当前话题"
+                                elif requested_scope == "current_table":
+                                    target_file_id = str(args.get("file_id") or _active_file_id or "")
+                                    if not target_file_id or target_file_id not in _valid_file_ids:
+                                        result = {"error": "当前没有可用的 WPS 表格，无法保存表格业务规则"}
+                                        target_file_id = ""
+                                    else:
+                                        scope_type, scope_id = "file", target_file_id
+                                        scope_label = "当前数据源"
+                                else:
+                                    scope_type, scope_id = "global", ""
+                                    scope_label = "个人长期"
+                                if (requested_scope != "current_table") or target_file_id:
+                                    _db_save_memory_item(
+                                        uid, new_content, scope_type=scope_type, scope_id=scope_id,
+                                        category="explicit", source_type="explicit", confidence=1.0,
+                                    )
+                                    # 旧表继续维护全局显式记忆，保证旧版本/插件读取行为不变。
+                                    if scope_type == "global":
+                                        old = _db_get_user_memory(uid)
+                                        merged = (old + "\n- " + new_content) if old else "- " + new_content
+                                        _db_save_user_memory(uid, merged)
+                                    note = "；实时配置已忽略" if rejected else ""
+                                    result = {
+                                        "ok": True,
+                                        "message": f"已保存为{scope_label}记忆：{new_content}{note}",
+                                    }
                         else:
                             result = {"error": "无法获取用户ID，记忆保存失败"}
                     elif name == "send_notification":

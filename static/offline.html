@@ -17,7 +17,29 @@
     <div class="line"></div>
     <h1>当前没有网络连接</h1>
     <p>已打开离线提示页。恢复网络后，可继续使用对话、WPS 表格、驾驶舱和消息提醒等功能。</p>
-    <button type="button" onclick="location.reload()">重新连接</button>
+    <button id="reconnect" type="button">重新连接</button>
   </main>
+  <script>
+    let reconnecting=false;
+    async function reconnect(manual=false){
+      if(reconnecting)return;
+      reconnecting=true;
+      const button=document.getElementById('reconnect');
+      if(manual)button.textContent='正在连接…';
+      try{
+        const response=await fetch('/manifest.json?reconnect='+Date.now(),{cache:'no-store'});
+        if(response.ok){
+          if(location.pathname==='/offline')location.replace('/login');
+          else location.reload();
+          return;
+        }
+      }catch(_error){}
+      reconnecting=false;
+      if(manual)button.textContent='重新连接';
+    }
+    document.getElementById('reconnect').addEventListener('click',()=>reconnect(true));
+    window.addEventListener('online',()=>reconnect(false));
+    setInterval(()=>reconnect(false),2000);
+  </script>
 </body>
 </html>

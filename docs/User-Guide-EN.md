@@ -86,7 +86,9 @@ Generated documents should be reviewed before external distribution.
 
 Administrators can upload policies, templates, and workflows to the shared knowledge base. With embedding configured, documents are chunked and retrieved semantically during relevant conversations.
 
-Personal long-term memory stores user-specific preferences and stable facts. Do not use it for passwords, tokens, or unnecessary sensitive personal data.
+Memory is isolated by user and purpose: personal preferences and stable facts can apply across topics; topic memory applies only to its conversation; and business rules can be bound to one connected WPS data source. Relevant history retrieval uses only the current user's own statements and never treats previous AI replies as facts.
+
+WPS remains the source of truth for mutable business status such as tasks, projects, progress, and leave records. OpenNexus re-queries WPS for current status instead of storing those values as long-term memory. Do not use memory for passwords, tokens, or unnecessary sensitive personal data.
 
 ## 10. Settings
 

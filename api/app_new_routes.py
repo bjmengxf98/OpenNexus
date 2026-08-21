@@ -19,6 +19,7 @@ from agent.assistant import Assistant
 from auth import db
 from auth.wps_oauth import build_auth_url, calc_expires_at, is_token_expired, refresh_access_token
 from core import upload_queue
+from core.context_memory import build_user_context, sanitize_memory_content
 from core.file_parser import parse_file
 
 
@@ -288,6 +289,17 @@ async def app_new_chat(request: Request):
                 history.append({"role": "user", "content": full_text})
                 db.add_chat(uid, "user", full_text, conv_id=conv_id)
 
+                all_files = db.list_wps_files(uid)
+                default_file = db.get_default_wps_file(uid) or (all_files[0] if all_files else None)
+                # 新上下文层只做增量增强：发生任何异常时会自动退回旧 user_memory，
+                # 不阻断对话、WPS 工具、提醒或知识库链路。
+                memory_context = build_user_context(
+                    uid, conv_id, text or full_text,
+                    legacy_memory=db.get_user_memory(uid),
+                    default_file=default_file, all_files=all_files,
+                    recent_contents=[row["content"] for row in history_rows],
+                )
+
                 async def on_tool_call(name, args):
                     await emit("tool", name=name)
 
@@ -298,13 +310,11 @@ async def app_new_chat(request: Request):
                     model=llm_cfg.get("model"),
                     advanced=llm_cfg.get("advanced"),
                 )
-                all_files = db.list_wps_files(uid)
-                default_file = db.get_default_wps_file(uid) or (all_files[0] if all_files else None)
                 reply = await assistant.chat(
                     history, access_token, on_tool_call=on_tool_call,
                     username=user.get("display_name") or user.get("username", "用户"),
                     role=user.get("role", "staff"), default_file=default_file,
-                    all_files=all_files, memory=db.get_user_memory(uid), uid=uid,
+                    all_files=all_files, memory=memory_context, uid=uid, conv_id=conv_id,
                 )
                 db.add_chat(uid, "assistant", reply, conv_id=conv_id)
 
@@ -320,12 +330,27 @@ async def app_new_chat(request: Request):
 
                 async def update_memory():
                     try:
-                        if db.get_chat_count(uid) % 3 == 0 and assistant:
-                            recent_rows = db.get_chat_history(uid, limit=20)
-                            recent = [{"role": r["role"], "content": r["content"]} for r in recent_rows]
-                            memory = await assistant.summarize_memory(recent, db.get_user_memory(uid))
+                        if db.get_chat_count(uid, conv_id=conv_id) % 3 == 0 and assistant:
+                            recent_rows = db.get_chat_history(uid, conv_id=conv_id, limit=20)
+                            recent = [
+                                {"role": r["role"], "content": r["content"]}
+                                for r in recent_rows if r["role"] == "user"
+                            ]
+                            current = db.get_memory_item_by_source(
+                                uid, "conversation_summary", str(conv_id),
+                            ) or {}
+                            memory = await assistant.summarize_memory(
+                                recent, current.get("content", ""),
+                            )
+                            memory, _rejected = sanitize_memory_content(memory)
                             if memory:
-                                db.save_user_memory(uid, memory)
+                                db.save_memory_item(
+                                    uid, memory, scope_type="conversation",
+                                    scope_id=str(conv_id), category="summary",
+                                    source_type="conversation_summary",
+                                    source_id=str(conv_id), confidence=0.8,
+                                    replace_source=True,
+                                )
                     except Exception:
                         pass
                 asyncio.create_task(update_memory())

@@ -3051,7 +3051,18 @@ if __name__ == "__main__":
 
     def open_browser():
         import time
-        time.sleep(3)
+        import urllib.request
+
+        # 启动阶段还要初始化微信、WPS、MCP 等服务。固定等待几秒可能会在
+        # Uvicorn 尚未接受请求时过早打开浏览器，进而触发 PWA 离线页。
+        login_url = f"http://127.0.0.1:{port}/login"
+        for _ in range(120):
+            try:
+                with urllib.request.urlopen(login_url, timeout=0.5) as response:
+                    if response.status == 200:
+                        break
+            except Exception:
+                time.sleep(0.25)
         webbrowser.open(f"http://localhost:{port}/login")
     threading.Thread(target=open_browser, daemon=True).start()
     uvicorn.run("app:fastapi_app", host="0.0.0.0", port=port, reload=False)

@@ -20,6 +20,7 @@ def test_every_primary_page_loads_shared_pwa_runtime():
 def test_service_worker_has_safe_offline_and_update_flow():
     worker = (STATIC / "service-worker.js").read_text(encoding="utf-8")
     runtime = (STATIC / "pwa.js").read_text(encoding="utf-8")
+    offline = (STATIC / "offline.html").read_text(encoding="utf-8")
     assert "'/offline'" in worker
     assert "request.mode === 'navigate'" in worker
     assert "url.pathname.startsWith('/api/')" in worker
@@ -35,6 +36,14 @@ def test_service_worker_has_safe_offline_and_update_flow():
     assert "opennexus-pwa-v4" in worker
     assert "'/static/pwa.js?v=20260821-1'" in worker
     assert ".then(() => self.skipWaiting())" in worker
+    assert "setInterval(()=>reconnect(false),2000)" in offline
+    assert "location.replace('/login')" in offline
+
+
+def test_local_browser_waits_until_login_page_is_ready():
+    source = (ROOT / "app.py").read_text(encoding="utf-8")
+    assert 'login_url = f"http://127.0.0.1:{port}/login"' in source
+    assert "urllib.request.urlopen(login_url" in source
 
 
 def test_manifest_and_mobile_navigation_are_complete():

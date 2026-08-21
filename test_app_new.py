@@ -54,6 +54,14 @@ def test_mobile_composer_has_rounded_corners_without_idle_scrollbar():
     assert "resizeInput();bootstrap();" in HTML
 
 
+def test_history_restore_jumps_to_bottom_without_replaying_smooth_scroll():
+    assert "scroll-behavior:smooth" not in HTML
+    assert "function scrollBottom(smooth=false)" in HTML
+    assert "addMessage(m.role,m.content,m.html,m.created_at,false)" in HTML
+    assert "scrollBottom(false)" in HTML
+    assert "if(autoScroll)scrollBottom(true)" in HTML
+
+
 def test_history_hides_parsed_payload_but_keeps_attachment_name():
     saved = "请处理附件\n【文件：汇报材料.docx】\n这里是解析后的长文本"
     assert _display_user_text(saved) == "请处理附件\n📎 汇报材料.docx"
