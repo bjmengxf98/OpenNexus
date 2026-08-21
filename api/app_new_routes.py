@@ -229,6 +229,16 @@ async def app_new_chat(request: Request):
                     raise RuntimeError("请先在设置中配置大模型 API Key")
 
                 image_cfg = db.get_image_llm_key(uid) if files_to_send else None
+                main_advanced = llm_cfg.get("advanced") or {}
+                main_vision_cfg = llm_cfg if main_advanced.get("supports_vision") else None
+                image_advanced = (image_cfg or {}).get("advanced") or {}
+                fallback_vision_cfg = (
+                    image_cfg
+                    if image_cfg and image_cfg.get("api_key")
+                    and image_advanced.get("supports_vision", True)
+                    else None
+                )
+                vision_cfg = main_vision_cfg or fallback_vision_cfg
                 image_suffixes = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
                 file_contents: list[str] = []
                 for file_info in files_to_send:
@@ -245,10 +255,10 @@ async def app_new_chat(request: Request):
                         continue
 
                     suffix = Path(name).suffix.lower()
-                    if suffix in image_suffixes and image_cfg and image_cfg.get("api_key"):
-                        use_cfg = image_cfg
+                    if suffix in image_suffixes:
+                        use_cfg = vision_cfg
                     elif suffix == ".pdf":
-                        use_cfg = image_cfg if image_cfg and image_cfg.get("api_key") else None
+                        use_cfg = vision_cfg
                     else:
                         use_cfg = llm_cfg
                     content = await asyncio.get_running_loop().run_in_executor(
@@ -256,6 +266,7 @@ async def app_new_chat(request: Request):
                         use_cfg.get("api_key") if use_cfg else None,
                         use_cfg.get("base_url") if use_cfg else None,
                         use_cfg.get("model") if use_cfg else None,
+                        (use_cfg.get("advanced") or {}).get("max_output_tokens") if use_cfg else None,
                     )
                     if suffix in image_suffixes:
                         file_contents.append(f"【图片：{name}】\n{content}\n")
@@ -285,6 +296,7 @@ async def app_new_chat(request: Request):
                     provider=llm_cfg.get("provider", "deepseek"),
                     base_url=llm_cfg.get("base_url"),
                     model=llm_cfg.get("model"),
+                    advanced=llm_cfg.get("advanced"),
                 )
                 all_files = db.list_wps_files(uid)
                 default_file = db.get_default_wps_file(uid) or (all_files[0] if all_files else None)

@@ -7,18 +7,23 @@ import os
 import secrets
 import subprocess
 import sys
+import time
 import warnings
 from pathlib import Path
 from contextlib import asynccontextmanager
 
-# 自动加载 .env 文件（如果存在）
+# 自动加载 .env 文件（如果存在）。
+#
+# 部署时 .env 是 OpenNexus 的权威配置。不能用 setdefault：由 nohup、
+# systemd 或旧 shell 遗留的 WPS_REDIRECT_URI 否则会压过 .env，导致
+# 生产环境误用 localhost 回调地址。
 _env_file = Path(__file__).parent / ".env"
 if _env_file.exists():
     for _line in _env_file.read_text(encoding="utf-8").splitlines():
         _line = _line.strip()
         if _line and not _line.startswith("#") and "=" in _line:
             _k, _v = _line.split("=", 1)
-            os.environ.setdefault(_k.strip(), _v.strip())
+            os.environ[_k.strip()] = _v.strip()
 from fastapi import FastAPI, Request, UploadFile, Form
 from fastapi.responses import RedirectResponse, JSONResponse, HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -2477,8 +2482,19 @@ async def weixin_chat(request: Request):
     if images:
         print(f"[WeChat] 收到图片数量: {len(images)}")
         image_llm_cfg = db.get_image_llm_key(uid)
-        print(f"[WeChat] 图片模型配置: {bool(image_llm_cfg)}, api_key: {bool(image_llm_cfg.get('api_key') if image_llm_cfg else False)}")
-        if image_llm_cfg and image_llm_cfg.get("api_key"):
+        main_vision_cfg = llm_cfg if (llm_cfg.get("advanced") or {}).get("supports_vision") else None
+        image_advanced = (image_llm_cfg or {}).get("advanced") or {}
+        vision_cfg = main_vision_cfg or (
+            image_llm_cfg
+            if image_llm_cfg and image_llm_cfg.get("api_key")
+            and image_advanced.get("supports_vision", True)
+            else None
+        )
+        print(
+            f"[WeChat] 视觉配置来源: "
+            f"{'主模型' if main_vision_cfg else ('图片模型' if vision_cfg else '未配置')}"
+        )
+        if vision_cfg and vision_cfg.get("api_key"):
             import tempfile, os as _os
             from core.file_parser import parse_file
             recognized_parts = []
@@ -2497,9 +2513,10 @@ async def weixin_chat(request: Request):
                     tmp.close()
                     recognized = parse_file(
                         tmp.name, f"image.{ext}",
-                        api_key=image_llm_cfg["api_key"],
-                        base_url=image_llm_cfg.get("base_url"),
-                        model=image_llm_cfg.get("model"),
+                        api_key=vision_cfg["api_key"],
+                        base_url=vision_cfg.get("base_url"),
+                        model=vision_cfg.get("model"),
+                        max_output_tokens=(vision_cfg.get("advanced") or {}).get("max_output_tokens"),
                     )
                     recognized_parts.append(f"[图片{idx+1}内容]\n{recognized}")
                 except Exception as e:
@@ -2537,6 +2554,7 @@ async def weixin_chat(request: Request):
         provider=llm_cfg.get("provider", "deepseek"),
         base_url=llm_cfg.get("base_url"),
         model=llm_cfg.get("model"),
+        advanced=llm_cfg.get("advanced"),
     )
 
     try:
@@ -2566,6 +2584,8 @@ _wechat_qr_url: str = ""  # 缓存最新二维码 URL，供前端渲染
 _wechat_qr_base64: str = ""  # 缓存生成的二维码 Base64，供前端直接显示
 _wechat_rendered_url: str = ""  # 记录已渲染的 URL，用于检测刷新
 _wechat_setup_result: dict | None = None  # 缓存 SETUP_RESULT，供 setup_status 读取
+_wechat_setup_started_at: float = 0.0
+_wechat_setup_last_error: str = ""
 
 @fastapi_app.get("/api/weixin/qrcode")
 async def weixin_qrcode(request: Request):
@@ -2582,13 +2602,19 @@ async def weixin_qrcode(request: Request):
 @fastapi_app.post("/api/weixin/start_setup")
 async def weixin_start_setup(request: Request):
     """启动微信扫码绑定流程"""
-    global _wechat_setup_proc, _wechat_proc, _wechat_procs, _wechat_qr_url, _wechat_setup_result
+    global _wechat_setup_proc, _wechat_proc, _wechat_procs, _wechat_qr_url
+    global _wechat_setup_result, _wechat_setup_started_at, _wechat_setup_last_error
     if not request.session.get("uid"):
         return JSONResponse({"error": "未登录"}, status_code=401)
     wechat_dir = _APP_DIR / "wechat-claude-code-main"
     node_main = wechat_dir / "dist" / "main.js"
     if not node_main.exists():
         return JSONResponse({"error": "微信桥接未构建"}, status_code=400)
+    if _wechat_setup_proc and _wechat_setup_proc.poll() is None:
+        try:
+            _wechat_setup_proc.terminate()
+        except Exception:
+            pass
     qr_path = Path.home() / ".wechat-claude-code" / "qrcode.png"
     if qr_path.exists():
         qr_path.unlink()
@@ -2596,20 +2622,32 @@ async def weixin_start_setup(request: Request):
     _wechat_qr_base64 = ""
     _wechat_rendered_url = ""
     _wechat_setup_result = None
-    _wechat_setup_proc = subprocess.Popen(
-        ["node", str(node_main), "setup"],
-        cwd=str(wechat_dir),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        encoding="utf-8",
-        bufsize=1,
-        errors="replace",
-    )
+    _wechat_setup_started_at = time.monotonic()
+    _wechat_setup_last_error = ""
+    try:
+        _wechat_setup_proc = subprocess.Popen(
+            ["node", str(node_main), "setup"],
+            cwd=str(wechat_dir),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            bufsize=1,
+            errors="replace",
+        )
+    except FileNotFoundError:
+        _wechat_setup_proc = None
+        return JSONResponse(
+            {"error": "服务器未安装 Node.js，无法启动微信桥接"}, status_code=500
+        )
+    except Exception as exc:
+        _wechat_setup_proc = None
+        print(f"[wx_setup] start failed: {exc}")
+        return JSONResponse({"error": f"微信桥接启动失败：{exc}"}, status_code=500)
 
     import threading, json as _json
     def _reader():
-        global _wechat_qr_url, _wechat_setup_result
+        global _wechat_qr_url, _wechat_setup_result, _wechat_setup_last_error
         proc = _wechat_setup_proc
         if not proc or not proc.stdout:
             return
@@ -2617,7 +2655,7 @@ async def weixin_start_setup(request: Request):
             line = line.strip()
             if not line:
                 continue
-            print(f"[wx_stdout] {line!r}")
+            print(f"[wx_setup] {line!r}")
             if line.startswith("QR_URL:"):
                 _wechat_qr_url = line[len("QR_URL:"):]
                 _wechat_qr_base64 = ""  # 清空旧图，让前端重新生成
@@ -2626,6 +2664,8 @@ async def weixin_start_setup(request: Request):
                     _wechat_setup_result = _json.loads(line[len("SETUP_RESULT:"):])
                 except Exception as e:
                     print(f"[WeChat] 解析 SETUP_RESULT 失败: {e}")
+            elif any(word in line.lower() for word in ("error", "failed", "exception", "not found")):
+                _wechat_setup_last_error = line[-300:]
     threading.Thread(target=_reader, daemon=True).start()
 
     return JSONResponse({"ok": True, "message": "扫码流程已启动，请刷新二维码"})
@@ -2752,7 +2792,7 @@ async def _activate_wechat_binding(uid: int, new_account_id: str, new_weixin_id:
 @fastapi_app.get("/api/weixin/setup_status")
 async def weixin_setup_status(request: Request):
     """查询扫码绑定状态"""
-    global _wechat_setup_proc, _wechat_qr_url
+    global _wechat_setup_proc, _wechat_qr_url, _wechat_setup_started_at, _wechat_setup_last_error
     uid = request.session.get("uid")
     if not uid:
         return JSONResponse({"error": "未登录"}, status_code=401)
@@ -2760,10 +2800,26 @@ async def weixin_setup_status(request: Request):
     if _wechat_setup_proc:
         ret = _wechat_setup_proc.poll()
         if ret is None:
+            if (not qr_path.exists() and _wechat_setup_started_at
+                    and time.monotonic() - _wechat_setup_started_at > 45):
+                try:
+                    _wechat_setup_proc.terminate()
+                except Exception:
+                    pass
+                _wechat_setup_proc = None
+                detail = f"（{_wechat_setup_last_error}）" if _wechat_setup_last_error else ""
+                return JSONResponse({
+                    "status": "failed",
+                    "message": (
+                        "二维码生成超时。服务器可能无法访问微信二维码接口，"
+                        f"或微信桥接依赖异常{detail}；请查看 app.log 中 [wx_setup] 日志。"
+                    ),
+                })
             return JSONResponse({"status": "waiting", "has_qr": qr_path.exists(), "qr_url": _wechat_qr_url})
         _wechat_setup_proc = None
         if ret != 0:
-            return JSONResponse({"status": "failed", "message": "绑定失败，请重试"})
+            detail = f"：{_wechat_setup_last_error}" if _wechat_setup_last_error else "，请查看 app.log 中 [wx_setup] 日志"
+            return JSONResponse({"status": "failed", "message": f"绑定失败{detail}"})
 
         new_account_id = (_wechat_setup_result or {}).get("accountId", "")
         new_weixin_id = (_wechat_setup_result or {}).get("userId", "")

@@ -1,10 +1,10 @@
-const CACHE_VERSION = 'opennexus-pwa-v2';
+const CACHE_VERSION = 'opennexus-pwa-v4';
 const STATIC_CACHE = `${CACHE_VERSION}-static`;
 const OFFLINE_URL = '/offline';
 const PRECACHE = [
   OFFLINE_URL,
   '/manifest.json',
-  '/static/pwa.js',
+  '/static/pwa.js?v=20260821-1',
   '/static/icon-192.png',
   '/static/icon-512.png',
   '/static/icon-maskable-512.png',
@@ -12,7 +12,11 @@ const PRECACHE = [
 ];
 
 self.addEventListener('install', event => {
-  event.waitUntil(caches.open(STATIC_CACHE).then(cache => cache.addAll(PRECACHE)));
+  event.waitUntil(
+    caches.open(STATIC_CACHE)
+      .then(cache => cache.addAll(PRECACHE))
+      .then(() => self.skipWaiting())
+  );
 });
 
 self.addEventListener('activate', event => {
