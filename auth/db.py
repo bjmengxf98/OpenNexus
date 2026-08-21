@@ -385,14 +385,50 @@ def init_db():
             success     INTEGER NOT NULL DEFAULT 0,
             error       TEXT DEFAULT '',
             duration_ms INTEGER DEFAULT 0,
+            risk        TEXT DEFAULT '',
+            decision    TEXT DEFAULT '',
+            approval_id TEXT DEFAULT '',
+            required_scope TEXT DEFAULT '',
             created_at  TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id),
+            FOREIGN KEY(token_id) REFERENCES mcp_tokens(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS mcp_tool_approvals (
+            id             TEXT PRIMARY KEY,
+            user_id        INTEGER NOT NULL,
+            token_id       INTEGER NOT NULL,
+            tool_name      TEXT NOT NULL,
+            arguments_hash TEXT NOT NULL,
+            arguments      TEXT DEFAULT '',
+            risk           TEXT DEFAULT '',
+            required_scope TEXT DEFAULT '',
+            summary        TEXT DEFAULT '',
+            status         TEXT NOT NULL DEFAULT 'pending',
+            requested_at   TEXT NOT NULL,
+            decided_at     TEXT DEFAULT '',
+            executed_at    TEXT DEFAULT '',
+            expires_at     TEXT NOT NULL,
             FOREIGN KEY(user_id) REFERENCES users(id),
             FOREIGN KEY(token_id) REFERENCES mcp_tokens(id)
         );
 
         CREATE INDEX IF NOT EXISTS idx_mcp_tokens_hash ON mcp_tokens(token_hash);
         CREATE INDEX IF NOT EXISTS idx_mcp_audit_user_time ON mcp_audit_log(user_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_mcp_approval_user_status
+            ON mcp_tool_approvals(user_id, status, requested_at);
         """)
+        # 旧数据库补充代码级治理审计字段。
+        for column_sql in (
+            "ALTER TABLE mcp_audit_log ADD COLUMN risk TEXT DEFAULT ''",
+            "ALTER TABLE mcp_audit_log ADD COLUMN decision TEXT DEFAULT ''",
+            "ALTER TABLE mcp_audit_log ADD COLUMN approval_id TEXT DEFAULT ''",
+            "ALTER TABLE mcp_audit_log ADD COLUMN required_scope TEXT DEFAULT ''",
+        ):
+            try:
+                conn.execute(column_sql)
+            except Exception:
+                pass
 
 
 # ── 用户 CRUD ──────────────────────────────────────────────
@@ -1830,19 +1866,35 @@ def get_dashboard_cache_status(user_id: int, file_id: str) -> list[dict]:
 
 # ── MCP 访问令牌与审计 ─────────────────────────────────────
 
-def create_mcp_token(user_id: int, name: str = "WorkBuddy", expires_days: int | None = None) -> dict:
+def _decode_mcp_scopes(value) -> list[str]:
+    try:
+        scopes = json.loads(value) if isinstance(value, str) else list(value or [])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    return [str(scope) for scope in scopes if str(scope)]
+
+
+def create_mcp_token(
+    user_id: int,
+    name: str = "WorkBuddy",
+    expires_days: int | None = None,
+    scopes: list[str] | None = None,
+) -> dict:
     """创建 MCP Bearer token；明文只由本函数返回一次。"""
     raw_token = "onx_mcp_" + secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
     now = beijing_now()
     expires_at = (now + timedelta(days=expires_days)).strftime("%Y-%m-%d %H:%M:%S") if expires_days else ""
     safe_name = (name or "WorkBuddy").strip()[:80]
+    safe_scopes = list(dict.fromkeys(scopes or ["all"]))
+    scopes_json = json.dumps(safe_scopes, ensure_ascii=False)
     with get_conn() as conn:
         cursor = conn.execute(
             """INSERT INTO mcp_tokens
                (user_id, name, token_hash, token_prefix, scopes, is_active, created_at, expires_at)
-               VALUES (?, ?, ?, ?, '[\"all\"]', 1, ?, ?)""",
-            (user_id, safe_name, token_hash, raw_token[:16], now.strftime("%Y-%m-%d %H:%M:%S"), expires_at),
+               VALUES (?, ?, ?, ?, ?, 1, ?, ?)""",
+            (user_id, safe_name, token_hash, raw_token[:16], scopes_json,
+             now.strftime("%Y-%m-%d %H:%M:%S"), expires_at),
         )
         token_id = cursor.lastrowid
     return {
@@ -1850,6 +1902,7 @@ def create_mcp_token(user_id: int, name: str = "WorkBuddy", expires_days: int | 
         "name": safe_name,
         "token": raw_token,
         "token_prefix": raw_token[:16],
+        "scopes": safe_scopes,
         "expires_at": expires_at,
     }
 
@@ -1878,7 +1931,9 @@ def verify_mcp_token(raw_token: str) -> dict | None:
             "UPDATE mcp_tokens SET last_used_at=? WHERE id=?",
             (now.strftime("%Y-%m-%d %H:%M:%S"), row["id"]),
         )
-        return dict(row)
+        result = dict(row)
+        result["scopes"] = _decode_mcp_scopes(result.get("scopes"))
+        return result
 
 
 def list_mcp_tokens(user_id: int) -> list[dict]:
@@ -1888,7 +1943,12 @@ def list_mcp_tokens(user_id: int) -> list[dict]:
                FROM mcp_tokens WHERE user_id=? ORDER BY id DESC""",
             (user_id,),
         ).fetchall()
-    return [dict(row) for row in rows]
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["scopes"] = _decode_mcp_scopes(item.get("scopes"))
+        result.append(item)
+    return result
 
 
 def revoke_mcp_token(user_id: int, token_id: int) -> bool:
@@ -1897,7 +1957,130 @@ def revoke_mcp_token(user_id: int, token_id: int) -> bool:
             "UPDATE mcp_tokens SET is_active=0 WHERE id=? AND user_id=? AND is_active=1",
             (token_id, user_id),
         )
+        if cursor.rowcount:
+            now_text = beijing_now().strftime("%Y-%m-%d %H:%M:%S")
+            conn.execute(
+                """UPDATE mcp_tool_approvals
+                   SET status='rejected', decided_at=?
+                   WHERE user_id=? AND token_id=? AND status IN ('pending', 'approved')""",
+                (now_text, user_id, token_id),
+            )
         return cursor.rowcount > 0
+
+
+def _expire_mcp_tool_approvals(conn, now_text: str) -> None:
+    conn.execute(
+        """UPDATE mcp_tool_approvals
+           SET status='expired', decided_at=CASE WHEN decided_at='' THEN ? ELSE decided_at END
+           WHERE status IN ('pending', 'approved') AND expires_at<=?""",
+        (now_text, now_text),
+    )
+
+
+def create_mcp_tool_approval(
+    user_id: int,
+    token_id: int,
+    tool_name: str,
+    arguments_hash: str,
+    arguments: str,
+    risk: str,
+    required_scope: str,
+    summary: str,
+    ttl_minutes: int = 10,
+) -> dict:
+    """创建或复用同一令牌、工具和参数的待审批单。"""
+    now = beijing_now()
+    now_text = now.strftime("%Y-%m-%d %H:%M:%S")
+    expires_at = (now + timedelta(minutes=max(1, min(int(ttl_minutes), 60)))).strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        _expire_mcp_tool_approvals(conn, now_text)
+        existing = conn.execute(
+            """SELECT * FROM mcp_tool_approvals
+               WHERE user_id=? AND token_id=? AND tool_name=? AND arguments_hash=?
+                 AND status='pending' AND expires_at>?
+               ORDER BY requested_at DESC LIMIT 1""",
+            (user_id, token_id, tool_name, arguments_hash, now_text),
+        ).fetchone()
+        if existing:
+            return dict(existing)
+        approval_id = "onx_apr_" + secrets.token_urlsafe(18)
+        conn.execute(
+            """INSERT INTO mcp_tool_approvals
+               (id, user_id, token_id, tool_name, arguments_hash, arguments, risk,
+                required_scope, summary, status, requested_at, expires_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
+            (approval_id, user_id, token_id, tool_name, arguments_hash,
+             arguments[:12000], risk[:80], required_scope[:80], summary[:1000],
+             now_text, expires_at),
+        )
+        row = conn.execute("SELECT * FROM mcp_tool_approvals WHERE id=?", (approval_id,)).fetchone()
+        return dict(row)
+
+
+def get_mcp_tool_approval(user_id: int, approval_id: str) -> dict | None:
+    now_text = beijing_now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        _expire_mcp_tool_approvals(conn, now_text)
+        row = conn.execute(
+            "SELECT * FROM mcp_tool_approvals WHERE id=? AND user_id=?",
+            (approval_id, user_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def list_mcp_tool_approvals(user_id: int, limit: int = 50) -> list[dict]:
+    now_text = beijing_now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        _expire_mcp_tool_approvals(conn, now_text)
+        rows = conn.execute(
+            """SELECT id, token_id, tool_name, arguments, risk, required_scope, summary,
+                      status, requested_at, decided_at, executed_at, expires_at
+               FROM mcp_tool_approvals WHERE user_id=?
+               ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END,
+                        requested_at DESC LIMIT ?""",
+            (user_id, max(1, min(int(limit), 200))),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def decide_mcp_tool_approval(user_id: int, approval_id: str, decision: str) -> dict | None:
+    if decision not in {"approved", "rejected"}:
+        raise ValueError("审批结果必须是 approved 或 rejected")
+    now_text = beijing_now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        _expire_mcp_tool_approvals(conn, now_text)
+        cursor = conn.execute(
+            """UPDATE mcp_tool_approvals SET status=?, decided_at=?
+               WHERE id=? AND user_id=? AND status='pending' AND expires_at>?""",
+            (decision, now_text, approval_id, user_id, now_text),
+        )
+        if not cursor.rowcount:
+            return None
+        row = conn.execute(
+            "SELECT * FROM mcp_tool_approvals WHERE id=? AND user_id=?",
+            (approval_id, user_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def consume_mcp_tool_approval(
+    user_id: int,
+    token_id: int,
+    approval_id: str,
+    tool_name: str,
+    arguments_hash: str,
+) -> bool:
+    """原子消费已批准的审批单；每张审批单最多执行一次。"""
+    now_text = beijing_now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        _expire_mcp_tool_approvals(conn, now_text)
+        cursor = conn.execute(
+            """UPDATE mcp_tool_approvals SET status='executed', executed_at=?
+               WHERE id=? AND user_id=? AND token_id=? AND tool_name=? AND arguments_hash=?
+                 AND status='approved' AND expires_at>?""",
+            (now_text, approval_id, user_id, token_id, tool_name, arguments_hash, now_text),
+        )
+        return cursor.rowcount == 1
 
 
 def add_mcp_audit_log(
@@ -1908,15 +2091,23 @@ def add_mcp_audit_log(
     success: bool,
     error: str = "",
     duration_ms: int = 0,
+    *,
+    risk: str = "",
+    decision: str = "",
+    approval_id: str = "",
+    required_scope: str = "",
 ) -> None:
     with get_conn() as conn:
         conn.execute(
             """INSERT INTO mcp_audit_log
-               (user_id, token_id, tool_name, arguments, success, error, duration_ms, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               (user_id, token_id, tool_name, arguments, success, error, duration_ms,
+                risk, decision, approval_id, required_scope, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 user_id, token_id, tool_name, arguments[:12000], 1 if success else 0,
                 (error or "")[:2000], max(0, int(duration_ms)),
+                (risk or "")[:80], (decision or "")[:80], (approval_id or "")[:120],
+                (required_scope or "")[:80],
                 beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
             ),
         )
@@ -1925,7 +2116,8 @@ def add_mcp_audit_log(
 def list_mcp_audit_log(user_id: int, limit: int = 100) -> list[dict]:
     with get_conn() as conn:
         rows = conn.execute(
-            """SELECT id, token_id, tool_name, success, error, duration_ms, created_at
+            """SELECT id, token_id, tool_name, success, error, duration_ms, risk,
+                      decision, approval_id, required_scope, created_at
                FROM mcp_audit_log WHERE user_id=? ORDER BY id DESC LIMIT ?""",
             (user_id, max(1, min(int(limit), 500))),
         ).fetchall()

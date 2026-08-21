@@ -115,6 +115,7 @@ from auth.wps_oauth import (
 )
 from core.mcp_server import mcp_server, mcp_http_app
 from core.reminder_text import format_reminder_push_text
+from core.tool_governance import normalize_requested_scopes, scope_options
 
 # ── PWA 图标生成 ───────────────────────────────────────────
 
@@ -656,7 +657,11 @@ async def api_create_mcp_token(request: Request):
             return JSONResponse({"ok": False, "error": "有效天数必须是整数"}, status_code=400)
     else:
         expires_days = None
-    created = db.create_mcp_token(user["id"], name, expires_days)
+    try:
+        scopes = normalize_requested_scopes(payload.get("scopes"))
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    created = db.create_mcp_token(user["id"], name, expires_days, scopes)
     return JSONResponse({"ok": True, **created})
 
 
@@ -683,6 +688,7 @@ async def api_mcp_info(request: Request):
         "endpoint": endpoint,
         "authorization": "Bearer <在设置页创建的 MCP 令牌>",
         "tool_count": len(mcp_server._tool_manager.list_tools()),
+        "scope_options": scope_options(),
     })
 
 

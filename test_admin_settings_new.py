@@ -58,6 +58,10 @@ def test_all_pages_have_no_server_ui_runtime():
     assert 'data-advanced="supports_vision"' in settings_html
     assert 'data-advanced="reasoning_mode"' in settings_html
     assert 'data-advanced="context_window"' in settings_html
+    assert 'id="tokenScopes"' in settings_html
+    assert 'id="approvalList"' in settings_html
+    assert "selectedScopes()" in settings_html
+    assert "/api/settings/mcp/approvals/" in settings_html
 
     runtime_files = [project_root / "app.py"]
     for folder in ("agent", "api", "auth", "core", "scripts"):
@@ -74,6 +78,43 @@ def test_admin_page_requires_admin(monkeypatch):
     response = client.get("/admin-new", follow_redirects=False)
     assert response.status_code == 302
     assert response.headers["location"] == "/"
+
+
+def test_mcp_approval_api_is_user_scoped(monkeypatch):
+    from api import settings_new_routes
+
+    client = _client(monkeypatch)
+    approvals = [{
+        "id": "onx_apr_test", "status": "pending", "summary": "删除记录",
+    }]
+    decisions = []
+    monkeypatch.setattr(
+        settings_new_routes.db, "list_mcp_tool_approvals", lambda uid: approvals,
+    )
+    monkeypatch.setattr(
+        settings_new_routes.db,
+        "decide_mcp_tool_approval",
+        lambda uid, approval_id, decision: decisions.append(
+            (uid, approval_id, decision),
+        ) or {**approvals[0], "status": decision},
+    )
+
+    response = client.get("/api/settings/mcp/approvals")
+    assert response.status_code == 200
+    assert response.json()["approvals"] == approvals
+
+    response = client.post(
+        "/api/settings/mcp/approvals/onx_apr_test/decision",
+        json={"decision": "approved"},
+    )
+    assert response.status_code == 200
+    assert decisions == [(1, "onx_apr_test", "approved")]
+
+    response = client.post(
+        "/api/settings/mcp/approvals/onx_apr_test/decision",
+        json={"decision": "invalid"},
+    )
+    assert response.status_code == 400
 
 
 def test_admin_bootstrap(monkeypatch):

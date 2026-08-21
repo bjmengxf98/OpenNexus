@@ -13,6 +13,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from agent.assistant import LLM_PRESETS
 from auth import db
+from core.tool_governance import scope_options
 
 
 settings_new_router = APIRouter()
@@ -180,8 +181,36 @@ async def settings_bootstrap(request: Request):
         "mcp": {
             "endpoint": str(request.base_url).rstrip("/") + "/mcp/",
             "tokens": db.list_mcp_tokens(uid),
+            "scope_options": scope_options(),
+            "approvals": db.list_mcp_tool_approvals(uid),
         },
     }
+
+
+@settings_new_router.get("/api/settings/mcp/approvals")
+async def settings_mcp_approvals(request: Request):
+    uid, user = _current_user(request)
+    if not uid or not user:
+        return _not_logged_in()
+    return {"ok": True, "approvals": db.list_mcp_tool_approvals(uid)}
+
+
+@settings_new_router.post("/api/settings/mcp/approvals/{approval_id}/decision")
+async def settings_mcp_approval_decision(approval_id: str, request: Request):
+    uid, user = _current_user(request)
+    if not uid or not user:
+        return _not_logged_in()
+    body = await request.json()
+    decision = str(body.get("decision") or "").strip().lower()
+    if decision not in {"approved", "rejected"}:
+        return JSONResponse({"ok": False, "error": "审批结果无效"}, status_code=400)
+    row = db.decide_mcp_tool_approval(uid, approval_id, decision)
+    if not row:
+        return JSONResponse(
+            {"ok": False, "error": "审批单不存在、已处理或已过期"},
+            status_code=409,
+        )
+    return {"ok": True, "approval": row, "approvals": db.list_mcp_tool_approvals(uid)}
 
 
 @settings_new_router.get("/api/settings/provider/{kind}/{provider}")
