@@ -67,6 +67,17 @@ def test_history_hides_parsed_payload_but_keeps_attachment_name():
     assert _display_user_text(saved) == "请处理附件\n📎 汇报材料.docx"
 
 
+def test_chat_turn_can_resume_and_be_cancelled_without_replacing_chat_entrypoint():
+    assert "fetch('/api/app-new/chat'" in HTML
+    assert "X-Agent-Turn-ID" in HTML
+    assert "/events?after=" in HTML
+    assert "/cancel" in HTML
+    assert "function resumeTurn(" in HTML
+    assert "function cancelActiveTurn(" in HTML
+    assert "sendBtn.onclick=()=>state.sending?cancelActiveTurn():send()" in HTML
+    assert ".send.stop{background:#ef4444}" in HTML
+
+
 def test_user_help_covers_current_major_features():
     required_topics = (
         "部门智能驾驶舱",

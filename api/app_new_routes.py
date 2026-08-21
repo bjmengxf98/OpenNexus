@@ -27,12 +27,70 @@ app_new_router = APIRouter()
 _HTML_FILE = Path(__file__).resolve().parent.parent / "static" / "app_new.html"
 _HELP_FILE = Path(__file__).resolve().parent.parent / "docs" / "用户帮助.md"
 _user_locks: dict[int, asyncio.Lock] = {}
+_turn_tasks: dict[str, asyncio.Task] = {}
+_turn_subscribers: dict[str, set[asyncio.Queue]] = {}
+_TERMINAL_TURN_STATUSES = {"completed", "failed", "cancelled", "interrupted"}
 _markdown = markdown.Markdown(extensions=["tables", "fenced_code", "nl2br"])
 
 
 def _event(kind: str, **payload) -> str:
     data = json.dumps({"type": kind, **payload}, ensure_ascii=False)
     return f"data: {data}\n\n"
+
+
+def _publish_turn_event(turn_id: str, event: dict):
+    """向当前进程内的在线订阅者广播；持久化由调用方先完成。"""
+    for queue in tuple(_turn_subscribers.get(turn_id, ())):
+        queue.put_nowait(dict(event))
+
+
+async def _emit_turn_event(turn_id: str, kind: str, **payload) -> dict:
+    event_id = db.add_agent_turn_event(turn_id, kind, payload)
+    event = {"event_id": event_id, "turn_id": turn_id, "type": kind, **payload}
+    _publish_turn_event(turn_id, event)
+    return event
+
+
+async def _stream_turn_events(user_id: int, turn_id: str, after_id: int = 0):
+    """先回放数据库事件，再实时跟随；断线后可用事件游标无损续接。"""
+    queue: asyncio.Queue[dict] = asyncio.Queue()
+    subscribers = _turn_subscribers.setdefault(turn_id, set())
+    subscribers.add(queue)
+    last_id = max(0, int(after_id))
+    try:
+        for item in db.list_agent_turn_events(turn_id, user_id, last_id):
+            last_id = max(last_id, int(item["event_id"]))
+            kind = item.pop("type")
+            yield _event(kind, **item)
+
+        while True:
+            turn = db.get_agent_turn(turn_id, user_id)
+            if not turn:
+                return
+            # 多进程部署时事件可能由另一进程写入，不能只依赖本地内存队列。
+            for item in db.list_agent_turn_events(turn_id, user_id, last_id):
+                last_id = max(last_id, int(item["event_id"]))
+                kind = item.pop("type")
+                yield _event(kind, **item)
+            if turn.get("status") in _TERMINAL_TURN_STATUSES:
+                return
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=15)
+            except asyncio.TimeoutError:
+                yield _event("ping", turn_id=turn_id, event_id=last_id)
+                continue
+            if item.get("type") == "close":
+                continue
+            event_id = int(item.get("event_id") or 0)
+            if event_id <= last_id:
+                continue
+            last_id = event_id
+            kind = item.pop("type")
+            yield _event(kind, **item)
+    finally:
+        subscribers.discard(queue)
+        if not subscribers:
+            _turn_subscribers.pop(turn_id, None)
 
 
 def _render_markdown(text: str) -> str:
@@ -92,6 +150,7 @@ async def app_new_bootstrap(request: Request):
     )
     files = db.list_wps_files(uid)
     default_file = db.get_default_wps_file(uid)
+    active_turn = db.get_active_agent_turn(uid, current_id) if current_id else None
     return {
         "ok": True,
         "user": {
@@ -110,6 +169,11 @@ async def app_new_bootstrap(request: Request):
         },
         "conversations": conversations,
         "current_conversation_id": current_id,
+        "active_turn": ({
+            "id": active_turn["id"],
+            "conversation_id": active_turn["conversation_id"],
+            "status": active_turn["status"],
+        } if active_turn else None),
     }
 
 
@@ -168,6 +232,65 @@ async def app_new_disconnect_wps(request: Request):
     return {"ok": True}
 
 
+@app_new_router.get("/api/app-new/turns/{turn_id}")
+async def app_new_turn_status(turn_id: str, request: Request):
+    uid, user = _current_user(request)
+    if not uid or not user:
+        return JSONResponse({"ok": False, "error": "未登录"}, status_code=401)
+    turn = db.get_agent_turn(turn_id, uid)
+    if not turn:
+        return JSONResponse({"ok": False, "error": "任务不存在"}, status_code=404)
+    return {
+        "ok": True,
+        "turn": {
+            "id": turn["id"],
+            "conversation_id": turn["conversation_id"],
+            "status": turn["status"],
+            "last_event_id": turn.get("last_event_id", 0),
+            "error": turn.get("error", ""),
+        },
+    }
+
+
+@app_new_router.get("/api/app-new/turns/{turn_id}/events")
+async def app_new_turn_events(turn_id: str, request: Request, after: int = 0):
+    uid, user = _current_user(request)
+    if not uid or not user:
+        return JSONResponse({"ok": False, "error": "未登录"}, status_code=401)
+    if not db.get_agent_turn(turn_id, uid):
+        return JSONResponse({"ok": False, "error": "任务不存在"}, status_code=404)
+    header_cursor = request.headers.get("last-event-id", "").strip()
+    if header_cursor.isdigit():
+        after = max(after, int(header_cursor))
+    return StreamingResponse(
+        _stream_turn_events(uid, turn_id, after),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app_new_router.post("/api/app-new/turns/{turn_id}/cancel")
+async def app_new_cancel_turn(turn_id: str, request: Request):
+    uid, user = _current_user(request)
+    if not uid or not user:
+        return JSONResponse({"ok": False, "error": "未登录"}, status_code=401)
+    turn = db.get_agent_turn(turn_id, uid)
+    if not turn:
+        return JSONResponse({"ok": False, "error": "任务不存在"}, status_code=404)
+    if turn.get("status") in _TERMINAL_TURN_STATUSES:
+        return {"ok": True, "turn_id": turn_id, "status": turn["status"]}
+
+    turn = db.request_agent_turn_cancel(turn_id, uid) or turn
+    task = _turn_tasks.get(turn_id)
+    if task and not task.done():
+        task.cancel()
+    else:
+        await _emit_turn_event(turn_id, "cancelled", message="已停止本次回复")
+        turn = db.update_agent_turn_status(turn_id, uid, "cancelled") or turn
+        _publish_turn_event(turn_id, {"type": "close"})
+    return {"ok": True, "turn_id": turn_id, "status": turn.get("status", "cancel_requested")}
+
+
 @app_new_router.post("/api/app-new/chat")
 async def app_new_chat(request: Request):
     uid, user = _current_user(request)
@@ -192,17 +315,27 @@ async def app_new_chat(request: Request):
     from core.state import user_current_conv
     user_current_conv[uid] = conv_id
 
-    queue: asyncio.Queue[dict] = asyncio.Queue()
     lock = _user_locks.setdefault(uid, asyncio.Lock())
+    turn = db.create_agent_turn(
+        uid, conv_id, {"text": text, "as_attachment": as_attachment},
+    )
+    turn_id = str(turn["id"])
 
     async def emit(kind: str, **payload):
-        await queue.put({"type": kind, **payload})
+        await _emit_turn_event(turn_id, kind, **payload)
+
+    def ensure_not_cancelled():
+        current = db.get_agent_turn(turn_id, uid) or {}
+        if current.get("cancel_requested"):
+            raise asyncio.CancelledError
 
     async def worker():
         pending_cleanup: list[str] = []
         assistant = None
         try:
+            db.update_agent_turn_status(turn_id, uid, "in_progress")
             async with lock:
+                ensure_not_cancelled()
                 files_to_send = upload_queue.dequeue_all(uid)
                 await emit("accepted", conversation_id=conv_id, title=title,
                            files=[f.get("name", "") for f in files_to_send])
@@ -224,6 +357,7 @@ async def app_new_chat(request: Request):
                     except Exception:
                         access_token = ""
                         await emit("notice", message="WPS 授权已过期，请重新连接；普通对话仍可继续。")
+                ensure_not_cancelled()
 
                 llm_cfg = db.get_llm_key(uid)
                 if not llm_cfg or not llm_cfg.get("api_key"):
@@ -269,6 +403,7 @@ async def app_new_chat(request: Request):
                         use_cfg.get("model") if use_cfg else None,
                         (use_cfg.get("advanced") or {}).get("max_output_tokens") if use_cfg else None,
                     )
+                    ensure_not_cancelled()
                     if suffix in image_suffixes:
                         file_contents.append(f"【图片：{name}】\n{content}\n")
                     else:
@@ -316,6 +451,7 @@ async def app_new_chat(request: Request):
                     role=user.get("role", "staff"), default_file=default_file,
                     all_files=all_files, memory=memory_context, uid=uid, conv_id=conv_id,
                 )
+                ensure_not_cancelled()
                 db.add_chat(uid, "assistant", reply, conv_id=conv_id)
 
                 conv = db.get_conversation(conv_id, uid)
@@ -327,6 +463,7 @@ async def app_new_chat(request: Request):
 
                 await emit("done", conversation_id=conv_id, reply=reply,
                            html=_render_markdown(reply), title=new_title or title)
+                db.update_agent_turn_status(turn_id, uid, "completed")
 
                 async def update_memory():
                     try:
@@ -354,38 +491,39 @@ async def app_new_chat(request: Request):
                     except Exception:
                         pass
                 asyncio.create_task(update_memory())
+        except asyncio.CancelledError:
+            await emit("cancelled", message="已停止本次回复")
+            db.update_agent_turn_status(turn_id, uid, "cancelled")
         except Exception as exc:
             await emit("error", message=f"{type(exc).__name__}: {exc}")
+            db.update_agent_turn_status(turn_id, uid, "failed", f"{type(exc).__name__}: {exc}")
         finally:
             for path in pending_cleanup:
                 try:
                     os.unlink(path)
                 except OSError:
                     pass
-            await emit("close")
+            _publish_turn_event(turn_id, {"type": "close"})
 
-    async def stream():
-        task = asyncio.create_task(worker())
-        try:
-            while True:
-                try:
-                    item = await asyncio.wait_for(queue.get(), timeout=15)
-                except asyncio.TimeoutError:
-                    yield _event("ping")
-                    continue
-                kind = item.pop("type")
-                if kind == "close":
-                    break
-                yield _event(kind, **item)
-        finally:
-            # 客户端断线时不取消业务任务，避免模型已执行但回复未入库。
-            if task.done():
-                try:
-                    task.result()
-                except Exception:
-                    pass
+    task = asyncio.create_task(worker(), name=f"agent-turn:{turn_id}")
+    _turn_tasks[turn_id] = task
+
+    def forget_task(done_task: asyncio.Task):
+        _turn_tasks.pop(turn_id, None)
+        if done_task.cancelled():
+            current = db.get_agent_turn(turn_id, uid) or {}
+            if current.get("status") not in _TERMINAL_TURN_STATUSES:
+                db.add_agent_turn_event(turn_id, "cancelled", {"message": "已停止本次回复"})
+                db.update_agent_turn_status(turn_id, uid, "cancelled")
+                _publish_turn_event(turn_id, {"type": "close"})
+
+    task.add_done_callback(forget_task)
 
     return StreamingResponse(
-        stream(), media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        _stream_turn_events(uid, turn_id), media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "X-Agent-Turn-ID": turn_id,
+        },
     )

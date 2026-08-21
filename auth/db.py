@@ -282,6 +282,40 @@ def init_db():
             FOREIGN KEY(user_id) REFERENCES users(id)
         )
         """)
+        # 持久化代理 Turn 与事件流。旧聊天记录仍是最终消息来源；这些表只负责
+        # 运行状态、断线续接与取消，不改变原有 conversations/chat_history 结构。
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS agent_turns (
+            id                 TEXT PRIMARY KEY,
+            user_id            INTEGER NOT NULL,
+            conversation_id    INTEGER NOT NULL,
+            status             TEXT NOT NULL DEFAULT 'queued',
+            request_json       TEXT NOT NULL DEFAULT '{}',
+            cancel_requested   INTEGER NOT NULL DEFAULT 0,
+            error              TEXT DEFAULT '',
+            created_at         TEXT NOT NULL,
+            updated_at         TEXT NOT NULL,
+            completed_at       TEXT DEFAULT '',
+            FOREIGN KEY(user_id) REFERENCES users(id),
+            FOREIGN KEY(conversation_id) REFERENCES conversations(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS agent_turn_events (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            turn_id     TEXT NOT NULL,
+            event_type  TEXT NOT NULL,
+            payload     TEXT NOT NULL DEFAULT '{}',
+            created_at  TEXT NOT NULL,
+            FOREIGN KEY(turn_id) REFERENCES agent_turns(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_agent_turns_user_status
+            ON agent_turns(user_id, status, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_agent_turns_conversation
+            ON agent_turns(user_id, conversation_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_agent_turn_events_turn
+            ON agent_turn_events(turn_id, id);
+        """)
         # 迁移：chat_history 添加 conversation_id 字段
         try:
             conn.execute("ALTER TABLE chat_history ADD COLUMN conversation_id INTEGER REFERENCES conversations(id)")
@@ -864,6 +898,21 @@ def rename_conversation(conv_id: int, user_id: int, title: str):
 
 def delete_conversation(conv_id: int, user_id: int):
     with get_conn() as conn:
+        turn_rows = conn.execute(
+            "SELECT id FROM agent_turns WHERE conversation_id=? AND user_id=?",
+            (conv_id, user_id),
+        ).fetchall()
+        turn_ids = [str(row["id"]) for row in turn_rows]
+        if turn_ids:
+            placeholders = ",".join("?" for _ in turn_ids)
+            conn.execute(
+                f"DELETE FROM agent_turn_events WHERE turn_id IN ({placeholders})",
+                turn_ids,
+            )
+            conn.execute(
+                f"DELETE FROM agent_turns WHERE id IN ({placeholders})",
+                turn_ids,
+            )
         conn.execute("DELETE FROM chat_history WHERE conversation_id=?", (conv_id,))
         conn.execute(
             "DELETE FROM memory_items WHERE user_id=? AND scope_type='conversation' AND scope_id=?",
@@ -934,6 +983,146 @@ def get_chat_count(user_id: int, conv_id: int = None) -> int:
                 "SELECT COUNT(*) FROM chat_history WHERE user_id=?", (user_id,)
             ).fetchone()
         return row[0] if row else 0
+
+
+# ── 持久化代理 Turn / 事件流 ────────────────────────────────
+
+_AGENT_TURN_STATUSES = {
+    "queued", "in_progress", "cancel_requested",
+    "completed", "failed", "cancelled", "interrupted",
+}
+_ACTIVE_AGENT_TURN_STATUSES = ("queued", "in_progress", "cancel_requested")
+_TERMINAL_AGENT_TURN_STATUSES = ("completed", "failed", "cancelled", "interrupted")
+
+
+def _agent_turn_result(row) -> dict | None:
+    if not row:
+        return None
+    result = dict(row)
+    try:
+        result["request"] = json.loads(result.pop("request_json") or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        result["request"] = {}
+        result.pop("request_json", None)
+    result["cancel_requested"] = bool(result.get("cancel_requested"))
+    return result
+
+
+def create_agent_turn(user_id: int, conv_id: int, request_data: dict | None = None) -> dict:
+    """创建一个可持久化、可续接的聊天 Turn。"""
+    turn_id = f"turn_{secrets.token_hex(12)}"
+    now = beijing_now().isoformat(timespec="seconds")
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO agent_turns "
+            "(id,user_id,conversation_id,status,request_json,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (
+                turn_id, user_id, conv_id, "queued",
+                json.dumps(request_data or {}, ensure_ascii=False), now, now,
+            ),
+        )
+    return get_agent_turn(turn_id, user_id) or {"id": turn_id}
+
+
+def get_agent_turn(turn_id: str, user_id: int) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT t.*, COALESCE((SELECT MAX(e.id) FROM agent_turn_events e "
+            "WHERE e.turn_id=t.id), 0) AS last_event_id "
+            "FROM agent_turns t WHERE t.id=? AND t.user_id=?",
+            (turn_id, user_id),
+        ).fetchone()
+    return _agent_turn_result(row)
+
+
+def get_active_agent_turn(user_id: int, conv_id: int | None = None) -> dict | None:
+    placeholders = ",".join("?" for _ in _ACTIVE_AGENT_TURN_STATUSES)
+    params: list = [user_id, *_ACTIVE_AGENT_TURN_STATUSES]
+    where = f"user_id=? AND status IN ({placeholders})"
+    if conv_id is not None:
+        where += " AND conversation_id=?"
+        params.append(conv_id)
+    with get_conn() as conn:
+        row = conn.execute(
+            f"SELECT * FROM agent_turns WHERE {where} ORDER BY created_at DESC LIMIT 1",
+            params,
+        ).fetchone()
+    return _agent_turn_result(row)
+
+
+def update_agent_turn_status(
+    turn_id: str, user_id: int, status: str, error: str = "",
+) -> dict | None:
+    if status not in _AGENT_TURN_STATUSES:
+        raise ValueError(f"不支持的 Turn 状态: {status}")
+    now = beijing_now().isoformat(timespec="seconds")
+    completed_at = now if status in _TERMINAL_AGENT_TURN_STATUSES else ""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE agent_turns SET status=?, error=?, updated_at=?, completed_at=? "
+            "WHERE id=? AND user_id=?",
+            (status, error, now, completed_at, turn_id, user_id),
+        )
+    return get_agent_turn(turn_id, user_id)
+
+
+def request_agent_turn_cancel(turn_id: str, user_id: int) -> dict | None:
+    now = beijing_now().isoformat(timespec="seconds")
+    placeholders = ",".join("?" for _ in _ACTIVE_AGENT_TURN_STATUSES)
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE agent_turns SET status='cancel_requested', cancel_requested=1, "
+            f"updated_at=? WHERE id=? AND user_id=? AND status IN ({placeholders})",
+            (now, turn_id, user_id, *_ACTIVE_AGENT_TURN_STATUSES),
+        )
+    return get_agent_turn(turn_id, user_id)
+
+
+def add_agent_turn_event(turn_id: str, event_type: str, payload: dict | None = None) -> int:
+    now = beijing_now().isoformat(timespec="seconds")
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO agent_turn_events (turn_id,event_type,payload,created_at) "
+            "VALUES (?,?,?,?)",
+            (turn_id, event_type, json.dumps(payload or {}, ensure_ascii=False), now),
+        )
+        conn.execute(
+            "UPDATE agent_turns SET updated_at=? WHERE id=?",
+            (now, turn_id),
+        )
+        return int(cur.lastrowid)
+
+
+def list_agent_turn_events(
+    turn_id: str, user_id: int, after_id: int = 0, limit: int = 500,
+) -> list[dict]:
+    with get_conn() as conn:
+        owner = conn.execute(
+            "SELECT 1 FROM agent_turns WHERE id=? AND user_id=?",
+            (turn_id, user_id),
+        ).fetchone()
+        if not owner:
+            return []
+        rows = conn.execute(
+            "SELECT id,event_type,payload,created_at FROM agent_turn_events "
+            "WHERE turn_id=? AND id>? ORDER BY id ASC LIMIT ?",
+            (turn_id, max(0, int(after_id)), max(1, min(int(limit), 1000))),
+        ).fetchall()
+    events = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        events.append({
+            "event_id": int(row["id"]),
+            "turn_id": turn_id,
+            "type": row["event_type"],
+            "created_at": row["created_at"],
+            **payload,
+        })
+    return events
 
 
 # ── 密码重置 Token ──────────────────────────────────────────
