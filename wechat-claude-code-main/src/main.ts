@@ -101,8 +101,13 @@ async function runSetup(): Promise<void> {
       !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY;
 
     if (isHeadlessLinux) {
-      // Headless Linux: output QR URL for Python to render
+      // Headless Linux still needs a PNG because the OpenNexus web page serves
+      // DATA_DIR/qrcode.png. The terminal rendering is only an extra fallback.
       console.log(`QR_URL:${qrcodeUrl}`);
+      const QRCode = await import('qrcode');
+      const pngData = await QRCode.toBuffer(qrcodeUrl, { type: 'png', width: 400, margin: 2 });
+      writeFileSync(QR_PATH, pngData);
+      console.log(`二维码已生成: ${QR_PATH}`);
       try {
         const qrcodeTerminal = await import('qrcode-terminal');
         console.log('请用微信扫描下方二维码：\n');

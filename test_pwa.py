@@ -12,7 +12,7 @@ def test_every_primary_page_loads_shared_pwa_runtime():
     for name in PAGES:
         html = (STATIC / name).read_text(encoding="utf-8")
         assert 'rel="manifest" href="/manifest.json"' in html, name
-        assert 'src="/static/pwa.js"' in html, name
+        assert 'src="/static/pwa.js?v=20260821-1"' in html, name
         assert 'rel="apple-touch-icon"' in html, name
         assert "viewport-fit=cover" in html, name
 
@@ -26,9 +26,15 @@ def test_service_worker_has_safe_offline_and_update_flow():
     assert "SKIP_WAITING" in worker
     assert "navigator.serviceWorker.register('/sw.js'" in runtime
     assert "beforeinstallprompt" in runtime
+    assert "isMobileDevice" in runtime
+    assert "localStorage.getItem(INSTALL_DISMISS_KEY)" in runtime
+    assert "INSTALL_DISMISS_MS = 30 * 24 * 60 * 60 * 1000" in runtime
+    assert "sessionStorage.getItem('pwa-install-dismissed')" not in runtime
     assert "controllerchange" in runtime
     assert "checkForUpdate" in runtime
-    assert "opennexus-pwa-v2" in worker
+    assert "opennexus-pwa-v4" in worker
+    assert "'/static/pwa.js?v=20260821-1'" in worker
+    assert ".then(() => self.skipWaiting())" in worker
 
 
 def test_manifest_and_mobile_navigation_are_complete():
