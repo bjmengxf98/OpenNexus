@@ -292,6 +292,8 @@ def init_db():
             status             TEXT NOT NULL DEFAULT 'queued',
             request_json       TEXT NOT NULL DEFAULT '{}',
             cancel_requested   INTEGER NOT NULL DEFAULT 0,
+            worker_id          TEXT DEFAULT '',
+            heartbeat_at       TEXT DEFAULT '',
             error              TEXT DEFAULT '',
             created_at         TEXT NOT NULL,
             updated_at         TEXT NOT NULL,
@@ -316,6 +318,15 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_agent_turn_events_turn
             ON agent_turn_events(turn_id, id);
         """)
+        # 第二阶段已创建过 agent_turns 的数据库，继续采用追加字段迁移。
+        for column_sql in (
+            "ALTER TABLE agent_turns ADD COLUMN worker_id TEXT DEFAULT ''",
+            "ALTER TABLE agent_turns ADD COLUMN heartbeat_at TEXT DEFAULT ''",
+        ):
+            try:
+                conn.execute(column_sql)
+            except Exception:
+                pass
         # 迁移：chat_history 添加 conversation_id 字段
         try:
             conn.execute("ALTER TABLE chat_history ADD COLUMN conversation_id INTEGER REFERENCES conversations(id)")
@@ -1065,6 +1076,76 @@ def update_agent_turn_status(
             (status, error, now, completed_at, turn_id, user_id),
         )
     return get_agent_turn(turn_id, user_id)
+
+
+def claim_agent_turn(turn_id: str, user_id: int, worker_id: str) -> bool:
+    """由当前服务进程认领 Turn，并开始刷新租约。"""
+    now = beijing_now().isoformat(timespec="seconds")
+    placeholders = ",".join("?" for _ in _ACTIVE_AGENT_TURN_STATUSES)
+    with get_conn() as conn:
+        cursor = conn.execute(
+            "UPDATE agent_turns SET "
+            "status=CASE WHEN cancel_requested=1 THEN 'cancel_requested' ELSE 'in_progress' END, "
+            "worker_id=?, heartbeat_at=?, updated_at=? "
+            f"WHERE id=? AND user_id=? AND status IN ({placeholders})",
+            (worker_id, now, now, turn_id, user_id, *_ACTIVE_AGENT_TURN_STATUSES),
+        )
+        return cursor.rowcount == 1
+
+
+def heartbeat_agent_turn(turn_id: str, user_id: int, worker_id: str) -> bool:
+    """只允许认领该 Turn 的进程续租，避免其他进程误覆盖。"""
+    now = beijing_now().isoformat(timespec="seconds")
+    placeholders = ",".join("?" for _ in _ACTIVE_AGENT_TURN_STATUSES)
+    with get_conn() as conn:
+        cursor = conn.execute(
+            "UPDATE agent_turns SET heartbeat_at=?, updated_at=? "
+            f"WHERE id=? AND user_id=? AND worker_id=? AND status IN ({placeholders})",
+            (now, now, turn_id, user_id, worker_id, *_ACTIVE_AGENT_TURN_STATUSES),
+        )
+        return cursor.rowcount == 1
+
+
+def interrupt_stale_agent_turns(stale_seconds: int = 120) -> list[str]:
+    """终结租约超时的 Turn，但不自动重放可能已有副作用的请求。"""
+    timeout = max(30, int(stale_seconds))
+    now_dt = beijing_now()
+    now = now_dt.isoformat(timespec="seconds")
+    cutoff = (now_dt - timedelta(seconds=timeout)).isoformat(timespec="seconds")
+    message = "服务进程中断，本次任务未自动重放；请确认已有结果后重新发送。"
+    placeholders = ",".join("?" for _ in _ACTIVE_AGENT_TURN_STATUSES)
+    interrupted: list[str] = []
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id,user_id FROM agent_turns "
+            f"WHERE status IN ({placeholders}) "
+            "AND COALESCE(NULLIF(heartbeat_at,''), updated_at)<?",
+            (*_ACTIVE_AGENT_TURN_STATUSES, cutoff),
+        ).fetchall()
+        for row in rows:
+            cursor = conn.execute(
+                "UPDATE agent_turns SET status='interrupted', error=?, updated_at=?, "
+                "completed_at=? WHERE id=? AND user_id=? "
+                f"AND status IN ({placeholders}) "
+                "AND COALESCE(NULLIF(heartbeat_at,''), updated_at)<?",
+                (
+                    message, now, now, row["id"], row["user_id"],
+                    *_ACTIVE_AGENT_TURN_STATUSES, cutoff,
+                ),
+            )
+            if cursor.rowcount != 1:
+                continue
+            conn.execute(
+                "INSERT INTO agent_turn_events (turn_id,event_type,payload,created_at) "
+                "VALUES (?,?,?,?)",
+                (
+                    row["id"], "error",
+                    json.dumps({"message": message, "reason": "worker_lost"}, ensure_ascii=False),
+                    now,
+                ),
+            )
+            interrupted.append(str(row["id"]))
+    return interrupted
 
 
 def request_agent_turn_cancel(turn_id: str, user_id: int) -> dict | None:

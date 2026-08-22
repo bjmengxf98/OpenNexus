@@ -568,8 +568,14 @@ async def _lifespan(app_):
     asyncio.create_task(_reminder_scheduler())
     asyncio.create_task(_dashboard_snapshot_scheduler())
     asyncio.create_task(_dashboard_cache_scheduler())
+    from api.app_new_routes import reap_stale_agent_turns
+    turn_reaper_task = asyncio.create_task(
+        reap_stale_agent_turns(), name="agent-turn-reaper",
+    )
 
     yield
+    turn_reaper_task.cancel()
+    await asyncio.gather(turn_reaper_task, return_exceptions=True)
     _wechat_monitor_stop = True
     for proc in _wechat_procs:
         proc.terminate()

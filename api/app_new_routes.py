@@ -9,6 +9,7 @@ import html
 import json
 import os
 import re
+import secrets
 from pathlib import Path
 
 import markdown
@@ -30,7 +31,12 @@ _user_locks: dict[int, asyncio.Lock] = {}
 _turn_tasks: dict[str, asyncio.Task] = {}
 _turn_subscribers: dict[str, set[asyncio.Queue]] = {}
 _TERMINAL_TURN_STATUSES = {"completed", "failed", "cancelled", "interrupted"}
+_TURN_WORKER_ID = f"worker_{secrets.token_hex(8)}"
 _markdown = markdown.Markdown(extensions=["tables", "fenced_code", "nl2br"])
+
+
+class _TurnLeaseLost(RuntimeError):
+    pass
 
 
 def _event(kind: str, **payload) -> str:
@@ -49,6 +55,25 @@ async def _emit_turn_event(turn_id: str, kind: str, **payload) -> dict:
     event = {"event_id": event_id, "turn_id": turn_id, "type": kind, **payload}
     _publish_turn_event(turn_id, event)
     return event
+
+
+async def _heartbeat_turn(turn_id: str, user_id: int, interval_seconds: int = 10):
+    while True:
+        await asyncio.sleep(max(5, int(interval_seconds)))
+        if not db.heartbeat_agent_turn(turn_id, user_id, _TURN_WORKER_ID):
+            return
+
+
+async def reap_stale_agent_turns(interval_seconds: int = 30, stale_seconds: int = 120):
+    """后台回收失去进程心跳的 Turn；不自动重放原请求。"""
+    while True:
+        try:
+            interrupted = db.interrupt_stale_agent_turns(stale_seconds)
+            if interrupted:
+                print(f"[AGENT] 已终结 {len(interrupted)} 个失联 Turn")
+        except Exception as exc:
+            print(f"[AGENT] Turn 租约检查失败: {exc}")
+        await asyncio.sleep(max(10, int(interval_seconds)))
 
 
 async def _stream_turn_events(user_id: int, turn_id: str, after_id: int = 0):
@@ -328,12 +353,19 @@ async def app_new_chat(request: Request):
         current = db.get_agent_turn(turn_id, uid) or {}
         if current.get("cancel_requested"):
             raise asyncio.CancelledError
+        if current.get("status") == "interrupted":
+            raise _TurnLeaseLost(current.get("error") or "Turn 租约已失效")
 
     async def worker():
         pending_cleanup: list[str] = []
         assistant = None
+        heartbeat_task = None
         try:
-            db.update_agent_turn_status(turn_id, uid, "in_progress")
+            if not db.claim_agent_turn(turn_id, uid, _TURN_WORKER_ID):
+                return
+            heartbeat_task = asyncio.create_task(
+                _heartbeat_turn(turn_id, uid), name=f"agent-heartbeat:{turn_id}",
+            )
             async with lock:
                 ensure_not_cancelled()
                 files_to_send = upload_queue.dequeue_all(uid)
@@ -491,6 +523,9 @@ async def app_new_chat(request: Request):
                     except Exception:
                         pass
                 asyncio.create_task(update_memory())
+        except _TurnLeaseLost:
+            # 回收器已写入 interrupted 终态和错误事件，避免重复覆盖为 failed。
+            pass
         except asyncio.CancelledError:
             await emit("cancelled", message="已停止本次回复")
             db.update_agent_turn_status(turn_id, uid, "cancelled")
@@ -498,6 +533,12 @@ async def app_new_chat(request: Request):
             await emit("error", message=f"{type(exc).__name__}: {exc}")
             db.update_agent_turn_status(turn_id, uid, "failed", f"{type(exc).__name__}: {exc}")
         finally:
+            if heartbeat_task:
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
             for path in pending_cleanup:
                 try:
                     os.unlink(path)

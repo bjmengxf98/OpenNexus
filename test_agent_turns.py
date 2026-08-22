@@ -1,5 +1,7 @@
 import asyncio
 import json
+import sqlite3
+from datetime import timedelta
 
 import pytest
 from fastapi import FastAPI
@@ -156,3 +158,54 @@ def test_cancel_endpoint_is_owner_scoped_and_reaches_terminal_state(monkeypatch,
     assert stopped.json()["status"] == "cancelled"
     assert db.get_agent_turn(turn["id"], 1)["status"] == "cancelled"
     assert db.list_agent_turn_events(turn["id"], 1)[-1]["type"] == "cancelled"
+
+
+def test_phase_two_database_gets_additive_worker_lease_columns(monkeypatch, tmp_path):
+    path = tmp_path / "phase-two.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("""
+            CREATE TABLE agent_turns (
+                id TEXT PRIMARY KEY, user_id INTEGER NOT NULL,
+                conversation_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'queued',
+                request_json TEXT NOT NULL DEFAULT '{}', cancel_requested INTEGER DEFAULT 0,
+                error TEXT DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                completed_at TEXT DEFAULT ''
+            )
+        """)
+    monkeypatch.setattr(db, "DB_PATH", path)
+    db.init_db()
+
+    with db.get_conn() as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(agent_turns)")}
+    assert {"worker_id", "heartbeat_at"}.issubset(columns)
+
+
+def test_worker_lease_interrupts_only_stale_turns_without_replay(monkeypatch, tmp_path):
+    _fresh_db(monkeypatch, tmp_path)
+    stale_conv = db.create_conversation(1, "失联任务")
+    fresh_conv = db.create_conversation(1, "正常任务")
+    stale = db.create_agent_turn(1, stale_conv, {"text": "可能写入 WPS"})
+    fresh = db.create_agent_turn(1, fresh_conv, {"text": "正常执行"})
+
+    assert db.claim_agent_turn(stale["id"], 1, "worker-old") is True
+    assert db.claim_agent_turn(fresh["id"], 1, "worker-live") is True
+    assert db.heartbeat_agent_turn(fresh["id"], 1, "wrong-worker") is False
+    assert db.heartbeat_agent_turn(fresh["id"], 1, "worker-live") is True
+
+    old = (db.beijing_now() - timedelta(minutes=5)).isoformat(timespec="seconds")
+    with db.get_conn() as conn:
+        conn.execute(
+            "UPDATE agent_turns SET heartbeat_at=?, updated_at=? WHERE id=?",
+            (old, old, stale["id"]),
+        )
+
+    interrupted = db.interrupt_stale_agent_turns(stale_seconds=30)
+
+    assert interrupted == [stale["id"]]
+    stale_result = db.get_agent_turn(stale["id"], 1)
+    assert stale_result["status"] == "interrupted"
+    assert "未自动重放" in stale_result["error"]
+    stale_event = db.list_agent_turn_events(stale["id"], 1)[-1]
+    assert stale_event["type"] == "error"
+    assert stale_event["reason"] == "worker_lost"
+    assert db.get_agent_turn(fresh["id"], 1)["status"] == "in_progress"
