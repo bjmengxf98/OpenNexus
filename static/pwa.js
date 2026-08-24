@@ -2,6 +2,10 @@
   'use strict';
 
   const isStandalone = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
+  const isMobileDevice = window.matchMedia('(max-width: 820px)').matches &&
+    (navigator.maxTouchPoints > 0 || /Android|iPhone|iPad|iPod|HarmonyOS|Mobile/i.test(navigator.userAgent));
+  const INSTALL_DISMISS_KEY = 'pwa-install-dismissed-at';
+  const INSTALL_DISMISS_MS = 30 * 24 * 60 * 60 * 1000;
   let installPrompt = null;
   let refreshing = false;
   let activeRegistration = null;
@@ -112,19 +116,28 @@
 
   window.OpenNexusPWA = {checkForUpdate};
 
+  function installPromptRecentlyDismissed() {
+    const dismissedAt = Number(localStorage.getItem(INSTALL_DISMISS_KEY) || 0);
+    return dismissedAt > 0 && Date.now() - dismissedAt < INSTALL_DISMISS_MS;
+  }
+
+  function rememberInstallPromptDismissal() {
+    localStorage.setItem(INSTALL_DISMISS_KEY, String(Date.now()));
+  }
+
   window.addEventListener('beforeinstallprompt', event => {
     event.preventDefault();
     installPrompt = event;
-    if (isStandalone || sessionStorage.getItem('pwa-install-dismissed') === '1') return;
+    if (isStandalone || !isMobileDevice || installPromptRecentlyDismissed()) return;
     const banner = actionBanner('pwa-install-banner', '安装到手机桌面，使用更方便', '安装', async () => {
       if (!installPrompt) return;
       await installPrompt.prompt();
       const result = await installPrompt.userChoice;
       installPrompt = null;
       banner.remove();
-      if (result.outcome !== 'accepted') sessionStorage.setItem('pwa-install-dismissed', '1');
+      if (result.outcome !== 'accepted') rememberInstallPromptDismissal();
     });
-    banner.querySelector('.pwa-close').addEventListener('click', () => sessionStorage.setItem('pwa-install-dismissed', '1'));
+    banner.querySelector('.pwa-close').addEventListener('click', rememberInstallPromptDismissal);
   });
 
   window.addEventListener('appinstalled', () => {

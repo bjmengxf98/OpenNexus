@@ -10,8 +10,11 @@ import auth.db as db
 from core.reminder_text import format_reminder_push_text, normalize_reminder_schedule
 from agent.assistant import (
     Assistant,
+    _append_tool_result_user_bridge,
+    _coalesce_system_messages,
     _detect_event_reminder_scene,
     _detect_personal_reminder_intent,
+    _needs_tool_result_user_bridge,
 )
 
 
@@ -77,6 +80,35 @@ class ReminderPushTextTests(unittest.TestCase):
 
 
 class ReminderIntentTests(unittest.TestCase):
+    def test_system_messages_are_coalesced_at_the_beginning(self):
+        result = _coalesce_system_messages([
+            {"role": "system", "content": "基础规则"},
+            {"role": "user", "content": "问题"},
+            {"role": "system", "content": "实时规则"},
+            {"role": "assistant", "content": "回答"},
+        ])
+        self.assertEqual([item["role"] for item in result], ["system", "user", "assistant"])
+        self.assertIn("基础规则", result[0]["content"])
+        self.assertIn("实时规则", result[0]["content"])
+
+    def test_qwen_tool_result_bridge_only_matches_the_exact_gateway_error(self):
+        messages = [
+            {"role": "system", "content": "规则"},
+            {"role": "user", "content": "查询部门情况"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "1"}]},
+            {"role": "tool", "tool_call_id": "1", "content": "{}"},
+        ]
+        exact = RuntimeError("no user query found in messages")
+        unrelated = RuntimeError("upstream internal server error")
+
+        self.assertTrue(_needs_tool_result_user_bridge(exact, messages))
+        self.assertFalse(_needs_tool_result_user_bridge(unrelated, messages))
+        self.assertFalse(_needs_tool_result_user_bridge(exact, messages[:-1]))
+
+        bridged = _append_tool_result_user_bridge(messages)
+        self.assertEqual(bridged[-1]["role"], "user")
+        self.assertIn("工具返回结果", bridged[-1]["content"])
+
     def test_screenshot_phrase_is_a_timed_personal_reminder(self):
         self.assertEqual(
             _detect_personal_reminder_intent("九点微信提醒我找小马说差旅平台的事"),
@@ -114,10 +146,90 @@ class _FakeCompletions:
     async def create(self, **kwargs):
         self.calls.append(kwargs)
         message = next(self._messages)
+        if isinstance(message, Exception):
+            raise message
         return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
 
 class ReminderConversationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_strict_qwen_gateway_retries_only_after_tool_result_error(self):
+        tool_call = SimpleNamespace(
+            id="list-reminders-qwen",
+            function=SimpleNamespace(name="list_reminders", arguments="{}"),
+        )
+        completions = _FakeCompletions([
+            SimpleNamespace(content=None, tool_calls=[tool_call]),
+            RuntimeError("500: no user query found in messages"),
+            SimpleNamespace(content="当前没有待触发提醒。", tool_calls=None),
+        ])
+        assistant = Assistant.__new__(Assistant)
+        assistant.provider = "custom"
+        assistant.model = "qwen-commercial"
+        assistant.client = SimpleNamespace(
+            chat=SimpleNamespace(completions=completions)
+        )
+        assistant._auto_learn = AsyncMock(return_value=None)
+
+        with patch("agent.assistant._db_list_reminders", return_value=[]):
+            reply = await assistant.chat(
+                [{"role": "user", "content": "看看我的提醒"}],
+                access_token="",
+                uid=2,
+            )
+
+        self.assertEqual(reply, "当前没有待触发提醒。")
+        self.assertEqual(len(completions.calls), 3)
+        self.assertEqual(completions.calls[1]["messages"][-1]["role"], "tool")
+        self.assertEqual(completions.calls[2]["messages"][-1]["role"], "user")
+
+    async def test_default_table_state_keeps_single_leading_system_message(self):
+        completions = _FakeCompletions([
+            SimpleNamespace(content="我是测试模型。", tool_calls=None),
+        ])
+        assistant = Assistant.__new__(Assistant)
+        assistant.provider = "deepseek"
+        assistant.model = "deepseek-chat"
+        assistant.client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        assistant._auto_learn = AsyncMock(return_value=None)
+
+        reply = await assistant.chat(
+            [{"role": "user", "content": "你是哪个大模型"}],
+            access_token="",
+            default_file={"file_id": "file-123", "file_name": "部门事务"},
+            all_files=[{"file_id": "file-123", "file_name": "部门事务", "is_default": True}],
+            uid=2,
+        )
+
+        self.assertEqual(reply, "我是测试模型。")
+        sent = completions.calls[0]["messages"]
+        self.assertEqual(sent[0]["role"], "system")
+        self.assertEqual(sum(item["role"] == "system" for item in sent), 1)
+        self.assertIn("本轮最高优先级实时状态", sent[0]["content"])
+        self.assertIn("file-123", sent[0]["content"])
+        self.assertEqual(sent[-1]["role"], "user")
+
+    async def test_reminder_planning_keeps_single_leading_system_message(self):
+        completions = _FakeCompletions([
+            SimpleNamespace(content="提醒规划：请告诉我出发地点。", tool_calls=None),
+        ])
+        assistant = Assistant.__new__(Assistant)
+        assistant.provider = "deepseek"
+        assistant.model = "deepseek-chat"
+        assistant.client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        assistant._auto_learn = AsyncMock(return_value=None)
+
+        await assistant.chat(
+            [{"role": "user", "content": "明天下午2点去民航局开会，提醒我"}],
+            access_token="",
+            uid=2,
+        )
+
+        sent = completions.calls[0]["messages"]
+        self.assertEqual(sent[0]["role"], "system")
+        self.assertEqual(sum(item["role"] == "system" for item in sent), 1)
+        self.assertIn("本轮最高优先级提醒规则", sent[0]["content"])
+        self.assertNotIn("tools", completions.calls[0])
+
     async def test_ordinary_meeting_is_created_without_second_confirmation(self):
         now = datetime.now(timezone(timedelta(hours=8)))
         wrong_date = now.strftime("%Y-%m-%d")
@@ -154,6 +266,9 @@ class ReminderConversationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("已设置", reply)
         self.assertIn("tools", completions.calls[0])
+        # 正常支持 tool 结果的模型仍保持原始协议顺序，
+        # 不会被千问的错误兼容分支改写。
+        self.assertEqual(completions.calls[1]["messages"][-1]["role"], "tool")
         self.assertEqual(
             completions.calls[0]["tool_choice"]["function"]["name"],
             "add_reminder",

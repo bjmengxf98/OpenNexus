@@ -54,9 +54,30 @@ def test_mobile_composer_has_rounded_corners_without_idle_scrollbar():
     assert "resizeInput();bootstrap();" in HTML
 
 
+def test_history_restore_jumps_to_bottom_without_replaying_smooth_scroll():
+    assert "scroll-behavior:smooth" not in HTML
+    assert "function scrollBottom(smooth=false)" in HTML
+    assert "addMessage(m.role,m.content,m.html,m.created_at,false)" in HTML
+    assert "scrollBottom(false)" in HTML
+    assert "if(autoScroll)scrollBottom(true)" in HTML
+
+
 def test_history_hides_parsed_payload_but_keeps_attachment_name():
     saved = "请处理附件\n【文件：汇报材料.docx】\n这里是解析后的长文本"
     assert _display_user_text(saved) == "请处理附件\n📎 汇报材料.docx"
+
+
+def test_chat_turn_can_resume_and_be_cancelled_without_replacing_chat_entrypoint():
+    assert "fetch('/api/app-new/chat'" in HTML
+    assert "X-Agent-Turn-ID" in HTML
+    assert "/events?after=" in HTML
+    assert "/cancel" in HTML
+    assert "function resumeTurn(" in HTML
+    assert "function cancelActiveTurn(" in HTML
+    assert "sendBtn.onclick=()=>state.sending?cancelActiveTurn():send()" in HTML
+    assert ".send.stop{background:#ef4444}" in HTML
+    assert ".send.stop::before{content:\"\";display:block;width:12px;height:12px" in HTML
+    assert "sendBtn.textContent=state.sending?'':'↑'" in HTML
 
 
 def test_user_help_covers_current_major_features():

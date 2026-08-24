@@ -8,11 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import inspect
-import json
 import os
 import tempfile
-import time
 from contextvars import ContextVar
 from datetime import date, datetime
 from pathlib import Path
@@ -22,16 +21,25 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import ToolAnnotations
 from starlette.responses import JSONResponse
 
 from auth import db
 from auth.wps_oauth import auto_refresh_token_for_user, is_token_expired
 from agent import assistant as assistant_module
+from core.context_memory import sanitize_memory_content
+from core.tool_governance import (
+    APPROVAL_ARGUMENT,
+    new_tool_context,
+    policy_for_tool,
+    potentially_requires_approval,
+    run_post_tool_hooks,
+    run_pre_tool_hooks,
+)
 
 
 _identity_var: ContextVar[dict | None] = ContextVar("mcp_identity", default=None)
 _MAX_REMOTE_FILE_BYTES = 20 * 1024 * 1024
-_SENSITIVE_KEYS = {"token", "authorization", "api_key", "password", "file_base64"}
 
 
 mcp_server = FastMCP(
@@ -55,20 +63,6 @@ def _identity() -> dict:
     if not identity:
         raise ToolError("MCP 身份上下文不存在，请重新连接")
     return identity
-
-
-def _redacted_arguments(arguments: dict) -> str:
-    def clean(value: Any, key: str = "") -> Any:
-        if key.lower() in _SENSITIVE_KEYS:
-            return "***"
-        if isinstance(value, dict):
-            return {k: clean(v, k) for k, v in value.items()}
-        if isinstance(value, list):
-            return [clean(v) for v in value[:200]]
-        if isinstance(value, str) and len(value) > 4000:
-            return value[:4000] + "…"
-        return value
-    return json.dumps(clean(arguments), ensure_ascii=False, default=str)
 
 
 async def _wps_access_token(user_id: int) -> str:
@@ -147,10 +141,30 @@ async def _execute_special(name: str, args: dict, identity: dict) -> dict | None
     user_id = int(identity["user_id"])
     display_name = identity.get("display_name") or identity.get("username") or "OpenNexus"
     if name == "save_memory":
-        old = db.get_user_memory(user_id)
-        content = (args.get("content") or "").strip()
-        db.save_user_memory(user_id, (old + "\n- " + content) if old else "- " + content)
-        return {"ok": True, "message": f"已永久记住：{content}"}
+        content, rejected = sanitize_memory_content(args.get("content") or "")
+        if not content:
+            return {"error": "该内容属于实时 WPS 配置，不写入长期记忆"}
+        requested_scope = str(args.get("scope") or "global")
+        if requested_scope == "current_table":
+            file_id = str(args.get("file_id") or "")
+            allowed = {str(item.get("file_id") or "") for item in db.list_wps_files(user_id)}
+            if not file_id or file_id not in allowed:
+                return {"error": "请为 current_table 记忆提供当前用户已连接的 file_id"}
+            scope_type, scope_id, scope_label = "file", file_id, "数据源"
+        else:
+            # MCP 没有 OpenNexus 对话 ID；current_topic 不冒充全局记忆。
+            if requested_scope == "current_topic":
+                return {"error": "MCP 调用没有 OpenNexus 当前话题，请使用 global 或 current_table"}
+            scope_type, scope_id, scope_label = "global", "", "个人长期"
+        db.save_memory_item(
+            user_id, content, scope_type=scope_type, scope_id=scope_id,
+            category="explicit", source_type="mcp_explicit", confidence=1.0,
+        )
+        if scope_type == "global":
+            old = db.get_user_memory(user_id)
+            db.save_user_memory(user_id, (old + "\n- " + content) if old else "- " + content)
+        note = "；实时配置已忽略" if rejected else ""
+        return {"ok": True, "message": f"已保存为{scope_label}记忆：{content}{note}"}
     if name == "send_notification":
         return assistant_module._send_notification(args, sender_name=display_name)
     if name == "get_change_log":
@@ -189,10 +203,21 @@ async def _execute_special(name: str, args: dict, identity: dict) -> dict | None
 
 async def execute_tool(name: str, arguments: dict) -> dict:
     identity = _identity()
-    started = time.perf_counter()
-    success = False
+    hook_context = new_tool_context(identity, name, arguments)
+    result: dict | None = None
     error_text = ""
     try:
+        decision = await run_pre_tool_hooks(hook_context)
+        if decision.action == "deny":
+            raise ToolError(decision.message or "当前令牌无权执行该工具")
+        if decision.action == "ask":
+            result = decision.payload or {
+                "ok": False,
+                "code": "approval_required",
+                "message": decision.message or "该操作需要批准",
+            }
+            return result
+        arguments = hook_context.arguments
         special = await _execute_special(name, arguments, identity)
         if special is not None:
             result = special
@@ -275,7 +300,6 @@ async def execute_tool(name: str, arguments: dict) -> dict:
             result = {"ok": True, "result": result}
         if result.get("error"):
             raise ToolError(str(result["error"]))
-        success = True
         return result
     except Exception as exc:
         error_text = str(exc)
@@ -283,11 +307,7 @@ async def execute_tool(name: str, arguments: dict) -> dict:
             raise
         raise ToolError(error_text) from exc
     finally:
-        duration_ms = round((time.perf_counter() - started) * 1000)
-        db.add_mcp_audit_log(
-            identity["user_id"], identity.get("id"), name,
-            _redacted_arguments(arguments), success, error_text, duration_ms,
-        )
+        await run_post_tool_hooks(hook_context, result, error_text)
 
 
 def _annotation(schema: dict) -> Any:
@@ -299,15 +319,26 @@ def _annotation(schema: dict) -> Any:
 def _register_tool(spec: dict) -> None:
     function = spec["function"]
     name = function["name"]
-    schema = function.get("parameters") or {"type": "object", "properties": {}}
-    properties = schema.get("properties") or {}
+    schema = copy.deepcopy(function.get("parameters") or {"type": "object", "properties": {}})
+    properties = schema.setdefault("properties", {})
     required = set(schema.get("required") or [])
+    policy = policy_for_tool(name)
+    description = function.get("description", name)
+    if potentially_requires_approval(name):
+        properties[APPROVAL_ARGUMENT] = {
+            "type": "string",
+            "description": (
+                "高风险操作首次调用后由 OpenNexus 返回。用户在设置页批准后，"
+                "使用完全相同的业务参数并附带此 approval_id 重试。"
+            ),
+        }
+        description += "【安全控制】此工具在高风险场景会先生成审批单，批准前不会执行。"
 
     async def dynamic_tool(**kwargs: Any) -> dict:
         return await execute_tool(name, {key: value for key, value in kwargs.items() if value is not None})
 
     dynamic_tool.__name__ = name
-    dynamic_tool.__doc__ = function.get("description", "")
+    dynamic_tool.__doc__ = description
     dynamic_tool.__signature__ = inspect.Signature(
         [
             inspect.Parameter(
@@ -320,7 +351,22 @@ def _register_tool(spec: dict) -> None:
         ],
         return_annotation=dict,
     )
-    mcp_server.add_tool(dynamic_tool, name=name, description=function.get("description", name))
+    mcp_server.add_tool(
+        dynamic_tool,
+        name=name,
+        description=description,
+        annotations=ToolAnnotations(
+            readOnlyHint=policy.read_only,
+            destructiveHint=policy.destructive,
+            idempotentHint=policy.idempotent,
+            openWorldHint=policy.open_world,
+        ),
+        meta={
+            "opennexus/risk": policy.risk,
+            "opennexus/required_scope": policy.required_scope,
+            "opennexus/approval_possible": potentially_requires_approval(name),
+        },
+    )
     tool = mcp_server._tool_manager.get_tool(name)
     if tool:
         tool.parameters = schema

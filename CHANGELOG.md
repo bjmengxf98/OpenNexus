@@ -2,6 +2,19 @@
 
 All notable public changes to OpenNexus are recorded here.
 
+## [Unreleased]
+
+### Added
+
+- User-, conversation-, and WPS-data-source-scoped context memory
+- Relevant history retrieval based only on the current user's own statements
+
+### Changed
+
+- Conversation summaries are isolated per topic and exclude assistant-generated claims
+- Live WPS data remains authoritative; runtime file and sheet selection is not persisted as memory
+- Legacy memory behavior remains available as a compatibility fallback
+
 ## [1.0.0] - 2026-08-09
 
 ### Added

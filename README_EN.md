@@ -23,7 +23,7 @@ OpenNexus is not merely a chatbot for spreadsheets. Its goal is to provide a pra
 - Business-aware reminders with retryable delivery through WeCom, WPS messaging, and an experimental personal-WeChat bridge
 - File upload, image understanding, document generation, and RAG-based knowledge retrieval
 - Topic-based conversations, users, roles, audit records, and feedback management
-- A full MCP server for WorkBuddy and other compatible clients to invoke OpenNexus business capabilities
+- A full MCP server for WorkBuddy and other compatible clients, with least-privilege tokens, code-enforced approval for high-risk actions, and audit trails
 - Responsive desktop/mobile UI, PWA installation, and light/dark/system themes
 
 ## Architecture

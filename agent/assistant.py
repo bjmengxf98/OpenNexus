@@ -31,6 +31,8 @@ from auth.db import (search_knowledge as _db_search_knowledge,
                      set_change_log_last_seen as _db_set_last_seen,
                      save_user_memory as _db_save_user_memory,
                      get_user_memory as _db_get_user_memory,
+                     save_memory_item as _db_save_memory_item,
+                     list_memory_items as _db_list_memory_items,
                      get_wps_user_id_by_name as _db_get_wps_uid,
                      list_users_for_ai as _db_list_users_for_ai,
                      add_wps_file as _db_add_wps_file,
@@ -45,6 +47,7 @@ from agent.wecom_client import send_wecom_webhook as _wecom_send
 from auth.db import get_system_config as _db_get_system_config
 from auth.db import get_wecom_userid as _db_get_wecom_userid
 from core.document_generator import generate_and_upload_document as _generate_document
+from core.context_memory import sanitize_memory_content
 
 LLM_PRESETS = {
     "scnet": {
@@ -356,6 +359,8 @@ content 参数是一个 JSON 对象（不是字符串），包含 sections 数�
 **绝对禁止说"我无法记忆""会话结束后会忘记""我没有长期记忆"等话**——这是错误的，系统已解决此问题。
 
 - 用户说「记住」「记下来」「下次也记得」「永久保存」等时，**立即调用 save_memory 工具**写入数据库，然后告知"已永久记住"
+- 个人偏好、身份和长期习惯使用 global；只适用于当前对话的内容使用 current_topic；只适用于当前 WPS 表格的业务规则使用 current_table
+- WPS 的 file_id、sheet_id、默认表选择等实时配置绝对不能写入记忆
 - 用户问"你能记忆吗"时，回答：能，你说的重要内容我会永久记住，下次对话也不会忘
 - 不要只说"好的我记住了"而不调用工具——必须真正调用工具写入
 
@@ -589,6 +594,46 @@ def build_system_prompt(username: str, role: str,
         file_hint=safe_file_hint,
         memory_hint=safe_memory_hint,
     )
+
+
+def _coalesce_system_messages(messages: list) -> list:
+    """合并所有系统消息并固定在首位，兼容只接受首条 system 的模型接口。"""
+    system_parts = []
+    ordinary_messages = []
+    for message in messages:
+        if message.get("role") == "system":
+            content = str(message.get("content") or "").strip()
+            if content:
+                system_parts.append(content)
+        else:
+            ordinary_messages.append(message)
+    if not system_parts:
+        return ordinary_messages
+    return [{"role": "system", "content": "\n\n".join(system_parts)}] + ordinary_messages
+
+
+def _needs_tool_result_user_bridge(error: Exception, messages: list) -> bool:
+    """仅识别“工具结果后必须再有 user 消息”的严格兼容网关。
+
+    正常模型永远不进入此分支；错误文本和末条 tool 角色必须同时匹配，
+    避免把其他 500 错误误判为千问兼容问题。
+    """
+    if not messages or messages[-1].get("role") != "tool":
+        return False
+    if not any(message.get("role") == "user" for message in messages):
+        return False
+    return "no user query found in messages" in str(error).lower()
+
+
+def _append_tool_result_user_bridge(messages: list) -> list:
+    """在工具结果后补一条语义不变的续问，供严格千问网关识别。"""
+    return list(messages) + [{
+        "role": "user",
+        "content": (
+            "请继续处理我上一条请求，根据刚才的工具返回结果直接回答；"
+            "如果完成回答仍缺少数据，可继续调用必要工具。"
+        ),
+    }]
 
 
 TOOLS = [
@@ -1122,6 +1167,15 @@ TOOLS = [
                     "content": {
                         "type": "string",
                         "description": "要永久记住的内容，简洁清晰，如：每周五下午3点开例会；李总分机号123",
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["global", "current_topic", "current_table"],
+                        "description": "记忆范围：个人长期信息用 global；仅当前话题用 current_topic；当前 WPS 表业务规则用 current_table。默认 global",
+                    },
+                    "file_id": {
+                        "type": "string",
+                        "description": "scope=current_table 时可指定已连接 WPS 文件；省略则使用当前默认表格",
                     },
                 },
                 "required": ["content"],
@@ -2173,7 +2227,8 @@ def _detect_event_reminder_scene(user_msg: str) -> str:
 
 class Assistant:
     def __init__(self, api_key: str, provider: str = "deepseek",
-                 base_url: str = None, model: str = None):
+                 base_url: str = None, model: str = None,
+                 advanced: dict | None = None):
         preset = LLM_PRESETS.get(provider, LLM_PRESETS["deepseek"])
         self.provider = provider  # 保存 provider
         self.client = AsyncOpenAI(
@@ -2181,8 +2236,23 @@ class Assistant:
             base_url=base_url or preset["base_url"],
         )
         self.model = model or preset["model"]
+        self.advanced = advanced or {}
+        self.supports_tools = bool(self.advanced.get("supports_tools", True))
+        self.supports_vision = bool(self.advanced.get("supports_vision", False))
+        self.reasoning_mode = str(self.advanced.get("reasoning_mode") or "auto").lower()
+        self.reasoning_effort = str(self.advanced.get("reasoning_effort") or "auto").lower()
+        try:
+            self.context_window = int(self.advanced.get("context_window") or 0)
+        except (TypeError, ValueError):
+            self.context_window = 0
+        try:
+            self.max_output_tokens = int(self.advanced.get("max_output_tokens") or 8192)
+        except (TypeError, ValueError):
+            self.max_output_tokens = 8192
+        self.max_output_tokens = max(128, min(self.max_output_tokens, 262_144))
 
-    async def _auto_learn(self, user_msg: str, ai_reply: str, uid: int, actual_model: str):
+    async def _auto_learn(self, user_msg: str, ai_reply: str, uid: int,
+                          actual_model: str, conv_id: int = 0):
         """
         后台自动学习（不阻塞主响应）：
         第一层 — 自动识别对话中的长期价值信息并存入记忆
@@ -2197,6 +2267,18 @@ class Assistant:
             return
 
         existing_memory = _db_get_user_memory(uid) or ""
+        if conv_id:
+            topic_items = _db_list_memory_items(
+                uid, scope_type="conversation", scope_ids=[str(conv_id)], limit=30,
+            )
+            if topic_items:
+                existing_memory += "\n" + "\n".join(
+                    str(item.get("content") or "") for item in topic_items
+                )
+        # 这一分支只提取明确的长期价值信息，继续按全局记忆保存，
+        # 保持旧版“跨话题记住习惯/偏好”能力。话题细节由独立话题摘要承载。
+        memory_scope = "global"
+        memory_scope_id = ""
 
         # ── 第二层：纠错记忆（优先）────────────────────────
         _CORRECTION_KW = ["不对", "不是", "错了", "不叫", "应该是", "不应该",
@@ -2209,7 +2291,6 @@ class Assistant:
                     messages=[{"role": "user", "content":
                         f"用户在纠正AI的错误。请提炼出需要永久记住的正确事实或规则。\n\n"
                         f"用户说：{user_msg}\n"
-                        f"AI原回复：{ai_reply[:200]}\n\n"
                         f"已有记忆（避免重复）：\n{existing_memory[:500] or '（空）'}\n\n"
                         f"要求：\n"
                         f"1. 提炼成一句简洁的话，格式：[纠错] 正确做法\n"
@@ -2219,10 +2300,18 @@ class Assistant:
                 )
                 item = resp.choices[0].message.content.strip()
                 if item and item not in ("无", "重复") and item.startswith("[纠错]"):
-                    merged = (existing_memory + "\n- " + item) if existing_memory else "- " + item
-                    _db_save_user_memory(uid, merged)
-                    print(f"[AUTO_LEARN] 纠错记忆已保存: {item}")
-                    return  # 本轮只写一条，纠错优先
+                    safe_item, _rejected = sanitize_memory_content(item)
+                    if safe_item:
+                        _db_save_memory_item(
+                            uid, safe_item, scope_type=memory_scope,
+                            scope_id=memory_scope_id, category="correction",
+                            source_type="user_correction", confidence=0.95,
+                        )
+                        old = _db_get_user_memory(uid)
+                        merged = (old + "\n- " + safe_item) if old else "- " + safe_item
+                        _db_save_user_memory(uid, merged)
+                        print(f"[AUTO_LEARN] 纠错记忆已保存: {safe_item}")
+                        return  # 本轮只写一条，纠错优先
             except Exception as e:
                 print(f"[AUTO_LEARN] 纠错检测失败: {e}")
 
@@ -2233,7 +2322,6 @@ class Assistant:
                 messages=[{"role": "user", "content":
                     f"分析下面这段对话，判断是否包含值得长期记忆的信息。\n\n"
                     f"用户说：{user_msg}\n"
-                    f"AI回复：{ai_reply[:300]}\n\n"
                     f"已有记忆（避免重复）：\n{existing_memory[:500] or '（空）'}\n\n"
                     f"【值得记忆的信息类型】\n"
                     f"✅ 工作习惯（如：每周五下午开例会）\n"
@@ -2251,9 +2339,17 @@ class Assistant:
             )
             item = resp.choices[0].message.content.strip()
             if item and item != "无" and item.startswith("[自动]"):
-                merged = (existing_memory + "\n- " + item) if existing_memory else "- " + item
-                _db_save_user_memory(uid, merged)
-                print(f"[AUTO_LEARN] 自动记忆已保存: {item}")
+                safe_item, _rejected = sanitize_memory_content(item)
+                if safe_item:
+                    _db_save_memory_item(
+                        uid, safe_item, scope_type=memory_scope,
+                        scope_id=memory_scope_id, category="automatic",
+                        source_type="user_statement", confidence=0.75,
+                    )
+                    old = _db_get_user_memory(uid)
+                    merged = (old + "\n- " + safe_item) if old else "- " + safe_item
+                    _db_save_user_memory(uid, merged)
+                    print(f"[AUTO_LEARN] 自动记忆已保存: {safe_item}")
         except Exception as e:
             print(f"[AUTO_LEARN] 自动记忆识别失败: {e}")
 
@@ -2268,10 +2364,11 @@ class Assistant:
             elif line.strip():
                 summarize_lines.append(line.strip())
 
+        # 只以用户原话为记忆证据。AI 回复可能包含推测，不能反过来固化为用户事实。
         conv_text = "\n".join(
-            f"{'用户' if m['role'] == 'user' else 'AI'}：{m['content'][:300]}"
+            f"用户：{m['content'][:300]}"
             for m in recent_messages
-            if m["role"] in ("user", "assistant")
+            if m["role"] == "user"
         )
         prompt = MEMORY_SUMMARIZE_PROMPT.format(
             existing_memory="\n".join(summarize_lines) or "（暂无）",
@@ -2299,12 +2396,39 @@ class Assistant:
                    on_tool_call=None, username: str = "用户",
                    role: str = "staff", default_file: dict = None,
                    all_files: list = None, memory: str = "",
-                   uid: int = 0) -> str:
+                   uid: int = 0, conv_id: int = 0) -> str:
+        # 兼容旧测试、插件或外部代码通过 Assistant.__new__ 构造的实例；
+        # 正常运行时这些值均由 __init__ 从高级配置写入。
+        if not hasattr(self, "supports_tools"):
+            self.supports_tools = True
+        if not hasattr(self, "supports_vision"):
+            self.supports_vision = False
+        if not hasattr(self, "reasoning_mode"):
+            self.reasoning_mode = "auto"
+        if not hasattr(self, "reasoning_effort"):
+            self.reasoning_effort = "auto"
+        if not hasattr(self, "context_window"):
+            self.context_window = 0
+        if not hasattr(self, "max_output_tokens"):
+            self.max_output_tokens = 8192
         from datetime import datetime, timezone, timedelta
         _now = datetime.now(tz=timezone(timedelta(hours=8)))
         _wd  = ["周一","周二","周三","周四","周五","周六","周日"][_now.weekday()]
         _today = _now.strftime("%Y年%m月%d日") + "(" + _wd + ")" + _now.strftime(" %H:%M")
         system_prompt = build_system_prompt(username, role, default_file, all_files, memory)
+
+        # 部分 OpenAI 兼容接口（尤其部分千问网关）要求 system 只能出现在
+        # 消息数组首位。实时配置仍保持系统级权限，并放在系统提示末尾以维持
+        # 对 DeepSeek 等原有模型的近因强调效果，不降级成用户消息。
+        if default_file:
+            _rt_name = default_file.get("file_name") or default_file["file_id"]
+            _rt_id = default_file["file_id"]
+            system_prompt += (
+                "\n\n## 本轮最高优先级实时状态\n"
+                f"当前默认表格：**{_rt_name}**（file_id: {_rt_id}）。"
+                "如用户未指定表格，必须使用此 file_id；"
+                "如用户明确指定了其他已配置表格，直接使用用户指定的表格。"
+            )
 
         # ── 历史清洗 ──────────────────────────────────────────
         # 去掉传给 API 的 tool_calls / tool 消息，断掉模型对历史成功结果的"幻觉依赖"
@@ -2340,20 +2464,22 @@ class Assistant:
                 _base += f"\n\n{_filing_guide}"
             injected[-1]["content"] = _base
 
+        # 自定义模型可声明上下文窗口。用保守字符估算裁剪最旧历史，始终保留
+        # 系统提示和当前用户消息；未配置时沿用路由层最近 20 条的默认策略。
+        if self.context_window and len(injected) > 1:
+            reserve_chars = self.max_output_tokens * 2
+            history_budget = max(2000, self.context_window * 2 - len(system_prompt) - reserve_chars)
+            while len(injected) > 1 and sum(len(str(m.get("content", ""))) for m in injected) > history_budget:
+                injected.pop(0)
+
         full_messages = [{"role": "system", "content": system_prompt}] + injected
 
-        # 方案2：位置反转——实时配置插到最末尾紧贴用户提问，利用近因效应压过记忆
-        if default_file:
-            _rt_name = default_file.get("file_name") or default_file["file_id"]
-            _rt_id   = default_file["file_id"]
-            _rt_msg  = {
-                "role": "system",
-                "content": (
-                    f"[系统实时状态] 当前默认表格：**{_rt_name}**（file_id: {_rt_id}）。"
-                    "如用户未指定表格，必须使用此 file_id；如用户明确指定了其他已配置表格，直接使用用户指定的表格。"
-                ),
-            }
-            full_messages = full_messages[:-1] + [_rt_msg] + [full_messages[-1]]
+        def _append_system_instruction(instruction: str):
+            """追加系统级规则，但始终保持消息数组只有首条 system。"""
+            nonlocal full_messages
+            full_messages = _coalesce_system_messages(
+                full_messages + [{"role": "system", "content": instruction}]
+            )
 
         # 合法 file_id 集合：用户已配置的所有文件，AI 可以自由在这些文件间切换
         _valid_file_ids = {f["file_id"] for f in (all_files or [])} if all_files else set()
@@ -2450,10 +2576,8 @@ class Assistant:
                     "用最少的问题确认具体日期、事件时间，以及是否涉及出行。"
                     "回复必须以「提醒规划：」开头，不得调用工具，不得声称已经设置。"
                 )
-            full_messages = (
-                full_messages[:-1]
-                + [{"role": "system", "content": _planning_instruction}]
-                + [full_messages[-1]]
+            _append_system_instruction(
+                "## 本轮最高优先级提醒规则\n" + _planning_instruction
             )
 
         # 检测微信发送意图 → 第一轮强制指定 send_weixin_message
@@ -2483,6 +2607,16 @@ class Assistant:
                           "有什么新增", "有什么修改", "有什么删除", "变更记录", "操作记录"]
         _force_change_log = any(kw in _last_user_content for kw in _CHANGE_LOG_KW)
 
+        if not self.supports_tools and any((
+            _force_sheets_create, _force_change_log, _force_doc_gen,
+            _force_reminder, _force_weixin, _force_tool_first,
+        )):
+            return (
+                "当前主模型配置为不支持工具调用，只能进行普通对话。"
+                "请在设置的主模型高级配置中启用“支持工具调用”，"
+                "或更换具备工具调用能力的模型后再执行此操作。"
+            )
+
         _create_records_success = False  # 追踪 create_records 是否成功
         _reminder_created_success = False  # 追踪本轮提醒是否已真实写入数据库
         for _turn in range(50):
@@ -2494,29 +2628,48 @@ class Assistant:
                 _enable_reasoning = True
                 # 兼容小写(-reasoning)和大写(-Reasoning)两种后缀
                 _actual_model = self.model[:-len("-reasoning")]
+            if self.reasoning_mode == "on":
+                _enable_reasoning = True
+            elif self.reasoning_mode == "off":
+                _enable_reasoning = False
 
             _kwargs = dict(
                 model=_actual_model,
-                messages=full_messages,
-                tools=TOOLS,
-                max_tokens=8192,
+                # 最后一道结构防线：未来新增规则即使误追加 system，也会在
+                # 发出请求前合并回首位。普通消息、tool_calls 与 tool 结果顺序不变。
+                messages=_coalesce_system_messages(full_messages),
+                max_tokens=self.max_output_tokens,
             )
+            if self.supports_tools:
+                _kwargs["tools"] = TOOLS
             # 规划阶段只允许自然语言澄清/提案，彻底禁止提前写入提醒。
             if _reminder_needs_planning:
                 _kwargs.pop("tools", None)
             # DeepSeek 思考模式控制
             if self.provider == "deepseek" and _actual_model in {"deepseek-v4-flash", "deepseek-v4-pro"}:
                 if _enable_reasoning:
-                    _kwargs["reasoning_effort"] = "max"
+                    _kwargs["reasoning_effort"] = (
+                        "max" if self.reasoning_effort == "auto" else self.reasoning_effort
+                    )
                     _kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
                 else:
                     _kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
             # SCNet DeepSeek V4 思考模式控制（-Reasoning 后缀 → enable_thinking=true）
             elif self.provider == "scnet" and _actual_model in {"DeepSeek-V4-Flash", "DeepSeek-V4-Pro"}:
                 if _enable_reasoning:
-                    _kwargs["extra_body"] = {"enable_thinking": True, "reasoning_effort": "high"}
+                    effort = "high" if self.reasoning_effort in {"auto", "max"} else self.reasoning_effort
+                    _kwargs["extra_body"] = {"enable_thinking": True, "reasoning_effort": effort}
                 else:
                     _kwargs["extra_body"] = {"enable_thinking": False}
+            elif _enable_reasoning:
+                # 自定义 OpenAI 兼容模型仅在用户明确开启推理时发送标准风格参数。
+                # 不主动猜测各厂商私有的 thinking/enable_thinking 请求结构。
+                effort = self.reasoning_effort
+                if effort == "auto":
+                    effort = "high"
+                if effort == "max":
+                    effort = "high"
+                _kwargs["reasoning_effort"] = effort
             # 千问 3.6-plus 和 deepseek-reasoner/v4系列 不支持任何形式的 tool_choice
             _is_qwen_36plus = (self.provider == "qwen" and _actual_model == "qwen3.6-plus")
             _is_deepseek_no_tc = (self.provider == "deepseek" and _actual_model in {
@@ -2528,22 +2681,22 @@ class Assistant:
             if _reminder_needs_planning:
                 pass
             # 第一轮：传统表格新建意图 → 强制指定 sheets_create_file，优先级最高
-            elif _turn == 0 and _force_sheets_create and not _no_tool_choice:
+            elif _turn == 0 and _force_sheets_create and self.supports_tools and not _no_tool_choice:
                 _kwargs["tool_choice"] = {"type": "function", "function": {"name": "sheets_create_file"}}
             # 第一轮：变更查询意图 → 强制指定 get_change_log
-            elif _turn == 0 and _force_change_log and not _no_tool_choice:
+            elif _turn == 0 and _force_change_log and self.supports_tools and not _no_tool_choice:
                 _kwargs["tool_choice"] = {"type": "function", "function": {"name": "get_change_log"}}
             # 第一轮：文档生成意图 → 强制指定 generate_document
-            elif _turn == 0 and _force_doc_gen and not _no_tool_choice:
+            elif _turn == 0 and _force_doc_gen and self.supports_tools and not _no_tool_choice:
                 _kwargs["tool_choice"] = {"type": "function", "function": {"name": "generate_document"}}
             # 第一轮：当前用户的定时提醒 → 强制写入提醒表
-            elif _turn == 0 and _force_reminder and not _no_tool_choice:
+            elif _turn == 0 and _force_reminder and self.supports_tools and not _no_tool_choice:
                 _kwargs["tool_choice"] = {"type": "function", "function": {"name": "add_reminder"}}
             # 第一轮：微信发送意图 → 强制指定工具
-            elif _turn == 0 and _force_weixin and not _no_tool_choice:
+            elif _turn == 0 and _force_weixin and self.supports_tools and not _no_tool_choice:
                 _kwargs["tool_choice"] = {"type": "function", "function": {"name": "send_weixin_message"}}
             # 第一轮：其他操作指令 → 强制调用某个工具（防止复用历史结果）
-            elif _turn == 0 and _force_tool_first and not _no_tool_choice:
+            elif _turn == 0 and _force_tool_first and self.supports_tools and not _no_tool_choice:
                 _kwargs["tool_choice"] = "required"
             try:
                 resp = await self.client.chat.completions.create(**_kwargs)
@@ -2575,26 +2728,42 @@ class Assistant:
                 if _force_reminder or _reminder_needs_planning:
                     return "模型服务当前繁忙，本次提醒尚未设置。请稍后再试。"
                 return "模型服务当前繁忙，请稍后再试。"
+            except Exception as _api_error:
+                # 部分千问 OpenAI 兼容网关不接受以 tool 结果结尾的
+                # 二次请求，会返回 no user query found in messages。只在该
+                # 特定错误与消息形态同时出现时补语义等价的续问；正常
+                # DeepSeek/Agnes/其他模型的请求结构完全不变。
+                _sent_messages = _kwargs.get("messages") or []
+                if not _needs_tool_result_user_bridge(_api_error, _sent_messages):
+                    raise
+                print(
+                    "[LLM COMPAT] strict tool-result gateway requires a trailing "
+                    "user query; retrying once with a semantic continuation"
+                )
+                full_messages = _append_tool_result_user_bridge(full_messages)
+                _compat_kwargs = dict(_kwargs)
+                _compat_kwargs["messages"] = _coalesce_system_messages(full_messages)
+                resp = await self.client.chat.completions.create(**_compat_kwargs)
             msg = resp.choices[0].message
 
             if not msg.tool_calls:
                 if _force_reminder and not _reminder_created_success:
                     if _turn == 0:
                         # 某些模型不支持 tool_choice；明确纠正一次，但绝不把普通文字当作成功。
-                        full_messages.append({
-                            "role": "system",
-                            "content": (
-                                "必须立即调用 add_reminder 写入数据库。"
-                                "禁止仅用文字声称提醒已设置。"
-                            ),
-                        })
+                        _append_system_instruction(
+                            "## 本轮最高优先级提醒写入纠正\n"
+                            "必须立即调用 add_reminder 写入数据库。"
+                            "禁止仅用文字声称提醒已设置。"
+                        )
                         continue
                     return "提醒未能写入系统，请稍后重试；本次没有虚假地标记为设置成功。"
                 reply = msg.content or ""
                 # 后台自动学习：不阻塞响应，fire-and-forget
                 import asyncio as _asyncio
                 _asyncio.create_task(
-                    self._auto_learn(_last_user_content, reply, uid, _actual_model)
+                    self._auto_learn(
+                        _last_user_content, reply, uid, _actual_model, conv_id=conv_id,
+                    )
                 )
                 return reply
 
@@ -2653,11 +2822,42 @@ class Assistant:
                 try:
                     if name == "save_memory":
                         if uid:
-                            old = _db_get_user_memory(uid)
-                            new_content = args.get("content", "")
-                            merged = (old + "\n- " + new_content) if old else "- " + new_content
-                            _db_save_user_memory(uid, merged)
-                            result = {"ok": True, "message": f"已永久记住：{new_content}"}
+                            new_content, rejected = sanitize_memory_content(args.get("content", ""))
+                            if not new_content:
+                                result = {
+                                    "error": "该内容属于实时 WPS 配置，不写入长期记忆；系统会在每轮实时读取。"
+                                }
+                            else:
+                                requested_scope = str(args.get("scope") or "global")
+                                if requested_scope == "current_topic" and conv_id:
+                                    scope_type, scope_id = "conversation", str(conv_id)
+                                    scope_label = "当前话题"
+                                elif requested_scope == "current_table":
+                                    target_file_id = str(args.get("file_id") or _active_file_id or "")
+                                    if not target_file_id or target_file_id not in _valid_file_ids:
+                                        result = {"error": "当前没有可用的 WPS 表格，无法保存表格业务规则"}
+                                        target_file_id = ""
+                                    else:
+                                        scope_type, scope_id = "file", target_file_id
+                                        scope_label = "当前数据源"
+                                else:
+                                    scope_type, scope_id = "global", ""
+                                    scope_label = "个人长期"
+                                if (requested_scope != "current_table") or target_file_id:
+                                    _db_save_memory_item(
+                                        uid, new_content, scope_type=scope_type, scope_id=scope_id,
+                                        category="explicit", source_type="explicit", confidence=1.0,
+                                    )
+                                    # 旧表继续维护全局显式记忆，保证旧版本/插件读取行为不变。
+                                    if scope_type == "global":
+                                        old = _db_get_user_memory(uid)
+                                        merged = (old + "\n- " + new_content) if old else "- " + new_content
+                                        _db_save_user_memory(uid, merged)
+                                    note = "；实时配置已忽略" if rejected else ""
+                                    result = {
+                                        "ok": True,
+                                        "message": f"已保存为{scope_label}记忆：{new_content}{note}",
+                                    }
                         else:
                             result = {"error": "无法获取用户ID，记忆保存失败"}
                     elif name == "send_notification":

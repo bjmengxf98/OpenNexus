@@ -2,6 +2,7 @@
 数据库模块 - SQLite用户管理
 """
 import sqlite3
+import json
 import bcrypt
 import secrets
 import hashlib
@@ -139,6 +140,12 @@ def init_db():
                 conn.execute(f"ALTER TABLE user_llm_keys ADD COLUMN {col} TEXT")
             except Exception:
                 pass
+        # 迁移：模型能力与高级请求参数（JSON，兼容未来继续扩展）
+        for col in ("advanced_config TEXT DEFAULT '{}'", "image_advanced_config TEXT DEFAULT '{}'"):
+            try:
+                conn.execute(f"ALTER TABLE user_llm_keys ADD COLUMN {col}")
+            except Exception:
+                pass
         # 迁移：用户活跃表格选择
         try:
             conn.execute("ALTER TABLE users ADD COLUMN active_file_ids TEXT DEFAULT ''")
@@ -160,6 +167,37 @@ def init_db():
             FOREIGN KEY(user_id) REFERENCES users(id)
         )
         """)
+        # 结构化上下文记忆。保留上方 user_memory 作为旧版本兼容与回退，
+        # 新数据按用户、话题和 WPS 数据源隔离，避免不同用户/业务互相污染。
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS memory_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            scope_type TEXT NOT NULL DEFAULT 'global',
+            scope_id TEXT NOT NULL DEFAULT '',
+            category TEXT NOT NULL DEFAULT 'general',
+            content TEXT NOT NULL,
+            source_type TEXT NOT NULL DEFAULT 'explicit',
+            source_id TEXT NOT NULL DEFAULT '',
+            confidence REAL NOT NULL DEFAULT 1.0,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_items_user_scope "
+            "ON memory_items(user_id, scope_type, scope_id, status)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_items_source "
+            "ON memory_items(user_id, source_type, source_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_history_user_role "
+            "ON chat_history(user_id, role, id DESC)"
+        )
         # 迁移：WPS 变更日志表（webhook 推送内容持久化）
         conn.execute("""
         CREATE TABLE IF NOT EXISTS wps_change_log (
@@ -196,6 +234,11 @@ def init_db():
             FOREIGN KEY(user_id) REFERENCES users(id)
         )
         """)
+        for table in ("user_provider_configs", "user_image_provider_configs"):
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN advanced_config TEXT DEFAULT '{{}}'")
+            except Exception:
+                pass
         # 迁移：知识库分类字段
         try:
             conn.execute("ALTER TABLE org_knowledge ADD COLUMN category TEXT DEFAULT '规章制度'")
@@ -239,6 +282,51 @@ def init_db():
             FOREIGN KEY(user_id) REFERENCES users(id)
         )
         """)
+        # 持久化代理 Turn 与事件流。旧聊天记录仍是最终消息来源；这些表只负责
+        # 运行状态、断线续接与取消，不改变原有 conversations/chat_history 结构。
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS agent_turns (
+            id                 TEXT PRIMARY KEY,
+            user_id            INTEGER NOT NULL,
+            conversation_id    INTEGER NOT NULL,
+            status             TEXT NOT NULL DEFAULT 'queued',
+            request_json       TEXT NOT NULL DEFAULT '{}',
+            cancel_requested   INTEGER NOT NULL DEFAULT 0,
+            worker_id          TEXT DEFAULT '',
+            heartbeat_at       TEXT DEFAULT '',
+            error              TEXT DEFAULT '',
+            created_at         TEXT NOT NULL,
+            updated_at         TEXT NOT NULL,
+            completed_at       TEXT DEFAULT '',
+            FOREIGN KEY(user_id) REFERENCES users(id),
+            FOREIGN KEY(conversation_id) REFERENCES conversations(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS agent_turn_events (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            turn_id     TEXT NOT NULL,
+            event_type  TEXT NOT NULL,
+            payload     TEXT NOT NULL DEFAULT '{}',
+            created_at  TEXT NOT NULL,
+            FOREIGN KEY(turn_id) REFERENCES agent_turns(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_agent_turns_user_status
+            ON agent_turns(user_id, status, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_agent_turns_conversation
+            ON agent_turns(user_id, conversation_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_agent_turn_events_turn
+            ON agent_turn_events(turn_id, id);
+        """)
+        # 第二阶段已创建过 agent_turns 的数据库，继续采用追加字段迁移。
+        for column_sql in (
+            "ALTER TABLE agent_turns ADD COLUMN worker_id TEXT DEFAULT ''",
+            "ALTER TABLE agent_turns ADD COLUMN heartbeat_at TEXT DEFAULT ''",
+        ):
+            try:
+                conn.execute(column_sql)
+            except Exception:
+                pass
         # 迁移：chat_history 添加 conversation_id 字段
         try:
             conn.execute("ALTER TABLE chat_history ADD COLUMN conversation_id INTEGER REFERENCES conversations(id)")
@@ -342,14 +430,50 @@ def init_db():
             success     INTEGER NOT NULL DEFAULT 0,
             error       TEXT DEFAULT '',
             duration_ms INTEGER DEFAULT 0,
+            risk        TEXT DEFAULT '',
+            decision    TEXT DEFAULT '',
+            approval_id TEXT DEFAULT '',
+            required_scope TEXT DEFAULT '',
             created_at  TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id),
+            FOREIGN KEY(token_id) REFERENCES mcp_tokens(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS mcp_tool_approvals (
+            id             TEXT PRIMARY KEY,
+            user_id        INTEGER NOT NULL,
+            token_id       INTEGER NOT NULL,
+            tool_name      TEXT NOT NULL,
+            arguments_hash TEXT NOT NULL,
+            arguments      TEXT DEFAULT '',
+            risk           TEXT DEFAULT '',
+            required_scope TEXT DEFAULT '',
+            summary        TEXT DEFAULT '',
+            status         TEXT NOT NULL DEFAULT 'pending',
+            requested_at   TEXT NOT NULL,
+            decided_at     TEXT DEFAULT '',
+            executed_at    TEXT DEFAULT '',
+            expires_at     TEXT NOT NULL,
             FOREIGN KEY(user_id) REFERENCES users(id),
             FOREIGN KEY(token_id) REFERENCES mcp_tokens(id)
         );
 
         CREATE INDEX IF NOT EXISTS idx_mcp_tokens_hash ON mcp_tokens(token_hash);
         CREATE INDEX IF NOT EXISTS idx_mcp_audit_user_time ON mcp_audit_log(user_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_mcp_approval_user_status
+            ON mcp_tool_approvals(user_id, status, requested_at);
         """)
+        # 旧数据库补充代码级治理审计字段。
+        for column_sql in (
+            "ALTER TABLE mcp_audit_log ADD COLUMN risk TEXT DEFAULT ''",
+            "ALTER TABLE mcp_audit_log ADD COLUMN decision TEXT DEFAULT ''",
+            "ALTER TABLE mcp_audit_log ADD COLUMN approval_id TEXT DEFAULT ''",
+            "ALTER TABLE mcp_audit_log ADD COLUMN required_scope TEXT DEFAULT ''",
+        ):
+            try:
+                conn.execute(column_sql)
+            except Exception:
+                pass
 
 
 # ── 用户 CRUD ──────────────────────────────────────────────
@@ -547,49 +671,100 @@ def get_wps_user_id_by_name(name: str) -> str:
 
 # ── LLM Key（多提供商配置记忆）────────────────────────────
 
-def save_llm_key(user_id, provider, api_key, base_url, model):
+def _decode_advanced_config(raw) -> dict:
+    if isinstance(raw, dict):
+        return raw
+    try:
+        value = json.loads(raw or "{}")
+        return value if isinstance(value, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+def save_llm_key(user_id, provider, api_key, base_url, model, advanced_config=None):
     """保存主模型配置（同时保存到当前配置和提供商配置表）"""
     with get_conn() as conn:
         # 更新当前使用的配置
         conn.execute("""
-            INSERT INTO user_llm_keys (user_id, provider, api_key, base_url, model)
-            VALUES (?,?,?,?,?)
+            INSERT INTO user_llm_keys (user_id, provider, api_key, base_url, model, advanced_config)
+            VALUES (?,?,?,?,?,?)
             ON CONFLICT(user_id) DO UPDATE SET
                 provider=excluded.provider,
                 api_key=excluded.api_key,
                 base_url=excluded.base_url,
-                model=excluded.model
-        """, (user_id, provider, api_key, base_url, model))
+                model=excluded.model,
+                advanced_config=COALESCE(excluded.advanced_config, user_llm_keys.advanced_config)
+        """, (user_id, provider, api_key, base_url, model,
+              json.dumps(advanced_config, ensure_ascii=False) if advanced_config is not None else None))
 
         # 同时保存到提供商配置表（记忆功能）
         conn.execute("""
-            INSERT INTO user_provider_configs (user_id, provider, api_key, base_url, model)
-            VALUES (?,?,?,?,?)
+            INSERT INTO user_provider_configs (user_id, provider, api_key, base_url, model, advanced_config)
+            VALUES (?,?,?,?,?,?)
             ON CONFLICT(user_id, provider) DO UPDATE SET
                 api_key=excluded.api_key,
                 base_url=excluded.base_url,
-                model=excluded.model
-        """, (user_id, provider, api_key, base_url, model))
+                model=excluded.model,
+                advanced_config=COALESCE(excluded.advanced_config, user_provider_configs.advanced_config)
+        """, (user_id, provider, api_key, base_url, model,
+              json.dumps(advanced_config, ensure_ascii=False) if advanced_config is not None else None))
 
 
 def get_llm_key(user_id):
     """获取当前使用的主模型配置"""
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM user_llm_keys WHERE user_id=?", (user_id,)).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        result = dict(row)
+        result["advanced"] = _decode_advanced_config(result.get("advanced_config"))
+        return result
 
 
 def get_provider_config(user_id, provider):
     """获取指定提供商的已保存配置"""
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT api_key, base_url, model FROM user_provider_configs WHERE user_id=? AND provider=?",
+            "SELECT api_key, base_url, model, advanced_config FROM user_provider_configs WHERE user_id=? AND provider=?",
             (user_id, provider)
         ).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        result = dict(row)
+        result["advanced"] = _decode_advanced_config(result.get("advanced_config"))
+        return result
 
 
-def save_image_llm_key(user_id, provider, api_key, base_url, model):
+def list_custom_provider_configs(user_id, image: bool = False):
+    """列出用户保存的自定义 OpenAI 兼容模型档案（不返回密钥）。"""
+    table = "user_image_provider_configs" if image else "user_provider_configs"
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"""SELECT provider, base_url, model, advanced_config
+                FROM {table}
+                WHERE user_id=? AND provider LIKE 'custom_openai:%'
+                ORDER BY id DESC""",
+            (user_id,),
+        ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["advanced"] = _decode_advanced_config(item.pop("advanced_config", "{}"))
+            result.append(item)
+        return result
+
+
+def delete_custom_provider_config(user_id, provider, image: bool = False):
+    """删除指定自定义模型档案；调用方负责阻止删除当前正在使用的档案。"""
+    table = "user_image_provider_configs" if image else "user_provider_configs"
+    with get_conn() as conn:
+        conn.execute(
+            f"DELETE FROM {table} WHERE user_id=? AND provider=? AND provider LIKE 'custom_openai:%'",
+            (user_id, provider),
+        )
+
+
+def save_image_llm_key(user_id, provider, api_key, base_url, model, advanced_config=None):
     """保存图片模型配置（同时保存到当前配置和提供商配置表）"""
     with get_conn() as conn:
         # 确保 user_llm_keys 记录存在
@@ -598,26 +773,35 @@ def save_image_llm_key(user_id, provider, api_key, base_url, model):
         )
         # 更新当前使用的图片模型配置
         conn.execute(
-            "UPDATE user_llm_keys SET image_provider=?, image_api_key=?, image_base_url=?, image_model=? WHERE user_id=?",
-            (provider, api_key, base_url, model, user_id)
+            """UPDATE user_llm_keys
+               SET image_provider=?, image_api_key=?, image_base_url=?, image_model=?,
+                   image_advanced_config=COALESCE(?, image_advanced_config)
+               WHERE user_id=?""",
+            (provider, api_key, base_url, model,
+             json.dumps(advanced_config, ensure_ascii=False) if advanced_config is not None else None,
+             user_id)
         )
 
         # 同时保存到图片提供商配置表（记忆功能）
         conn.execute("""
-            INSERT INTO user_image_provider_configs (user_id, provider, api_key, base_url, model)
-            VALUES (?,?,?,?,?)
+            INSERT INTO user_image_provider_configs (user_id, provider, api_key, base_url, model, advanced_config)
+            VALUES (?,?,?,?,?,?)
             ON CONFLICT(user_id, provider) DO UPDATE SET
                 api_key=excluded.api_key,
                 base_url=excluded.base_url,
-                model=excluded.model
-        """, (user_id, provider, api_key, base_url, model))
+                model=excluded.model,
+                advanced_config=COALESCE(excluded.advanced_config, user_image_provider_configs.advanced_config)
+        """, (user_id, provider, api_key, base_url, model,
+              json.dumps(advanced_config, ensure_ascii=False) if advanced_config is not None else None))
 
 
 def get_image_llm_key(user_id):
     """获取当前使用的图片模型配置"""
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT image_provider, image_api_key, image_base_url, image_model FROM user_llm_keys WHERE user_id=?",
+            """SELECT image_provider, image_api_key, image_base_url, image_model,
+                      image_advanced_config
+               FROM user_llm_keys WHERE user_id=?""",
             (user_id,)
         ).fetchone()
         if not row or not row["image_api_key"]:
@@ -627,6 +811,7 @@ def get_image_llm_key(user_id):
             "api_key": row["image_api_key"],
             "base_url": row["image_base_url"],
             "model": row["image_model"],
+            "advanced": _decode_advanced_config(row["image_advanced_config"]),
         }
 
 
@@ -634,10 +819,14 @@ def get_image_provider_config(user_id, provider):
     """获取指定提供商的已保存图片模型配置"""
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT api_key, base_url, model FROM user_image_provider_configs WHERE user_id=? AND provider=?",
+            "SELECT api_key, base_url, model, advanced_config FROM user_image_provider_configs WHERE user_id=? AND provider=?",
             (user_id, provider)
         ).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        result = dict(row)
+        result["advanced"] = _decode_advanced_config(result.get("advanced_config"))
+        return result
 
 
 # ── 反馈 ───────────────────────────────────────────────────
@@ -720,7 +909,26 @@ def rename_conversation(conv_id: int, user_id: int, title: str):
 
 def delete_conversation(conv_id: int, user_id: int):
     with get_conn() as conn:
+        turn_rows = conn.execute(
+            "SELECT id FROM agent_turns WHERE conversation_id=? AND user_id=?",
+            (conv_id, user_id),
+        ).fetchall()
+        turn_ids = [str(row["id"]) for row in turn_rows]
+        if turn_ids:
+            placeholders = ",".join("?" for _ in turn_ids)
+            conn.execute(
+                f"DELETE FROM agent_turn_events WHERE turn_id IN ({placeholders})",
+                turn_ids,
+            )
+            conn.execute(
+                f"DELETE FROM agent_turns WHERE id IN ({placeholders})",
+                turn_ids,
+            )
         conn.execute("DELETE FROM chat_history WHERE conversation_id=?", (conv_id,))
+        conn.execute(
+            "DELETE FROM memory_items WHERE user_id=? AND scope_type='conversation' AND scope_id=?",
+            (user_id, str(conv_id)),
+        )
         conn.execute("DELETE FROM conversations WHERE id=? AND user_id=?", (conv_id, user_id))
 
 
@@ -762,8 +970,16 @@ def clear_chat_history(user_id: int, conv_id: int = None):
     with get_conn() as conn:
         if conv_id is not None:
             conn.execute("DELETE FROM chat_history WHERE user_id=? AND conversation_id=?", (user_id, conv_id))
+            conn.execute(
+                "DELETE FROM memory_items WHERE user_id=? AND scope_type='conversation' AND scope_id=?",
+                (user_id, str(conv_id)),
+            )
         else:
             conn.execute("DELETE FROM chat_history WHERE user_id=?", (user_id,))
+            conn.execute(
+                "DELETE FROM memory_items WHERE user_id=? AND scope_type='conversation'",
+                (user_id,),
+            )
 
 
 def get_chat_count(user_id: int, conv_id: int = None) -> int:
@@ -778,6 +994,216 @@ def get_chat_count(user_id: int, conv_id: int = None) -> int:
                 "SELECT COUNT(*) FROM chat_history WHERE user_id=?", (user_id,)
             ).fetchone()
         return row[0] if row else 0
+
+
+# ── 持久化代理 Turn / 事件流 ────────────────────────────────
+
+_AGENT_TURN_STATUSES = {
+    "queued", "in_progress", "cancel_requested",
+    "completed", "failed", "cancelled", "interrupted",
+}
+_ACTIVE_AGENT_TURN_STATUSES = ("queued", "in_progress", "cancel_requested")
+_TERMINAL_AGENT_TURN_STATUSES = ("completed", "failed", "cancelled", "interrupted")
+
+
+def _agent_turn_result(row) -> dict | None:
+    if not row:
+        return None
+    result = dict(row)
+    try:
+        result["request"] = json.loads(result.pop("request_json") or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        result["request"] = {}
+        result.pop("request_json", None)
+    result["cancel_requested"] = bool(result.get("cancel_requested"))
+    return result
+
+
+def create_agent_turn(user_id: int, conv_id: int, request_data: dict | None = None) -> dict:
+    """创建一个可持久化、可续接的聊天 Turn。"""
+    turn_id = f"turn_{secrets.token_hex(12)}"
+    now = beijing_now().isoformat(timespec="seconds")
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO agent_turns "
+            "(id,user_id,conversation_id,status,request_json,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (
+                turn_id, user_id, conv_id, "queued",
+                json.dumps(request_data or {}, ensure_ascii=False), now, now,
+            ),
+        )
+    return get_agent_turn(turn_id, user_id) or {"id": turn_id}
+
+
+def get_agent_turn(turn_id: str, user_id: int) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT t.*, COALESCE((SELECT MAX(e.id) FROM agent_turn_events e "
+            "WHERE e.turn_id=t.id), 0) AS last_event_id "
+            "FROM agent_turns t WHERE t.id=? AND t.user_id=?",
+            (turn_id, user_id),
+        ).fetchone()
+    return _agent_turn_result(row)
+
+
+def get_active_agent_turn(user_id: int, conv_id: int | None = None) -> dict | None:
+    placeholders = ",".join("?" for _ in _ACTIVE_AGENT_TURN_STATUSES)
+    params: list = [user_id, *_ACTIVE_AGENT_TURN_STATUSES]
+    where = f"user_id=? AND status IN ({placeholders})"
+    if conv_id is not None:
+        where += " AND conversation_id=?"
+        params.append(conv_id)
+    with get_conn() as conn:
+        row = conn.execute(
+            f"SELECT * FROM agent_turns WHERE {where} ORDER BY created_at DESC LIMIT 1",
+            params,
+        ).fetchone()
+    return _agent_turn_result(row)
+
+
+def update_agent_turn_status(
+    turn_id: str, user_id: int, status: str, error: str = "",
+) -> dict | None:
+    if status not in _AGENT_TURN_STATUSES:
+        raise ValueError(f"不支持的 Turn 状态: {status}")
+    now = beijing_now().isoformat(timespec="seconds")
+    completed_at = now if status in _TERMINAL_AGENT_TURN_STATUSES else ""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE agent_turns SET status=?, error=?, updated_at=?, completed_at=? "
+            "WHERE id=? AND user_id=?",
+            (status, error, now, completed_at, turn_id, user_id),
+        )
+    return get_agent_turn(turn_id, user_id)
+
+
+def claim_agent_turn(turn_id: str, user_id: int, worker_id: str) -> bool:
+    """由当前服务进程认领 Turn，并开始刷新租约。"""
+    now = beijing_now().isoformat(timespec="seconds")
+    placeholders = ",".join("?" for _ in _ACTIVE_AGENT_TURN_STATUSES)
+    with get_conn() as conn:
+        cursor = conn.execute(
+            "UPDATE agent_turns SET "
+            "status=CASE WHEN cancel_requested=1 THEN 'cancel_requested' ELSE 'in_progress' END, "
+            "worker_id=?, heartbeat_at=?, updated_at=? "
+            f"WHERE id=? AND user_id=? AND status IN ({placeholders})",
+            (worker_id, now, now, turn_id, user_id, *_ACTIVE_AGENT_TURN_STATUSES),
+        )
+        return cursor.rowcount == 1
+
+
+def heartbeat_agent_turn(turn_id: str, user_id: int, worker_id: str) -> bool:
+    """只允许认领该 Turn 的进程续租，避免其他进程误覆盖。"""
+    now = beijing_now().isoformat(timespec="seconds")
+    placeholders = ",".join("?" for _ in _ACTIVE_AGENT_TURN_STATUSES)
+    with get_conn() as conn:
+        cursor = conn.execute(
+            "UPDATE agent_turns SET heartbeat_at=?, updated_at=? "
+            f"WHERE id=? AND user_id=? AND worker_id=? AND status IN ({placeholders})",
+            (now, now, turn_id, user_id, worker_id, *_ACTIVE_AGENT_TURN_STATUSES),
+        )
+        return cursor.rowcount == 1
+
+
+def interrupt_stale_agent_turns(stale_seconds: int = 120) -> list[str]:
+    """终结租约超时的 Turn，但不自动重放可能已有副作用的请求。"""
+    timeout = max(30, int(stale_seconds))
+    now_dt = beijing_now()
+    now = now_dt.isoformat(timespec="seconds")
+    cutoff = (now_dt - timedelta(seconds=timeout)).isoformat(timespec="seconds")
+    message = "服务进程中断，本次任务未自动重放；请确认已有结果后重新发送。"
+    placeholders = ",".join("?" for _ in _ACTIVE_AGENT_TURN_STATUSES)
+    interrupted: list[str] = []
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id,user_id FROM agent_turns "
+            f"WHERE status IN ({placeholders}) "
+            "AND COALESCE(NULLIF(heartbeat_at,''), updated_at)<?",
+            (*_ACTIVE_AGENT_TURN_STATUSES, cutoff),
+        ).fetchall()
+        for row in rows:
+            cursor = conn.execute(
+                "UPDATE agent_turns SET status='interrupted', error=?, updated_at=?, "
+                "completed_at=? WHERE id=? AND user_id=? "
+                f"AND status IN ({placeholders}) "
+                "AND COALESCE(NULLIF(heartbeat_at,''), updated_at)<?",
+                (
+                    message, now, now, row["id"], row["user_id"],
+                    *_ACTIVE_AGENT_TURN_STATUSES, cutoff,
+                ),
+            )
+            if cursor.rowcount != 1:
+                continue
+            conn.execute(
+                "INSERT INTO agent_turn_events (turn_id,event_type,payload,created_at) "
+                "VALUES (?,?,?,?)",
+                (
+                    row["id"], "error",
+                    json.dumps({"message": message, "reason": "worker_lost"}, ensure_ascii=False),
+                    now,
+                ),
+            )
+            interrupted.append(str(row["id"]))
+    return interrupted
+
+
+def request_agent_turn_cancel(turn_id: str, user_id: int) -> dict | None:
+    now = beijing_now().isoformat(timespec="seconds")
+    placeholders = ",".join("?" for _ in _ACTIVE_AGENT_TURN_STATUSES)
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE agent_turns SET status='cancel_requested', cancel_requested=1, "
+            f"updated_at=? WHERE id=? AND user_id=? AND status IN ({placeholders})",
+            (now, turn_id, user_id, *_ACTIVE_AGENT_TURN_STATUSES),
+        )
+    return get_agent_turn(turn_id, user_id)
+
+
+def add_agent_turn_event(turn_id: str, event_type: str, payload: dict | None = None) -> int:
+    now = beijing_now().isoformat(timespec="seconds")
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO agent_turn_events (turn_id,event_type,payload,created_at) "
+            "VALUES (?,?,?,?)",
+            (turn_id, event_type, json.dumps(payload or {}, ensure_ascii=False), now),
+        )
+        conn.execute(
+            "UPDATE agent_turns SET updated_at=? WHERE id=?",
+            (now, turn_id),
+        )
+        return int(cur.lastrowid)
+
+
+def list_agent_turn_events(
+    turn_id: str, user_id: int, after_id: int = 0, limit: int = 500,
+) -> list[dict]:
+    with get_conn() as conn:
+        owner = conn.execute(
+            "SELECT 1 FROM agent_turns WHERE id=? AND user_id=?",
+            (turn_id, user_id),
+        ).fetchone()
+        if not owner:
+            return []
+        rows = conn.execute(
+            "SELECT id,event_type,payload,created_at FROM agent_turn_events "
+            "WHERE turn_id=? AND id>? ORDER BY id ASC LIMIT ?",
+            (turn_id, max(0, int(after_id)), max(1, min(int(limit), 1000))),
+        ).fetchall()
+    events = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        events.append({
+            "event_id": int(row["id"]),
+            "turn_id": turn_id,
+            "type": row["event_type"],
+            "created_at": row["created_at"],
+            **payload,
+        })
+    return events
 
 
 # ── 密码重置 Token ──────────────────────────────────────────
@@ -1117,6 +1543,105 @@ def save_user_memory(user_id: int, memory_text: str):
                 memory_text=excluded.memory_text,
                 updated_at=excluded.updated_at
         """, (user_id, memory_text))
+
+
+def save_memory_item(user_id: int, content: str, *, scope_type: str = "global",
+                     scope_id: str = "", category: str = "general",
+                     source_type: str = "explicit", source_id: str = "",
+                     confidence: float = 1.0, replace_source: bool = False) -> int:
+    """保存一条有来源、可隔离的上下文记忆，返回记录 ID。
+
+    ``replace_source`` 用于话题摘要等单一派生结果；显式记忆和自动提取默认按
+    完整内容去重，以便保留证据而不重复堆叠。
+    """
+    allowed_scopes = {"global", "conversation", "file", "contact", "workspace"}
+    scope_type = scope_type if scope_type in allowed_scopes else "global"
+    scope_id = str(scope_id or "")
+    content = str(content or "").strip()
+    if not content:
+        return 0
+    try:
+        confidence = max(0.0, min(float(confidence), 1.0))
+    except (TypeError, ValueError):
+        confidence = 1.0
+
+    with get_conn() as conn:
+        row = None
+        if replace_source and source_type and source_id:
+            row = conn.execute(
+                "SELECT id FROM memory_items WHERE user_id=? AND scope_type=? AND scope_id=? "
+                "AND source_type=? AND source_id=? LIMIT 1",
+                (user_id, scope_type, scope_id, source_type, str(source_id)),
+            ).fetchone()
+        if not row:
+            row = conn.execute(
+                "SELECT id FROM memory_items WHERE user_id=? AND scope_type=? AND scope_id=? "
+                "AND category=? AND content=? AND status='active' LIMIT 1",
+                (user_id, scope_type, scope_id, category, content),
+            ).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE memory_items SET content=?, category=?, source_type=?, source_id=?, "
+                "confidence=?, status='active', updated_at=datetime('now') WHERE id=?",
+                (content, category, source_type, str(source_id or ""), confidence, row["id"]),
+            )
+            return int(row["id"])
+        cur = conn.execute(
+            "INSERT INTO memory_items "
+            "(user_id, scope_type, scope_id, category, content, source_type, source_id, confidence) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (user_id, scope_type, scope_id, category, content,
+             source_type, str(source_id or ""), confidence),
+        )
+        return int(cur.lastrowid)
+
+
+def list_memory_items(user_id: int, *, scope_type: str | None = None,
+                      scope_ids: list[str] | None = None, limit: int = 100) -> list:
+    """列出当前用户可用记忆；调用方必须明确传入用户，天然隔离租户。"""
+    clauses = ["user_id=?", "status='active'"]
+    params: list = [user_id]
+    if scope_type:
+        clauses.append("scope_type=?")
+        params.append(scope_type)
+    if scope_ids is not None:
+        normalized = [str(value) for value in scope_ids if str(value or "")]
+        if not normalized:
+            return []
+        placeholders = ",".join("?" for _ in normalized)
+        clauses.append(f"scope_id IN ({placeholders})")
+        params.extend(normalized)
+    params.append(max(1, min(int(limit), 500)))
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM memory_items WHERE " + " AND ".join(clauses)
+            + " ORDER BY confidence DESC, updated_at DESC, id DESC LIMIT ?",
+            params,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def get_memory_item_by_source(user_id: int, source_type: str, source_id: str) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM memory_items WHERE user_id=? AND source_type=? AND source_id=? "
+            "AND status='active' ORDER BY id DESC LIMIT 1",
+            (user_id, source_type, str(source_id)),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_user_chat_candidates(user_id: int, limit: int = 500) -> list:
+    """返回用于历史召回的用户原话；不返回 AI 回复，防止模型自我强化。"""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT h.id, h.conversation_id, h.content, h.created_at, "
+            "COALESCE(c.title, '') AS conversation_title "
+            "FROM chat_history h LEFT JOIN conversations c ON c.id=h.conversation_id "
+            "WHERE h.user_id=? AND h.role='user' ORDER BY h.id DESC LIMIT ?",
+            (user_id, max(1, min(int(limit), 2000))),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
 
 # ── 用户活跃表格选择 ─────────────────────────────────────────
@@ -1611,19 +2136,35 @@ def get_dashboard_cache_status(user_id: int, file_id: str) -> list[dict]:
 
 # ── MCP 访问令牌与审计 ─────────────────────────────────────
 
-def create_mcp_token(user_id: int, name: str = "WorkBuddy", expires_days: int | None = None) -> dict:
+def _decode_mcp_scopes(value) -> list[str]:
+    try:
+        scopes = json.loads(value) if isinstance(value, str) else list(value or [])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    return [str(scope) for scope in scopes if str(scope)]
+
+
+def create_mcp_token(
+    user_id: int,
+    name: str = "WorkBuddy",
+    expires_days: int | None = None,
+    scopes: list[str] | None = None,
+) -> dict:
     """创建 MCP Bearer token；明文只由本函数返回一次。"""
     raw_token = "onx_mcp_" + secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
     now = beijing_now()
     expires_at = (now + timedelta(days=expires_days)).strftime("%Y-%m-%d %H:%M:%S") if expires_days else ""
     safe_name = (name or "WorkBuddy").strip()[:80]
+    safe_scopes = list(dict.fromkeys(scopes or ["all"]))
+    scopes_json = json.dumps(safe_scopes, ensure_ascii=False)
     with get_conn() as conn:
         cursor = conn.execute(
             """INSERT INTO mcp_tokens
                (user_id, name, token_hash, token_prefix, scopes, is_active, created_at, expires_at)
-               VALUES (?, ?, ?, ?, '[\"all\"]', 1, ?, ?)""",
-            (user_id, safe_name, token_hash, raw_token[:16], now.strftime("%Y-%m-%d %H:%M:%S"), expires_at),
+               VALUES (?, ?, ?, ?, ?, 1, ?, ?)""",
+            (user_id, safe_name, token_hash, raw_token[:16], scopes_json,
+             now.strftime("%Y-%m-%d %H:%M:%S"), expires_at),
         )
         token_id = cursor.lastrowid
     return {
@@ -1631,6 +2172,7 @@ def create_mcp_token(user_id: int, name: str = "WorkBuddy", expires_days: int | 
         "name": safe_name,
         "token": raw_token,
         "token_prefix": raw_token[:16],
+        "scopes": safe_scopes,
         "expires_at": expires_at,
     }
 
@@ -1659,7 +2201,9 @@ def verify_mcp_token(raw_token: str) -> dict | None:
             "UPDATE mcp_tokens SET last_used_at=? WHERE id=?",
             (now.strftime("%Y-%m-%d %H:%M:%S"), row["id"]),
         )
-        return dict(row)
+        result = dict(row)
+        result["scopes"] = _decode_mcp_scopes(result.get("scopes"))
+        return result
 
 
 def list_mcp_tokens(user_id: int) -> list[dict]:
@@ -1669,7 +2213,12 @@ def list_mcp_tokens(user_id: int) -> list[dict]:
                FROM mcp_tokens WHERE user_id=? ORDER BY id DESC""",
             (user_id,),
         ).fetchall()
-    return [dict(row) for row in rows]
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["scopes"] = _decode_mcp_scopes(item.get("scopes"))
+        result.append(item)
+    return result
 
 
 def revoke_mcp_token(user_id: int, token_id: int) -> bool:
@@ -1678,7 +2227,130 @@ def revoke_mcp_token(user_id: int, token_id: int) -> bool:
             "UPDATE mcp_tokens SET is_active=0 WHERE id=? AND user_id=? AND is_active=1",
             (token_id, user_id),
         )
+        if cursor.rowcount:
+            now_text = beijing_now().strftime("%Y-%m-%d %H:%M:%S")
+            conn.execute(
+                """UPDATE mcp_tool_approvals
+                   SET status='rejected', decided_at=?
+                   WHERE user_id=? AND token_id=? AND status IN ('pending', 'approved')""",
+                (now_text, user_id, token_id),
+            )
         return cursor.rowcount > 0
+
+
+def _expire_mcp_tool_approvals(conn, now_text: str) -> None:
+    conn.execute(
+        """UPDATE mcp_tool_approvals
+           SET status='expired', decided_at=CASE WHEN decided_at='' THEN ? ELSE decided_at END
+           WHERE status IN ('pending', 'approved') AND expires_at<=?""",
+        (now_text, now_text),
+    )
+
+
+def create_mcp_tool_approval(
+    user_id: int,
+    token_id: int,
+    tool_name: str,
+    arguments_hash: str,
+    arguments: str,
+    risk: str,
+    required_scope: str,
+    summary: str,
+    ttl_minutes: int = 10,
+) -> dict:
+    """创建或复用同一令牌、工具和参数的待审批单。"""
+    now = beijing_now()
+    now_text = now.strftime("%Y-%m-%d %H:%M:%S")
+    expires_at = (now + timedelta(minutes=max(1, min(int(ttl_minutes), 60)))).strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        _expire_mcp_tool_approvals(conn, now_text)
+        existing = conn.execute(
+            """SELECT * FROM mcp_tool_approvals
+               WHERE user_id=? AND token_id=? AND tool_name=? AND arguments_hash=?
+                 AND status='pending' AND expires_at>?
+               ORDER BY requested_at DESC LIMIT 1""",
+            (user_id, token_id, tool_name, arguments_hash, now_text),
+        ).fetchone()
+        if existing:
+            return dict(existing)
+        approval_id = "onx_apr_" + secrets.token_urlsafe(18)
+        conn.execute(
+            """INSERT INTO mcp_tool_approvals
+               (id, user_id, token_id, tool_name, arguments_hash, arguments, risk,
+                required_scope, summary, status, requested_at, expires_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
+            (approval_id, user_id, token_id, tool_name, arguments_hash,
+             arguments[:12000], risk[:80], required_scope[:80], summary[:1000],
+             now_text, expires_at),
+        )
+        row = conn.execute("SELECT * FROM mcp_tool_approvals WHERE id=?", (approval_id,)).fetchone()
+        return dict(row)
+
+
+def get_mcp_tool_approval(user_id: int, approval_id: str) -> dict | None:
+    now_text = beijing_now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        _expire_mcp_tool_approvals(conn, now_text)
+        row = conn.execute(
+            "SELECT * FROM mcp_tool_approvals WHERE id=? AND user_id=?",
+            (approval_id, user_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def list_mcp_tool_approvals(user_id: int, limit: int = 50) -> list[dict]:
+    now_text = beijing_now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        _expire_mcp_tool_approvals(conn, now_text)
+        rows = conn.execute(
+            """SELECT id, token_id, tool_name, arguments, risk, required_scope, summary,
+                      status, requested_at, decided_at, executed_at, expires_at
+               FROM mcp_tool_approvals WHERE user_id=?
+               ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END,
+                        requested_at DESC LIMIT ?""",
+            (user_id, max(1, min(int(limit), 200))),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def decide_mcp_tool_approval(user_id: int, approval_id: str, decision: str) -> dict | None:
+    if decision not in {"approved", "rejected"}:
+        raise ValueError("审批结果必须是 approved 或 rejected")
+    now_text = beijing_now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        _expire_mcp_tool_approvals(conn, now_text)
+        cursor = conn.execute(
+            """UPDATE mcp_tool_approvals SET status=?, decided_at=?
+               WHERE id=? AND user_id=? AND status='pending' AND expires_at>?""",
+            (decision, now_text, approval_id, user_id, now_text),
+        )
+        if not cursor.rowcount:
+            return None
+        row = conn.execute(
+            "SELECT * FROM mcp_tool_approvals WHERE id=? AND user_id=?",
+            (approval_id, user_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def consume_mcp_tool_approval(
+    user_id: int,
+    token_id: int,
+    approval_id: str,
+    tool_name: str,
+    arguments_hash: str,
+) -> bool:
+    """原子消费已批准的审批单；每张审批单最多执行一次。"""
+    now_text = beijing_now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        _expire_mcp_tool_approvals(conn, now_text)
+        cursor = conn.execute(
+            """UPDATE mcp_tool_approvals SET status='executed', executed_at=?
+               WHERE id=? AND user_id=? AND token_id=? AND tool_name=? AND arguments_hash=?
+                 AND status='approved' AND expires_at>?""",
+            (now_text, approval_id, user_id, token_id, tool_name, arguments_hash, now_text),
+        )
+        return cursor.rowcount == 1
 
 
 def add_mcp_audit_log(
@@ -1689,15 +2361,23 @@ def add_mcp_audit_log(
     success: bool,
     error: str = "",
     duration_ms: int = 0,
+    *,
+    risk: str = "",
+    decision: str = "",
+    approval_id: str = "",
+    required_scope: str = "",
 ) -> None:
     with get_conn() as conn:
         conn.execute(
             """INSERT INTO mcp_audit_log
-               (user_id, token_id, tool_name, arguments, success, error, duration_ms, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               (user_id, token_id, tool_name, arguments, success, error, duration_ms,
+                risk, decision, approval_id, required_scope, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 user_id, token_id, tool_name, arguments[:12000], 1 if success else 0,
                 (error or "")[:2000], max(0, int(duration_ms)),
+                (risk or "")[:80], (decision or "")[:80], (approval_id or "")[:120],
+                (required_scope or "")[:80],
                 beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
             ),
         )
@@ -1706,7 +2386,8 @@ def add_mcp_audit_log(
 def list_mcp_audit_log(user_id: int, limit: int = 100) -> list[dict]:
     with get_conn() as conn:
         rows = conn.execute(
-            """SELECT id, token_id, tool_name, success, error, duration_ms, created_at
+            """SELECT id, token_id, tool_name, success, error, duration_ms, risk,
+                      decision, approval_id, required_scope, created_at
                FROM mcp_audit_log WHERE user_id=? ORDER BY id DESC LIMIT ?""",
             (user_id, max(1, min(int(limit), 500))),
         ).fetchall()
