@@ -76,6 +76,8 @@ def test_chat_turn_can_resume_and_be_cancelled_without_replacing_chat_entrypoint
     assert "function cancelActiveTurn(" in HTML
     assert "sendBtn.onclick=()=>state.sending?cancelActiveTurn():send()" in HTML
     assert ".send.stop{background:#ef4444}" in HTML
+    assert ".send.stop::before{content:\"\";display:block;width:12px;height:12px" in HTML
+    assert "sendBtn.textContent=state.sending?'':'↑'" in HTML
 
 
 def test_user_help_covers_current_major_features():
