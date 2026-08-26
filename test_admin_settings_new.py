@@ -73,6 +73,26 @@ def test_all_pages_have_no_server_ui_runtime():
         assert "ui.run(" not in text, path
 
 
+def test_primary_ui_exposes_project_ownership_and_license():
+    static_root = Path(__file__).parent / "static"
+    auth_html = (static_root / "auth.html").read_text(encoding="utf-8")
+    settings_html = (static_root / "settings_new.html").read_text(encoding="utf-8")
+
+    assert "© 2026" in auth_html
+    assert "孟宪锋（Meng Xianfeng）" in auth_html
+    assert "Apache License 2.0" in auth_html
+    assert 'rel="noopener noreferrer"' in auth_html
+
+    assert '<option value="about">关于 OpenNexus</option>' in settings_html
+    assert 'data-section="about"' in settings_html
+    assert 'id="section-about"' in settings_html
+    assert "版权所有 © 2026 孟宪锋（Meng Xianfeng）" in settings_html
+    assert "OpenNexus 自有代码依据 Apache License 2.0 许可发布" in settings_html
+    assert "THIRD_PARTY_NOTICES.md" in settings_html
+    assert "品牌标识的权利，相关权利保留" in settings_html
+    assert "本软件按“现状”提供" in settings_html
+
+
 def test_admin_page_requires_admin(monkeypatch):
     client = _client(monkeypatch, admin=False)
     response = client.get("/admin-new", follow_redirects=False)
