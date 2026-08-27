@@ -2,6 +2,7 @@
 智能体核心 - 多模型支持 + WPS REST API 全量工具调用
 """
 import json
+import hashlib
 import mimetypes
 from pathlib import Path
 from openai import AsyncOpenAI, APIConnectionError, APITimeoutError, RateLimitError
@@ -22,6 +23,7 @@ from agent.wps_client import (
     sheets_get_range, sheets_update_range, sheets_delete_range,
     sheets_find_range, sheets_create_file,
 )
+from agent.record_analyzer import ANALYZE_RECORDS_TOOL, analyze_records
 
 from auth.db import (search_knowledge as _db_search_knowledge,
                      search_knowledge_rag as _db_search_knowledge_rag,
@@ -49,6 +51,22 @@ from auth.db import get_system_config as _db_get_system_config
 from auth.db import get_wecom_userid as _db_get_wecom_userid
 from core.document_generator import generate_and_upload_document as _generate_document
 from core.context_memory import sanitize_memory_content
+from agent.tool_planner import (
+    DISCOVER_TOOL_NAME,
+    UPDATE_PLAN_TOOL_NAME,
+    TaskPlanState,
+    RunMetrics,
+    compact_messages_for_retry,
+    compact_tool_messages,
+    estimate_tools_tokens,
+    is_context_limit_error,
+    discovery_result,
+    discover_tool_names,
+    initial_tool_names,
+    is_complex_task,
+    trim_history_to_budget,
+    visible_tools,
+)
 
 LLM_PRESETS = {
     "scnet": {
@@ -1724,6 +1742,7 @@ TOOLS = [
         },
     },
 ]
+TOOLS.append(ANALYZE_RECORDS_TOOL)
 
 TOOL_MAP = {
     "get_schema":    lambda at, a: get_schema(at, a["file_id"]),
@@ -1732,6 +1751,7 @@ TOOL_MAP = {
                                                 a.get("page_token") if isinstance(a.get("page_token"), str) and not a.get("page_token", "").isdigit() else None,
                                                 a.get("fields"), a.get("filter"),
                                                 a.get("view_id"), a.get("max_records")),
+    "analyze_records": lambda at, a: analyze_records(at, a),
     "create_records": lambda at, a: create_records(at, a["file_id"], a["sheet_id"], a["records"]),
     "update_records": lambda at, a: update_records(at, a["file_id"], a["sheet_id"], a["records"]),
     "delete_records": lambda at, a: delete_records(at, a["file_id"], a["sheet_id"], a["record_ids"]),
@@ -2032,6 +2052,16 @@ def _compress_tool_result(name: str, result: dict) -> str:
         records = result.get("records", [])
         total = result.get("total", len(records))
         fetched = result.get("fetched", len(records))
+        has_more = bool(result.get("has_more", False))
+        next_page_token = result.get("next_page_token")
+        is_complete = bool(result.get("is_complete", not has_more))
+        result["_completeness"] = {
+            "total": total,
+            "fetched": fetched,
+            "has_more": has_more,
+            "next_page_token": next_page_token,
+            "is_complete": is_complete,
+        }
 
         # 代码层计算空行，AI 直接用，无需自己遍历
         empty_row_ids = []
@@ -2047,10 +2077,17 @@ def _compress_tool_result(name: str, result: dict) -> str:
 
         result["empty_row_ids"] = empty_row_ids
         result["empty_row_count"] = len(empty_row_ids)
-        if empty_row_ids:
+        if has_more:
             result["_note"] = (
-                f"已返回全部 {fetched} 条记录（共 {total} 条）。"
-                f"空行ID列表：{empty_row_ids}，新建记录前请优先用 update_records 填入空行。"
+                f"本次返回 {fetched} 条（共 {total} 条），尚未取完。"
+                f"必须使用 next_page_token={next_page_token!r} 继续调用 list_records，"
+                "不能把当前结果称为全部数据。"
+            )
+        else:
+            result["_note"] = f"已完整返回 {fetched} 条记录（共 {total} 条）。"
+        if empty_row_ids:
+            result["_note"] += (
+                f" 空行ID列表：{empty_row_ids}，新建记录前请优先用 update_records 填入空行。"
             )
 
     return json.dumps(result, ensure_ascii=False)
@@ -2239,6 +2276,13 @@ class Assistant:
         self.model = model or preset["model"]
         self.advanced = advanced or {}
         self.supports_tools = bool(self.advanced.get("supports_tools", True))
+        _smart_routing = self.advanced.get("smart_tool_routing", True)
+        if isinstance(_smart_routing, str):
+            _smart_routing = _smart_routing.strip().lower() not in {
+                "0", "false", "off", "no", "disabled",
+            }
+        self.smart_tool_routing = bool(_smart_routing)
+        self.last_run_metrics = {}
         self.supports_vision = bool(self.advanced.get("supports_vision", False))
         self.reasoning_mode = str(self.advanced.get("reasoning_mode") or "auto").lower()
         self.reasoning_effort = str(self.advanced.get("reasoning_effort") or "auto").lower()
@@ -2397,7 +2441,8 @@ class Assistant:
                    on_tool_call=None, username: str = "用户",
                    role: str = "staff", default_file: dict = None,
                    all_files: list = None, memory: str = "",
-                   uid: int = 0, conv_id: int = 0) -> str:
+                   uid: int = 0, conv_id: int = 0,
+                   on_agent_event=None) -> str:
         # 兼容旧测试、插件或外部代码通过 Assistant.__new__ 构造的实例；
         # 正常运行时这些值均由 __init__ 从高级配置写入。
         if not hasattr(self, "supports_tools"):
@@ -2412,11 +2457,39 @@ class Assistant:
             self.context_window = 0
         if not hasattr(self, "max_output_tokens"):
             self.max_output_tokens = 8192
+        if not hasattr(self, "smart_tool_routing"):
+            self.smart_tool_routing = True
+        _metrics = RunMetrics(
+            full_tool_count=len(TOOLS),
+            full_tool_tokens=estimate_tools_tokens(TOOLS),
+        )
+        self.last_run_metrics = _metrics.snapshot()
+
+        async def _publish_agent_event(kind: str, **payload):
+            if not on_agent_event:
+                return
+            try:
+                emitted = on_agent_event(kind, payload)
+                if hasattr(emitted, "__await__"):
+                    await emitted
+            except Exception as event_error:
+                print(f"[AGENT EVENT] {kind} publish failed: {event_error}")
         from datetime import datetime, timezone, timedelta
         _now = datetime.now(tz=timezone(timedelta(hours=8)))
         _wd  = ["周一","周二","周三","周四","周五","周六","周日"][_now.weekday()]
         _today = _now.strftime("%Y年%m月%d日") + "(" + _wd + ")" + _now.strftime(" %H:%M")
         system_prompt = build_system_prompt(username, role, default_file, all_files, memory)
+        if self.supports_tools and self.smart_tool_routing:
+            system_prompt += (
+                "\n\n## Goal-driven tool execution\n"
+                "- For multi-step, analytical, cross-table, or full-data tasks, call update_task_plan first.\n"
+                "- If a needed capability is not currently visible, call discover_tools; never infer that it is unavailable.\n"
+                "- Continue until the stated completion criteria are verified. There is no fixed tool-call round limit.\n"
+                "- For large-table analysis, get the schema, then prefer analyze_records with only necessary fields.\n"
+                "- After each large record batch, save verified conclusions in update_task_plan.findings before continuing.\n"
+                "- A partial page is not complete: follow next_page_token while has_more is true when full data is required.\n"
+                "- If progress stalls, revise the plan or discover another tool. Report blocked only when a concrete obstacle remains."
+            )
 
         # 部分 OpenAI 兼容接口（尤其部分千问网关）要求 system 只能出现在
         # 消息数组首位。实时配置仍保持系统级权限，并放在系统提示末尾以维持
@@ -2465,13 +2538,7 @@ class Assistant:
                 _base += f"\n\n{_filing_guide}"
             injected[-1]["content"] = _base
 
-        # 自定义模型可声明上下文窗口。用保守字符估算裁剪最旧历史，始终保留
-        # 系统提示和当前用户消息；未配置时沿用路由层最近 20 条的默认策略。
-        if self.context_window and len(injected) > 1:
-            reserve_chars = self.max_output_tokens * 2
-            history_budget = max(2000, self.context_window * 2 - len(system_prompt) - reserve_chars)
-            while len(injected) > 1 and sum(len(str(m.get("content", ""))) for m in injected) > history_budget:
-                injected.pop(0)
+        # 先保留清洗后的历史；工具确定后再按模型上下文窗口统一裁剪。
 
         full_messages = [{"role": "system", "content": system_prompt}] + injected
 
@@ -2618,9 +2685,61 @@ class Assistant:
                 "或更换具备工具调用能力的模型后再执行此操作。"
             )
 
+        _forced_tool_names = {
+            name
+            for enabled, name in (
+                (_force_sheets_create, "sheets_create_file"),
+                (_force_change_log, "get_change_log"),
+                (_force_doc_gen, "generate_document"),
+                (_force_reminder, "add_reminder"),
+                (_force_weixin, "send_weixin_message"),
+            )
+            if enabled
+        }
+        _complex_task = is_complex_task(_last_user_content)
+        _plan_state = TaskPlanState()
+        _all_business_tool_names = {
+            tool["function"]["name"] for tool in TOOLS
+        }
+        if self.smart_tool_routing:
+            _active_tool_names = initial_tool_names(
+                _last_user_content, _forced_tool_names
+            )
+        else:
+            _active_tool_names = set(_all_business_tool_names)
+
+        def _tools_for_turn():
+            if not self.supports_tools or _reminder_needs_planning:
+                return []
+            if not self.smart_tool_routing:
+                return TOOLS
+            return visible_tools(
+                TOOLS,
+                _active_tool_names,
+                include_discovery=True,
+                include_plan=_complex_task or bool(_plan_state.goal),
+            )
+
+        _budget_tools = _tools_for_turn()
+        if full_messages:
+            _trimmed_history = trim_history_to_budget(
+                full_messages[1:],
+                system_prompt=str(full_messages[0].get("content", "")),
+                tools=_budget_tools,
+                context_window=self.context_window,
+                max_output_tokens=self.max_output_tokens,
+            )
+            full_messages = [full_messages[0]] + _trimmed_history
+
+        _last_tool_fingerprint = ""
+        _same_tool_batches = 0
+        _premature_final_attempts = 0
+        _context_recovery_attempts = 0
         _create_records_success = False  # 追踪 create_records 是否成功
         _reminder_created_success = False  # 追踪本轮提醒是否已真实写入数据库
-        for _turn in range(50):
+        _turn = -1
+        while True:
+            _turn += 1
 
             # 处理思考模式：模型名带 -reasoning 后缀表示启用思考模式
             _actual_model = self.model
@@ -2641,8 +2760,9 @@ class Assistant:
                 messages=_coalesce_system_messages(full_messages),
                 max_tokens=self.max_output_tokens,
             )
-            if self.supports_tools:
-                _kwargs["tools"] = TOOLS
+            _current_tools = _tools_for_turn()
+            if _current_tools:
+                _kwargs["tools"] = _current_tools
             # 规划阶段只允许自然语言澄清/提案，彻底禁止提前写入提醒。
             if _reminder_needs_planning:
                 _kwargs.pop("tools", None)
@@ -2730,6 +2850,38 @@ class Assistant:
                     return "模型服务当前繁忙，本次提醒尚未设置。请稍后再试。"
                 return "模型服务当前繁忙，请稍后再试。"
             except Exception as _api_error:
+                if is_context_limit_error(_api_error):
+                    if _context_recovery_attempts >= 2:
+                        self.last_run_metrics = _metrics.snapshot()
+                        await _publish_agent_event(
+                            "context",
+                            status="blocked",
+                            message="模型输入仍超过限制，已停止重复重试。",
+                            metrics=self.last_run_metrics,
+                        )
+                        return (
+                            "当前任务所需上下文仍超过该模型的输入限制。系统已经自动压缩并重试，"
+                            "但没有删减数据后冒充完成。建议使用上下文更大的模型，或明确缩小时间范围。"
+                        )
+                    _context_recovery_attempts += 1
+                    full_messages, compacted = compact_messages_for_retry(full_messages)
+                    _active_tool_names.add("analyze_records")
+                    _metrics.context_recoveries += 1
+                    _metrics.context_compactions += compacted
+                    self.last_run_metrics = _metrics.snapshot()
+                    _append_system_instruction(
+                        "The previous request exceeded the model context limit. "
+                        "Use analyze_records with server/local filters and only necessary fields. "
+                        "Preserve verified facts in update_task_plan.findings before reading the next batch."
+                    )
+                    await _publish_agent_event(
+                        "context",
+                        status="recovered",
+                        message="输入超过模型限制，已自动压缩并改用大表分析模式。",
+                        compacted_results=compacted,
+                        metrics=self.last_run_metrics,
+                    )
+                    continue
                 # 部分千问 OpenAI 兼容网关不接受以 tool 结果结尾的
                 # 二次请求，会返回 no user query found in messages。只在该
                 # 特定错误与消息形态同时出现时补语义等价的续问；正常
@@ -2746,8 +2898,33 @@ class Assistant:
                 _compat_kwargs["messages"] = _coalesce_system_messages(full_messages)
                 resp = await self.client.chat.completions.create(**_compat_kwargs)
             msg = resp.choices[0].message
+            _metrics.tool_calls += len(msg.tool_calls or [])
+            _metrics.record_response(
+                resp,
+                messages=_kwargs.get("messages") or [],
+                tools=_current_tools,
+            )
+            self.last_run_metrics = _metrics.snapshot()
+            await _publish_agent_event(
+                "usage",
+                round=_turn + 1,
+                metrics=self.last_run_metrics,
+            )
 
             if not msg.tool_calls:
+                if _plan_state.goal and not _plan_state.terminal:
+                    _premature_final_attempts += 1
+                    if _premature_final_attempts < 3:
+                        _append_system_instruction(
+                            "The active task plan is still in_progress. Continue executing "
+                            "the unfinished steps, update the plan, and do not present a final answer yet. "
+                            f"Unfinished: {_plan_state.unfinished}"
+                        )
+                        continue
+                    return (
+                        "任务尚未完成，但模型连续停止执行。系统没有把它误报为完成；"
+                        "请重试本任务，或检查当前模型的工具调用能力。"
+                    )
                 if _force_reminder and not _reminder_created_success:
                     if _turn == 0:
                         # 某些模型不支持 tool_choice；明确纠正一次，但绝不把普通文字当作成功。
@@ -2768,6 +2945,7 @@ class Assistant:
                 )
                 return reply
 
+            _premature_final_attempts = 0
             _assistant_msg = {
                 "role": "assistant",
                 "content": msg.content,
@@ -2781,7 +2959,9 @@ class Assistant:
             if getattr(msg, "reasoning_content", None):
                 _assistant_msg["reasoning_content"] = msg.reasoning_content
             full_messages.append(_assistant_msg)
+            _compact_after_plan = False
 
+            _turn_receipts = []
             for tc in msg.tool_calls:
                 name = tc.function.name
                 try:
@@ -2821,7 +3001,29 @@ class Assistant:
                 # send_wps_bot_message 用 App Token，不依赖用户 WPS token
                 _LOCAL_TOOLS = {"search_knowledge", "get_change_log", "save_memory", "send_notification", "list_system_users", "send_wps_bot_message", "send_wecom_message", "send_weixin_message", "generate_document", "add_reminder", "list_reminders", "cancel_reminder"}
                 try:
-                    if name == "save_memory":
+                    if name == DISCOVER_TOOL_NAME:
+                        names, fallback_all = discover_tool_names(
+                            args.get("query", ""), TOOLS, args.get("limit", 12)
+                        )
+                        _active_tool_names.update(names)
+                        result = discovery_result(names, TOOLS, fallback_all)
+                        await _publish_agent_event(
+                            "discovery",
+                            loaded_tools=names,
+                            fallback_all=fallback_all,
+                        )
+                    elif name == UPDATE_PLAN_TOOL_NAME:
+                        result = _plan_state.update(args)
+                        if _plan_state.findings:
+                            _compact_after_plan = True
+                        await _publish_agent_event(
+                            "plan",
+                            goal=_plan_state.goal,
+                            status=_plan_state.status,
+                            steps=_plan_state.steps,
+                            findings_count=len(_plan_state.findings),
+                        )
+                    elif name == "save_memory":
                         if uid:
                             new_content, rejected = sanitize_memory_content(args.get("content", ""))
                             if not new_content:
@@ -3061,7 +3263,7 @@ class Assistant:
 
                         # 多维表格工具 sheet_id 兜底补齐：
                         # 优先从本次会话的 schema 缓存里找，其次从 default_file 配置里找
-                        if name in {"list_records", "create_records", "update_records", "delete_records"}:
+                        if name in {"list_records", "analyze_records", "create_records", "update_records", "delete_records"}:
                             _need_fallback = ("sheet_id" not in args) or (not args.get("sheet_id")) or (args.get("sheet_id") == 0)
                             if _need_fallback:
                                 _fid = args.get("file_id", "")
@@ -3121,10 +3323,51 @@ class Assistant:
                     print(f"[TOOL RESULT] {name} => {str(result)[:200]}")
                 except UnicodeEncodeError:
                     sys.stdout.write(f"[TOOL RESULT] {name} => {str(result)[:200]}\n")
+                _turn_receipts.append({"name": name, "args": args, "result": result})
                 full_messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
                     "content": _compress_tool_result(name, result),
                 })
+            if _compact_after_plan:
+                full_messages, compacted = compact_tool_messages(
+                    full_messages,
+                    preserve_recent_tool_messages=max(1, len(msg.tool_calls)),
+                    min_chars=2500,
+                )
+                if compacted:
+                    _metrics.context_compactions += compacted
+                    self.last_run_metrics = _metrics.snapshot()
+                    await _publish_agent_event(
+                        "context",
+                        status="compacted",
+                        message="阶段性结论已保存，旧的明细结果已压缩。",
+                        compacted_results=compacted,
+                        metrics=self.last_run_metrics,
+                    )
+            _tool_fingerprint = hashlib.sha256(
+                json.dumps(
+                    _turn_receipts,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest()
+            if _tool_fingerprint == _last_tool_fingerprint:
+                _same_tool_batches += 1
+            else:
+                _same_tool_batches = 0
+            _last_tool_fingerprint = _tool_fingerprint
 
-        return "已达到最大工具调用轮次，请重新描述需求。"
+            if _same_tool_batches >= 2 and self.smart_tool_routing:
+                _active_tool_names.update(_all_business_tool_names)
+                _append_system_instruction(
+                    "The last tool-call batch repeated without measurable progress. "
+                    "All business tools are now visible. Re-evaluate the plan, change "
+                    "arguments or strategy, and do not repeat the same call unchanged."
+                )
+            if _same_tool_batches >= 4:
+                return (
+                    "任务执行连续重复同一组调用，系统已停止无效消耗，且没有误报完成。"
+                    "请检查数据权限、工具返回内容或更换工具调用能力更强的模型后重试。"
+                )

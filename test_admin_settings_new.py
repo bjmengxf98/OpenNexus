@@ -58,6 +58,9 @@ def test_all_pages_have_no_server_ui_runtime():
     assert 'data-advanced="supports_vision"' in settings_html
     assert 'data-advanced="reasoning_mode"' in settings_html
     assert 'data-advanced="context_window"' in settings_html
+    assert "全部工具模式（兼容模式；通常无需开启）" in settings_html
+    assert 'data-advanced="smart_tool_routing" data-inverted="true"' in settings_html
+    assert "el.dataset.inverted==='true'?!el.checked:el.checked" in settings_html
     assert 'id="tokenScopes"' in settings_html
     assert 'id="approvalList"' in settings_html
     assert "selectedScopes()" in settings_html
@@ -72,6 +75,22 @@ def test_all_pages_have_no_server_ui_runtime():
         assert "import nicegui" not in text, path
         assert "ui.run(" not in text, path
 
+
+
+def test_login_card_is_compact_and_password_uses_browser_credentials():
+    auth_html = (
+        Path(__file__).parent / "static" / "auth.html"
+    ).read_text(encoding="utf-8")
+
+    assert "width:min(430px" in auth_html
+    assert "max-height:calc(100svh - 24px)" in auth_html
+    assert 'id="rememberPassword"' in auth_html
+    assert "记住密码" in auth_html
+    assert "PasswordCredential" in auth_html
+    assert "navigator.credentials.store" in auth_html
+    assert "localStorage.setItem('saved_password'" not in auth_html
+    assert "remember_password_preference" in auth_html
+    assert "localStorage.getItem('remember_password_preference')" in auth_html
 
 def test_primary_ui_exposes_project_ownership_and_license():
     static_root = Path(__file__).parent / "static"
@@ -204,6 +223,7 @@ def test_custom_openai_provider_can_be_saved(monkeypatch):
         {
             "supports_tools": True,
             "supports_vision": True,
+            "smart_tool_routing": True,
             "reasoning_mode": "on",
             "reasoning_effort": "high",
             "context_window": 128000,

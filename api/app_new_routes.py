@@ -233,6 +233,7 @@ async def app_new_messages(conv_id: int, request: Request):
             "content": _display_user_text(content) if row.get("role") == "user" else content,
             "html": "" if row.get("role") == "user" else _render_markdown(content),
             "created_at": row.get("created_at") or "",
+            "metadata": row.get("metadata") or {},
         })
     return {"ok": True, "messages": messages}
 
@@ -470,6 +471,9 @@ async def app_new_chat(request: Request):
                 async def on_tool_call(name, args):
                     await emit("tool", name=name)
 
+                async def on_agent_event(kind, payload):
+                    await emit(kind, **payload)
+
                 assistant = Assistant(
                     api_key=llm_cfg["api_key"],
                     provider=llm_cfg.get("provider", "deepseek"),
@@ -482,9 +486,14 @@ async def app_new_chat(request: Request):
                     username=user.get("display_name") or user.get("username", "用户"),
                     role=user.get("role", "staff"), default_file=default_file,
                     all_files=all_files, memory=memory_context, uid=uid, conv_id=conv_id,
+                    on_agent_event=on_agent_event,
                 )
                 ensure_not_cancelled()
-                db.add_chat(uid, "assistant", reply, conv_id=conv_id)
+                run_metrics = getattr(assistant, "last_run_metrics", {}) or {}
+                db.add_chat(
+                    uid, "assistant", reply, conv_id=conv_id,
+                    metadata={"run_metrics": run_metrics},
+                )
 
                 conv = db.get_conversation(conv_id, uid)
                 new_title = None
@@ -494,7 +503,8 @@ async def app_new_chat(request: Request):
                         db.rename_conversation(conv_id, uid, new_title)
 
                 await emit("done", conversation_id=conv_id, reply=reply,
-                           html=_render_markdown(reply), title=new_title or title)
+                           html=_render_markdown(reply), title=new_title or title,
+                           metrics=run_metrics)
                 db.update_agent_turn_status(turn_id, uid, "completed")
 
                 async def update_memory():

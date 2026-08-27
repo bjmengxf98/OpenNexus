@@ -94,6 +94,8 @@ WPS remains the source of truth for mutable business status such as tasks, proje
 
 Settings cover WPS files and account ID, primary and image models, display theme and font size, WeCom, personal WeChat, MCP access, account security, profile, and feedback.
 
+Keep **Smart tool selection and Token saving** enabled for the primary model unless compatibility troubleshooting requires the legacy full-tool mode. Large-table analysis reads every required page, performs filtering and aggregation locally, and returns compact row windows for semantic review. Each new assistant reply shows Token usage, model rounds, tool calls, and tool-schema savings. If the provider omits exact usage, the value is marked as estimated. Context-limit errors trigger automatic compaction and retry without claiming that incomplete data is complete.
+
 API keys are deployment secrets. Never include them in screenshots or public issues.
 
 ## 11. WorkBuddy and MCP

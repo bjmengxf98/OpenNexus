@@ -72,6 +72,7 @@ def _advanced_config(body: dict, kind: str) -> tuple[dict | None, str | None]:
 
     return {
         "supports_tools": bool(raw.get("supports_tools", kind == "main")),
+        "smart_tool_routing": bool(raw.get("smart_tool_routing", kind == "main")),
         "supports_vision": bool(raw.get("supports_vision", kind == "image")),
         "reasoning_mode": mode,
         "reasoning_effort": effort,

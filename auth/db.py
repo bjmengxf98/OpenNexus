@@ -96,6 +96,7 @@ def init_db():
             role TEXT NOT NULL,
             content TEXT NOT NULL,
             created_at TEXT DEFAULT (datetime('now')),
+            metadata TEXT DEFAULT '{}',
             FOREIGN KEY(user_id) REFERENCES users(id)
         );
 
@@ -330,6 +331,10 @@ def init_db():
         # 迁移：chat_history 添加 conversation_id 字段
         try:
             conn.execute("ALTER TABLE chat_history ADD COLUMN conversation_id INTEGER REFERENCES conversations(id)")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE chat_history ADD COLUMN metadata TEXT DEFAULT '{}'")
         except Exception:
             pass
         # 迁移：知识库向量分块表（RAG）
@@ -940,11 +945,19 @@ def touch_conversation(conv_id: int):
         )
 
 
-def add_chat(user_id: int, role: str, content: str, conv_id: int = None):
+def add_chat(
+    user_id: int,
+    role: str,
+    content: str,
+    conv_id: int = None,
+    metadata: dict | None = None,
+):
+    metadata_text = json.dumps(metadata or {}, ensure_ascii=False, default=str)
     with get_conn() as conn:
         conn.execute(
-            "INSERT INTO chat_history (user_id, role, content, conversation_id) VALUES (?,?,?,?)",
-            (user_id, role, content, conv_id)
+            "INSERT INTO chat_history "
+            "(user_id, role, content, conversation_id, metadata) VALUES (?,?,?,?,?)",
+            (user_id, role, content, conv_id, metadata_text)
         )
     if conv_id:
         touch_conversation(conv_id)
@@ -954,16 +967,25 @@ def get_chat_history(user_id: int, conv_id: int = None, limit: int = 20) -> list
     with get_conn() as conn:
         if conv_id is not None:
             rows = conn.execute(
-                "SELECT role, content, created_at FROM chat_history "
+                "SELECT role, content, created_at, metadata FROM chat_history "
                 "WHERE user_id=? AND conversation_id=? ORDER BY id DESC LIMIT ?",
                 (user_id, conv_id, limit)
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT role, content, created_at FROM chat_history WHERE user_id=? ORDER BY id DESC LIMIT ?",
+                "SELECT role, content, created_at, metadata "
+                "FROM chat_history WHERE user_id=? ORDER BY id DESC LIMIT ?",
                 (user_id, limit)
             ).fetchall()
-        return list(reversed([dict(r) for r in rows]))
+        result = []
+        for row in reversed(rows):
+            item = dict(row)
+            try:
+                item["metadata"] = json.loads(item.get("metadata") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                item["metadata"] = {}
+            result.append(item)
+        return result
 
 
 def clear_chat_history(user_id: int, conv_id: int = None):

@@ -57,7 +57,7 @@ def test_mobile_composer_has_rounded_corners_without_idle_scrollbar():
 def test_history_restore_jumps_to_bottom_without_replaying_smooth_scroll():
     assert "scroll-behavior:smooth" not in HTML
     assert "function scrollBottom(smooth=false)" in HTML
-    assert "addMessage(m.role,m.content,m.html,m.created_at,false)" in HTML
+    assert "addMessage(m.role,m.content,m.html,m.created_at,false,m.metadata)" in HTML
     assert "scrollBottom(false)" in HTML
     assert "if(autoScroll)scrollBottom(true)" in HTML
 
@@ -78,6 +78,14 @@ def test_chat_turn_can_resume_and_be_cancelled_without_replacing_chat_entrypoint
     assert ".send.stop{background:#ef4444}" in HTML
     assert ".send.stop::before{content:\"\";display:block;width:12px;height:12px" in HTML
     assert "sendBtn.textContent=state.sending?'':'↑'" in HTML
+
+def test_chat_shows_plan_and_persisted_token_metrics():
+    assert "e.type==='plan'" in HTML
+    assert "e.type==='usage'" in HTML
+    assert "className='run-meta'" in HTML
+    assert "tool_definition_saving_rate" not in HTML
+    assert "工具上下文减少" not in HTML
+    assert "m.metadata" in HTML
 
 
 def test_user_help_covers_current_major_features():

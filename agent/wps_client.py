@@ -146,7 +146,12 @@ async def list_records(access_token: str, file_id: str, sheet_id: int,
         if max_records:  body["max_records"] = max_records
         result = await _post(access_token,
                              f"/v7/coop/dbsheet/{file_id}/sheets/{sheet_id}/records", body)
-        return _parse_records(result.get("data", result))
+        parsed = _parse_records(result.get("data", result))
+        parsed["fetched"] = len(parsed.get("records", []))
+        parsed["has_more"] = bool(parsed.get("has_more", False))
+        parsed["is_complete"] = not parsed["has_more"]
+        parsed.setdefault("next_page_token", None)
+        return parsed
 
     # 默认：自动翻页，拉取全部记录（上限 3000 条，防止超大表撑爆 token）
     MAX_AUTO_FETCH = 3000
@@ -154,6 +159,7 @@ async def list_records(access_token: str, file_id: str, sheet_id: int,
     current_token = None
     total = 0
 
+    has_more = False
     while True:
         body = {"page_size": 1000}
         if current_token: body["page_token"] = current_token
@@ -174,8 +180,12 @@ async def list_records(access_token: str, file_id: str, sheet_id: int,
     return {
         "records": all_records,
         "total": total,
-        "has_more": len(all_records) < total,
+        "has_more": bool(has_more),
         "fetched": len(all_records),
+        "next_page_token": current_token if has_more else None,
+        "is_complete": not bool(has_more),
+        "auto_fetch_limit": MAX_AUTO_FETCH,
+        "continuation_available": bool(has_more and current_token),
     }
 
 
@@ -278,7 +288,7 @@ async def create_sheet(access_token: str, file_id: str, name: str = None,
     }
     if name:
         body["name"] = name
-    result = await _post(access_token, f"/v7/coop/dbsheet/{file_id}/sheets/create", body)
+    result = await _post(access_token, f"/v7/coop/dbsheet/{file_id}/sheets/create", body, signed=True)
     return result.get("data", result)
 
 
@@ -294,7 +304,7 @@ async def create_fields(access_token: str, file_id: str, sheet_id: int,
                         fields: list) -> dict:
     result = await _post(access_token,
                          f"/v7/coop/dbsheet/{file_id}/sheets/{sheet_id}/fields",
-                         {"fields": fields})
+                         {"fields": fields}, signed=True)
     return result.get("data", result)
 
 

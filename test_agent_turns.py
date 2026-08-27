@@ -96,7 +96,12 @@ def test_existing_chat_endpoint_keeps_sse_contract_and_persists_turn(monkeypatch
 
     class FakeAssistant:
         def __init__(self, **_kwargs):
-            pass
+            self.last_run_metrics = {
+                "total_tokens": 321,
+                "model_requests": 2,
+                "tool_calls": 1,
+                "estimated": False,
+            }
 
         async def chat(self, *_args, **_kwargs):
             return "兼容回复"
@@ -127,10 +132,13 @@ def test_existing_chat_endpoint_keeps_sse_contract_and_persists_turn(monkeypatch
     assert [item["type"] for item in payloads] == ["accepted", "done"]
     assert payloads[-1]["reply"] == "兼容回复"
     assert db.get_agent_turn(turn_id, 1)["status"] == "completed"
+    assert payloads[-1]["metrics"]["total_tokens"] == 321
     conv_id = payloads[0]["conversation_id"]
-    assert [row["role"] for row in db.get_chat_history(1, conv_id=conv_id)] == [
+    history = db.get_chat_history(1, conv_id=conv_id)
+    assert [row["role"] for row in history] == [
         "user", "assistant",
     ]
+    assert history[-1]["metadata"]["run_metrics"]["total_tokens"] == 321
 
 
 def test_cancel_endpoint_is_owner_scoped_and_reaches_terminal_state(monkeypatch, tmp_path):
