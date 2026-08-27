@@ -115,6 +115,7 @@ from auth.wps_oauth import (
 )
 from core.mcp_server import mcp_server, mcp_http_app
 from core.reminder_text import format_reminder_push_text
+from core.wechat_delivery import deliver_personal_weixin, probe_personal_weixin_bridge
 from core.tool_governance import normalize_requested_scopes, scope_options
 
 # ── PWA 图标生成 ───────────────────────────────────────────
@@ -410,15 +411,18 @@ async def _lifespan(app_):
 
     # 提醒调度器：每分钟扫描到期提醒，推送后立即删除
     async def _reminder_scheduler():
-        import httpx as _httpx
         from auth.db import (
             get_due_reminders as _get_due,
             delete_reminder as _del_reminder,
             mark_reminder_failed as _mark_failed,
             log_reminder_delivery as _log_delivery,
         )
+        first_scan = True
         while True:
-            await asyncio.sleep(60)
+            if first_scan:
+                first_scan = False
+            else:
+                await asyncio.sleep(60)
             try:
                 due = _get_due()
                 if not due:
@@ -438,38 +442,33 @@ async def _lifespan(app_):
                     delivery_channel = ""
                     push_errors = []
 
-                    # 优先：个人微信推送
-                    if weixin_id and _wechat_port_map:
-                        port_list = ([_wechat_port_map[weixin_id]]
-                                     if weixin_id in _wechat_port_map
-                                     else list(_wechat_port_map.values()))
-                        try:
-                            # Node 桥接遇到微信限流时最多退避重试约 70 秒；
-                            # Python 必须等待其明确结果，不能先超时后让桥接在后台继续发送。
-                            async with _httpx.AsyncClient(timeout=90) as _c:
-                                for _port in port_list:
-                                    _resp = await _c.post(
-                                        f"http://127.0.0.1:{_port}/local/send",
-                                        json={"to": weixin_id, "text": push_text, "token": local_token},
-                                    )
-                                    _body = {}
-                                    try:
-                                        _body = _resp.json()
-                                    except Exception:
-                                        pass
-                                    if _resp.status_code == 200 and _body.get("ok") is True:
-                                        pushed = True
-                                        delivery_channel = "wechat"
-                                        print(f"[REMINDER] pushed via WeChat -> {display}({weixin_id}) rid={rid}")
-                                        break
-                                    push_errors.append(
-                                        f"WeChat port {_port}: HTTP {_resp.status_code} {_resp.text[:300]}"
-                                    )
-                        except Exception as _e:
-                            push_errors.append(f"WeChat: {_e}")
-                            print(f"[REMINDER] WeChat push failed rid={rid}: {_e}")
-                    elif weixin_id:
-                        push_errors.append("WeChat: no active bridge process")
+                    # 优先：个人微信推送。不能只信任进程内端口映射：服务器
+                    # 重启、代理环境变量或端口变化后，映射可能为空或过期。
+                    # 每次通过 /health 找到与目标微信完全匹配的桥接，并要求
+                    # /local/send 明确返回 ok=true 才视为送达。
+                    if weixin_id:
+                        _delivery = await deliver_personal_weixin(
+                            weixin_id,
+                            push_text,
+                            local_token,
+                            _wechat_port_map,
+                        )
+                        if _delivery.get("ok") is True:
+                            pushed = True
+                            delivery_channel = "wechat"
+                            print(
+                                f"[REMINDER] pushed via WeChat -> "
+                                f"{display}({weixin_id}) rid={rid} "
+                                f"port={_delivery.get('port')}"
+                            )
+                        else:
+                            _detail = str(
+                                _delivery.get("error") or "unknown bridge error"
+                            )
+                            push_errors.append(f"WeChat: {_detail}")
+                            print(
+                                f"[REMINDER] WeChat push failed rid={rid}: {_detail}"
+                            )
 
                     # 未绑定个人微信时才兜底到 WPS。
                     # 已绑定微信但桥接临时失败时保留记录重试，不能用 WPS 成功冒充微信送达。
@@ -565,23 +564,45 @@ async def _lifespan(app_):
             cycle += 1
             await asyncio.sleep(300)
 
-    asyncio.create_task(_reminder_scheduler())
-    asyncio.create_task(_dashboard_snapshot_scheduler())
-    asyncio.create_task(_dashboard_cache_scheduler())
     from api.app_new_routes import reap_stale_agent_turns
-    turn_reaper_task = asyncio.create_task(
-        reap_stale_agent_turns(), name="agent-turn-reaper",
-    )
+    background_tasks = [
+        asyncio.create_task(
+            _reminder_scheduler(), name="reminder-scheduler",
+        ),
+        asyncio.create_task(
+            _dashboard_snapshot_scheduler(), name="dashboard-snapshot-scheduler",
+        ),
+        asyncio.create_task(
+            _dashboard_cache_scheduler(), name="dashboard-cache-scheduler",
+        ),
+        asyncio.create_task(
+            reap_stale_agent_turns(), name="agent-turn-reaper",
+        ),
+    ]
 
-    yield
-    turn_reaper_task.cancel()
-    await asyncio.gather(turn_reaper_task, return_exceptions=True)
-    _wechat_monitor_stop = True
-    for proc in _wechat_procs:
-        proc.terminate()
-    if _wechat_procs:
-        print("[WeChat] 微信桥接已停止")
-    await _mcp_lifecycle.__aexit__(None, None, None)
+    def _report_background_failure(task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            print(f"[BACKGROUND] {task.get_name()} stopped unexpectedly: {error!r}")
+
+    for task in background_tasks:
+        task.add_done_callback(_report_background_failure)
+    print("[REMINDER] scheduler started and retained by application lifespan")
+
+    try:
+        yield
+    finally:
+        for task in background_tasks:
+            task.cancel()
+        await asyncio.gather(*background_tasks, return_exceptions=True)
+        _wechat_monitor_stop = True
+        for proc in _wechat_procs:
+            proc.terminate()
+        if _wechat_procs:
+            print("[WeChat] 微信桥接已停止")
+        await _mcp_lifecycle.__aexit__(None, None, None)
 
 fastapi_app = FastAPI(lifespan=_lifespan)
 _session_secret = os.environ.get("SESSION_SECRET", "").strip()
@@ -2840,6 +2861,63 @@ async def weixin_setup_status(request: Request):
         return JSONResponse({"status": "done" if ok else "failed", "message": message})
     return JSONResponse({"status": "idle"})
 
+def _masked_weixin_id(value: str) -> str:
+    value = (value or "").strip()
+    if len(value) <= 8:
+        return value
+    return f"{value[:4]}…{value[-4:]}"
+
+
+@fastapi_app.get("/api/weixin/status")
+async def weixin_delivery_status(request: Request):
+    """Return the real bridge status instead of treating a saved ID as online."""
+    uid = request.session.get("uid")
+    if not uid:
+        return JSONResponse({"error": "未登录"}, status_code=401)
+    personal_weixin_id = db.get_personal_weixin_id(int(uid)) or ""
+    if not personal_weixin_id:
+        return JSONResponse({
+            "ok": True, "bound": False, "connected": False,
+            "message": "尚未绑定个人微信",
+        })
+    port, error = await probe_personal_weixin_bridge(
+        personal_weixin_id, _wechat_port_map,
+    )
+    connected = port is not None
+    return JSONResponse({
+        "ok": True,
+        "bound": True,
+        "connected": connected,
+        "personal_weixin_id": _masked_weixin_id(personal_weixin_id),
+        "port": port,
+        "message": "微信桥接在线，可以接收提醒" if connected else error,
+    })
+
+
+@fastapi_app.post("/api/weixin/test")
+async def weixin_delivery_test(request: Request):
+    """Send an immediate message so users can verify reminder delivery."""
+    uid = request.session.get("uid")
+    if not uid:
+        return JSONResponse({"error": "未登录"}, status_code=401)
+    personal_weixin_id = db.get_personal_weixin_id(int(uid)) or ""
+    if not personal_weixin_id:
+        return JSONResponse({"error": "尚未绑定个人微信"}, status_code=400)
+    local_token = db.get_system_config("weixin_bot_token", "")
+    result = await deliver_personal_weixin(
+        personal_weixin_id,
+        "✅ OpenNexus 微信提醒测试成功。今后的定时提醒会通过此通道发送。",
+        local_token,
+        _wechat_port_map,
+    )
+    if result.get("ok") is not True:
+        return JSONResponse(
+            {"error": f"测试消息发送失败：{result.get('error') or '未知错误'}"},
+            status_code=503,
+        )
+    return JSONResponse({"ok": True, "message": "测试消息已发送，请检查微信"})
+
+
 
 @fastapi_app.post("/api/weixin/notify")
 async def weixin_notify(request: Request):
@@ -3077,4 +3155,11 @@ if __name__ == "__main__":
                 time.sleep(0.25)
         webbrowser.open(f"http://localhost:{port}/login")
     threading.Thread(target=open_browser, daemon=True).start()
-    uvicorn.run("app:fastapi_app", host="0.0.0.0", port=port, reload=False)
+    # Uvicorn 0.40 forces ProactorEventLoop for a single Windows worker.
+    # A client that resets during AcceptEx can raise WinError 64 and leave the
+    # process alive while permanently closing the listening socket.  This app
+    # does not use asyncio subprocess APIs, so SelectorEventLoop is the safer
+    # Windows server loop.  Linux keeps Uvicorn's normal automatic selection.
+    server_loop = "asyncio:SelectorEventLoop" if sys.platform == "win32" else "auto"
+    print(f"[STARTUP] Uvicorn event loop: {server_loop}")
+    uvicorn.run("app:fastapi_app", host="0.0.0.0", port=port, reload=False, loop=server_loop)

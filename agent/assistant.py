@@ -38,7 +38,8 @@ from auth.db import (search_knowledge as _db_search_knowledge,
                      add_wps_file as _db_add_wps_file,
                      add_reminder as _db_add_reminder,
                      list_reminders as _db_list_reminders,
-                     cancel_reminder as _db_cancel_reminder)
+                     cancel_reminder as _db_cancel_reminder,
+                     get_personal_weixin_id as _db_get_personal_weixin_id)
 from auth.email_sender import send_email as _send_email
 from agent.wps_client import create_record_comment as _wps_comment
 from agent.wps_client import list_contacts as _wps_list_contacts
@@ -3006,10 +3007,20 @@ class Assistant:
                                     rid = _db_add_reminder(
                                         uid, content, remind_at, event_at=event_at
                                     )
+                                    try:
+                                        _has_weixin = bool(_db_get_personal_weixin_id(uid))
+                                    except Exception:
+                                        _has_weixin = False
+                                    _channel_text = (
+                                        "已保存个人微信绑定；可在设置页用“发送测试消息”确认当前连接"
+                                        if _has_weixin else
+                                        "尚未绑定个人微信，请在设置页绑定后再确认通知通道"
+                                    )
                                     result = {"ok": True, "reminder_id": rid,
                                               "message": (
-                                                  f"提醒已设置，将在 {remind_at} 推送微信消息："
-                                                  f"{content}（事件时间：{event_at}）"
+                                                  f"提醒已保存，将在 {remind_at} 尝试发送："
+                                                  f"{content}（事件时间：{event_at}）。"
+                                                  f"通知状态：{_channel_text}。"
                                               )}
                                     _reminder_created_success = True
                                 except Exception as _e:
