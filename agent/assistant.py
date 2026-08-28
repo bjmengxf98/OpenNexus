@@ -2620,7 +2620,24 @@ class Assistant:
             _previous_assistant.startswith("提醒方案：")
             and _positive_confirmation
         )
-        _continuing_reminder_planning = _previous_assistant.startswith("提醒规划：")
+        _previous_was_reminder_planning = _previous_assistant.startswith("提醒规划：")
+        _reminder_failure_followup = (
+            _previous_was_reminder_planning
+            and any(phrase in _last_user_content for phrase in (
+                "没通知", "没有通知", "未通知",
+                "没提醒", "没有提醒", "未提醒",
+                "昨天的事", "前天的事", "已经过去", "已经过了",
+            ))
+        )
+        if _reminder_failure_followup:
+            return (
+                "上一轮只进入了提醒规划，并没有把提醒写入系统，所以不会发送通知。"
+                "这件事已经过去，本次不再创建提醒；如果需要，我可以帮您记录未通知情况。"
+            )
+        # 明确的新建/删除等独立操作会终止上一轮提醒规划，防止旧状态劫持新任务。
+        _continuing_reminder_planning = (
+            _previous_was_reminder_planning and not _force_tool_first
+        )
 
         # 明确提醒时刻和普通会议直接入库；只有出行或信息不足时才先规划。
         _force_reminder = _is_plan_confirmation or (

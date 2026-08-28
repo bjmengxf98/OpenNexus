@@ -411,6 +411,72 @@ class ReminderConversationTests(unittest.IsolatedAsyncioTestCase):
             event_at=f"{future_date} 14:00",
         )
 
+    async def test_new_task_command_cancels_stale_reminder_planning(self):
+        completions = _FakeCompletions([
+            SimpleNamespace(content="开始处理新任务。", tool_calls=None),
+        ])
+        assistant = Assistant.__new__(Assistant)
+        assistant.provider = "deepseek"
+        assistant.model = "deepseek-chat"
+        assistant.client = SimpleNamespace(
+            chat=SimpleNamespace(completions=completions)
+        )
+        assistant._auto_learn = AsyncMock(return_value=None)
+        history = [
+            {
+                "role": "user",
+                "content": "明天下午两点去酒店，到时候提醒我",
+            },
+            {
+                "role": "assistant",
+                "content": "提醒规划：请确认出发地点。",
+            },
+            {
+                "role": "user",
+                "content": "建立任务，编写信息公开技术性判断，执行人是李金文",
+            },
+        ]
+
+        reply = await assistant.chat(history, access_token="", uid=2)
+
+        self.assertEqual(reply, "开始处理新任务。")
+        self.assertIn("tools", completions.calls[0])
+        self.assertEqual(completions.calls[0]["tool_choice"], "required")
+        self.assertNotIn(
+            "提醒规划续答",
+            completions.calls[0]["messages"][0]["content"],
+        )
+
+    async def test_past_missed_notice_after_planning_is_explained_not_replanned(self):
+        completions = _FakeCompletions([])
+        assistant = Assistant.__new__(Assistant)
+        assistant.provider = "deepseek"
+        assistant.model = "deepseek-chat"
+        assistant.client = SimpleNamespace(
+            chat=SimpleNamespace(completions=completions)
+        )
+        assistant._auto_learn = AsyncMock(return_value=None)
+        history = [
+            {
+                "role": "user",
+                "content": "昨天上午9点微信通知我去酒店",
+            },
+            {
+                "role": "assistant",
+                "content": "提醒规划：请确认具体提醒时间。",
+            },
+            {
+                "role": "user",
+                "content": "那个事昨天的事了，而且你今天上午也没通知我啊",
+            },
+        ]
+
+        reply = await assistant.chat(history, access_token="", uid=2)
+
+        self.assertIn("没有把提醒写入系统", reply)
+        self.assertIn("不会发送通知", reply)
+        self.assertEqual(completions.calls, [])
+
 
 class ReminderDatabaseTests(unittest.TestCase):
     def setUp(self):
