@@ -47,6 +47,15 @@ def test_mobile_sidebar_overlay_cannot_cover_sidebar_controls():
     assert ".panel-overlay{position:fixed;inset:54px 0 0;z-index:39" in HTML
 
 
+def test_mobile_sidebar_places_new_chat_between_actions_and_conversations():
+    sidebar_start = HTML.index('<aside class="sidebar" id="sidebar">')
+    sidebar_end = HTML.index('</aside>', sidebar_start)
+    mobile_actions = HTML.index('<nav class="mobile-nav"', sidebar_start, sidebar_end)
+    new_chat = HTML.index('id="newChat"', sidebar_start, sidebar_end)
+    conversations = HTML.index('id="convList"', sidebar_start, sidebar_end)
+    assert mobile_actions < new_chat < conversations
+
+
 def test_mobile_composer_has_rounded_corners_without_idle_scrollbar():
     assert ".composer{padding:7px 8px;border-radius:18px}" in HTML
     assert "overflow-y:hidden" in HTML
