@@ -137,6 +137,14 @@ class ReminderIntentTests(unittest.TestCase):
         self.assertEqual(_detect_personal_reminder_intent(text), (True, True))
         self.assertEqual(_detect_event_reminder_scene(text), "travel")
 
+    def test_explicit_notice_time_before_travel_is_not_event_time(self):
+        text = "明天上午9点微信通知我去长白山酒店"
+        self.assertEqual(
+            _detect_personal_reminder_intent(text),
+            (True, True),
+        )
+        self.assertEqual(_detect_event_reminder_scene(text), "")
+
 
 class _FakeCompletions:
     def __init__(self, messages):
@@ -279,6 +287,83 @@ class ReminderConversationTests(unittest.IsolatedAsyncioTestCase):
             f"{expected_date} 08:30",
             event_at=f"{expected_date} 09:00",
         )
+
+    async def test_explicit_wechat_notice_time_must_write_reminder(self):
+        now = datetime.now(timezone(timedelta(hours=8)))
+        expected_date = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+        tool_call = SimpleNamespace(
+            id="reminder-hotel",
+            function=SimpleNamespace(
+                name="add_reminder",
+                arguments=(
+                    '{"content":"去长白山酒店",'
+                    f'"remind_at":"{expected_date} 09:00",'
+                    f'"event_at":"{expected_date} 09:00"}}'
+                ),
+            ),
+        )
+        completions = _FakeCompletions([
+            SimpleNamespace(
+                content="明白，已为您设置提醒，现在为您创建定时提醒。",
+                tool_calls=None,
+            ),
+            SimpleNamespace(content=None, tool_calls=[tool_call]),
+            SimpleNamespace(
+                content="提醒已设置，明天上午9点微信通知您。",
+                tool_calls=None,
+            ),
+        ])
+        assistant = Assistant.__new__(Assistant)
+        assistant.provider = "deepseek"
+        assistant.model = "deepseek-chat"
+        assistant.client = SimpleNamespace(
+            chat=SimpleNamespace(completions=completions)
+        )
+        assistant._auto_learn = AsyncMock(return_value=None)
+
+        with patch("agent.assistant._db_add_reminder", return_value=45) as add:
+            reply = await assistant.chat(
+                [{"role": "user", "content": "明天上午9点微信通知我去长白山酒店"}],
+                access_token="",
+                uid=2,
+            )
+
+        self.assertIn("提醒已设置", reply)
+        self.assertEqual(len(completions.calls), 3)
+        self.assertEqual(
+            completions.calls[0]["tool_choice"]["function"]["name"],
+            "add_reminder",
+        )
+        add.assert_called_once_with(
+            2,
+            "去长白山酒店",
+            f"{expected_date} 09:00",
+            event_at=f"{expected_date} 09:00",
+        )
+
+    async def test_travel_planning_cannot_claim_success_without_tool(self):
+        completions = _FakeCompletions([
+            SimpleNamespace(
+                content="已设置，明天下午2点提醒您去民航局。",
+                tool_calls=None,
+            ),
+        ])
+        assistant = Assistant.__new__(Assistant)
+        assistant.provider = "deepseek"
+        assistant.model = "deepseek-chat"
+        assistant.client = SimpleNamespace(
+            chat=SimpleNamespace(completions=completions)
+        )
+        assistant._auto_learn = AsyncMock(return_value=None)
+
+        reply = await assistant.chat(
+            [{"role": "user", "content": "明天下午2点去民航局开会，到时候提醒我"}],
+            access_token="",
+            uid=2,
+        )
+
+        self.assertIn("本次尚未创建提醒", reply)
+        self.assertNotIn("已设置", reply)
 
     async def test_confirmed_plan_is_written_with_event_and_reminder_times(self):
         future_date = (

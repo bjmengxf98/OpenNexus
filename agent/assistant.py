@@ -2248,12 +2248,23 @@ def _detect_event_reminder_scene(user_msg: str) -> str:
         r"|(?:[零〇一二两三四五六七八九十\d]{1,3}\s*(?:点|时)"
         r"(?:半|[零〇一二两三四五六七八九十\d]{1,3}\s*分?)?)"
     )
-    event_after_time = re.search(
-        time_expr
-        + r".{0,6}(?:开会|会议开始|参加会议|出发|前往|去往|去|到达|赶到|拜访|登机|乘车)",
-        text,
+    time_match = re.search(time_expr, text)
+    if not time_match:
+        return ""
+    after_time = text[time_match.end():]
+    reminder_cue = re.search(
+        r"(?:微信\s*)?(?:提醒|通知)\s*我",
+        after_time,
     )
-    if not event_after_time:
+    event_cue = re.search(
+        r"(?:开会|会议开始|参加会议|出发|前往|去往|去|到达|赶到|拜访|登机|乘车)",
+        after_time,
+    )
+    # 「9点微信通知我去酒店」中的9点是明确提醒时刻；
+    # 「2点去酒店，到时候提醒我」中的2点才是事件时刻。
+    if reminder_cue and (not event_cue or reminder_cue.start() < event_cue.start()):
+        return ""
+    if not event_cue or event_cue.start() > 6:
         return ""
 
     travel_words = (
@@ -2925,6 +2936,20 @@ class Assistant:
                         "任务尚未完成，但模型连续停止执行。系统没有把它误报为完成；"
                         "请重试本任务，或检查当前模型的工具调用能力。"
                     )
+                if _reminder_needs_planning:
+                    planning_reply = (msg.content or "").strip()
+                    valid_prefix = planning_reply.startswith(
+                        ("提醒规划：", "提醒方案：")
+                    )
+                    false_success = any(phrase in planning_reply for phrase in (
+                        "已设置", "已经设置", "设置成功",
+                        "已创建", "已经创建", "创建成功",
+                    ))
+                    if not valid_prefix or false_success:
+                        return (
+                            "提醒规划：这项提醒还需要确认具体的提醒时刻或出行安排；"
+                            "本次尚未创建提醒。"
+                        )
                 if _force_reminder and not _reminder_created_success:
                     if _turn == 0:
                         # 某些模型不支持 tool_choice；明确纠正一次，但绝不把普通文字当作成功。
