@@ -14,6 +14,8 @@ All notable public changes to OpenNexus are recorded here.
 - Conversation summaries are isolated per topic and exclude assistant-generated claims
 - Live WPS data remains authoritative; runtime file and sheet selection is not persisted as memory
 - Legacy memory behavior remains available as a compatibility fallback
+- Task-creation replies now require a successful `create_records` tool receipt and post-write readback before claiming completion; fabricated WPS errors are blocked
+- Optional personal-WeChat bridges now use bounded exponential restart backoff, persistent child-process logs, and a failure circuit breaker without affecting the main service
 
 ## [1.0.0] - 2026-08-09
 

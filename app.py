@@ -31,6 +31,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response as StarletteResponse
 from core import upload_queue as _uq
+from core.wechat_supervisor import WechatRestartSupervisor
 
 # ── 上传 iframe HTML ────────────────────────────────────────
 
@@ -209,6 +210,42 @@ _wechat_procs: list = []  # 多账号进程列表
 _wechat_port_map: dict = {}  # weixin_id -> port
 _wechat_proc_map: dict = {}  # weixin_id -> proc
 
+
+def _launch_wechat_bridge(node_main: Path, wechat_dir: Path, account_id: str,
+                          port: int, show_log: bool = False):
+    """启动可选微信桥接，并保留有限大小的诊断日志。"""
+    data_dir = str(Path.home() / ".wechat-claude-code" / "instances" / account_id)
+    log_path = None
+    log_handle = None
+    if not show_log:
+        log_dir = _APP_DIR / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        safe_account = "".join(
+            ch if ch.isalnum() or ch in "-_" else "_" for ch in account_id
+        )
+        log_path = log_dir / f"wechat-bridge-{safe_account}.log"
+        try:
+            if log_path.exists() and log_path.stat().st_size > 2 * 1024 * 1024:
+                rotated = log_path.with_suffix(log_path.suffix + ".1")
+                if rotated.exists():
+                    rotated.unlink()
+                log_path.replace(rotated)
+        except OSError as exc:
+            print(f"[WeChat] 桥接日志轮转失败，将继续启动: {exc}")
+        log_handle = open(log_path, "ab", buffering=0)
+    try:
+        proc = subprocess.Popen(
+            ["node", str(node_main), "--account", account_id, "--port", str(port)],
+            cwd=str(wechat_dir),
+            stdout=None if show_log else log_handle,
+            stderr=None if show_log else subprocess.STDOUT,
+            env={**os.environ, "WCC_DATA_DIR": data_dir},
+        )
+    finally:
+        if log_handle is not None:
+            log_handle.close()
+    return proc, log_path
+
 # webhook 去重：{dedup_key: timestamp}，60秒内同一事件只处理一次
 _webhook_dedup: dict = {}
 
@@ -256,13 +293,16 @@ async def _lifespan(app_):
     _mcp_lifecycle = mcp_server.session_manager.run()
     await _mcp_lifecycle.__aenter__()
     global _wechat_proc, _wechat_procs, _wechat_port_map, _wechat_proc_map
+    show_log = os.environ.get("WECHAT_SHOW_LOG", "0") == "1"
+    _wechat_restart_supervisor = WechatRestartSupervisor(
+        base_delay=30, max_delay=600, max_failures=5, stable_seconds=300,
+    )
     wechat_dir = _APP_DIR / "wechat-claude-code-main"
     if wechat_dir.exists():
         node_main = wechat_dir / "dist" / "main.js"
         if node_main.exists():
             try:
                 import json as _json
-                show_log = os.environ.get("WECHAT_SHOW_LOG", "0") == "1"
                 accounts_dir = Path.home() / ".wechat-claude-code" / "accounts"
                 account_files = list(accounts_dir.glob("*.json")) if accounts_dir.exists() else []
 
@@ -333,19 +373,16 @@ async def _lifespan(app_):
                     port = 3001
                     for uid_wx, af in deduped:
                         account_id = af.stem
-                        data_dir = str(Path.home() / ".wechat-claude-code" / "instances" / account_id)
-                        proc = subprocess.Popen(
-                            ["node", str(node_main), "--account", account_id, "--port", str(port)],
-                            cwd=str(wechat_dir),
-                            stdout=None if show_log else subprocess.DEVNULL,
-                            stderr=None if show_log else subprocess.DEVNULL,
-                            env={**os.environ, "WCC_DATA_DIR": data_dir},
+                        proc, bridge_log = _launch_wechat_bridge(
+                            node_main, wechat_dir, account_id, port, show_log,
                         )
                         _wechat_procs.append(proc)
                         if uid_wx:
                             _wechat_port_map[uid_wx] = port
                             _wechat_proc_map[uid_wx] = proc
-                        print(f"[WeChat] 已启动账号 {account_id} (pid={proc.pid}, port={port})")
+                            _wechat_restart_supervisor.record_started(uid_wx, proc.pid)
+                        _log_hint = f", log={bridge_log}" if bridge_log else ""
+                        print(f"[WeChat] 已启动账号 {account_id} (pid={proc.pid}, port={port}{_log_hint})")
                         port += 1
                     _wechat_proc = _wechat_procs[0]
                 else:
@@ -361,47 +398,81 @@ async def _lifespan(app_):
     # ── WeChat Node daemon 监视和自动重启线程 ──
     _wechat_monitor_stop = False
     def _monitor_wechat_processes():
-        """定期检查 Node daemon 进程是否还活着，如果停止了自动重启"""
+        """监视可选 Node 桥接；退避重试，连续失败后熔断但不影响主系统。"""
         import time as _time
         import json as _json
         while not _wechat_monitor_stop:
             try:
                 _time.sleep(30)  # 每 30 秒检查一次
                 for uid_wx, proc in list(_wechat_proc_map.items()):
-                    if proc.poll() is not None:  # 进程已停止
-                        print(f"[WeChat] 进程已停止，尝试重启: {uid_wx}")
-                        # 重新启动
-                        try:
-                            accounts_dir = Path.home() / ".wechat-claude-code" / "accounts"
-                            account_files = [f for f in accounts_dir.glob("*.json") if f.stat().st_mtime]
-                            if not account_files:
+                    exit_code = proc.poll()
+                    if exit_code is None:
+                        continue
+                    decision = _wechat_restart_supervisor.observe_exit(
+                        uid_wx, proc.pid, exit_code,
+                    )
+                    if decision.new_event:
+                        if decision.action == "disabled":
+                            print(
+                                f"[WeChat] 桥接连续退出 {decision.failures} 次，"
+                                f"已暂停自动重启: {uid_wx} (exit={exit_code})。"
+                                "个人微信为可选功能，主系统继续运行；请重新扫码或检查桥接日志后重启主服务。"
+                            )
+                        else:
+                            print(
+                                f"[WeChat] 桥接已退出: {uid_wx} (exit={exit_code})，"
+                                f"{decision.delay_seconds} 秒后尝试第 {decision.failures} 次恢复"
+                            )
+                    if decision.action != "restart":
+                        continue
+                    try:
+                        accounts_dir = Path.home() / ".wechat-claude-code" / "accounts"
+                        account_files = list(accounts_dir.glob("*.json")) if accounts_dir.exists() else []
+                        matched_file = None
+                        for af in account_files:
+                            try:
+                                data = _json.loads(af.read_text(encoding="utf-8"))
+                            except Exception:
                                 continue
-                            # 找到对应的账号文件
-                            for af in account_files:
-                                try:
-                                    data = _json.loads(af.read_text(encoding="utf-8"))
-                                    if data.get("userId") == uid_wx:
-                                        account_id = af.stem
-                                        data_dir = str(Path.home() / ".wechat-claude-code" / "instances" / account_id)
-                                        node_main = _APP_DIR / "wechat-claude-code-main" / "dist" / "main.js"
-                                        if node_main.exists():
-                                            port = _wechat_port_map.get(uid_wx, 3001)
-                                            new_proc = subprocess.Popen(
-                                                ["node", str(node_main), "--account", account_id, "--port", str(port)],
-                                                cwd=str(_APP_DIR / "wechat-claude-code-main"),
-                                                stdout=subprocess.DEVNULL,
-                                                stderr=subprocess.DEVNULL,
-                                                env={**os.environ, "WCC_DATA_DIR": data_dir},
-                                            )
-                                            _wechat_proc_map[uid_wx] = new_proc
-                                            _wechat_procs.remove(proc)
-                                            _wechat_procs.append(new_proc)
-                                            print(f"[WeChat] 已重启账号 {account_id} (新 pid={new_proc.pid}, port={port})")
-                                        break
-                                except Exception:
-                                    pass
-                        except Exception as e:
-                            print(f"[WeChat] 重启进程失败: {e}")
+                            if data.get("userId") == uid_wx:
+                                matched_file = af
+                                break
+                        node_main = _APP_DIR / "wechat-claude-code-main" / "dist" / "main.js"
+                        if matched_file is None or not node_main.exists():
+                            raise FileNotFoundError("账号文件或微信桥接程序不存在")
+                        account_id = matched_file.stem
+                        port = _wechat_port_map.get(uid_wx, 3001)
+                        new_proc, bridge_log = _launch_wechat_bridge(
+                            node_main,
+                            _APP_DIR / "wechat-claude-code-main",
+                            account_id,
+                            port,
+                            show_log,
+                        )
+                        _wechat_proc_map[uid_wx] = new_proc
+                        try:
+                            _wechat_procs.remove(proc)
+                        except ValueError:
+                            pass
+                        _wechat_procs.append(new_proc)
+                        _wechat_restart_supervisor.record_started(uid_wx, new_proc.pid)
+                        _log_hint = f", log={bridge_log}" if bridge_log else ""
+                        print(
+                            f"[WeChat] 已重启账号 {account_id} "
+                            f"(新 pid={new_proc.pid}, port={port}{_log_hint})"
+                        )
+                    except Exception as e:
+                        failed = _wechat_restart_supervisor.record_launch_failure(uid_wx)
+                        if failed.action == "disabled":
+                            print(
+                                f"[WeChat] 重启失败并已熔断: {uid_wx}: {e}。"
+                                "个人微信为可选功能，主系统继续运行。"
+                            )
+                        else:
+                            print(
+                                f"[WeChat] 重启失败: {uid_wx}: {e}；"
+                                f"{failed.delay_seconds} 秒后重试"
+                            )
             except Exception as e:
                 print(f"[WeChat] 监视线程异常: {e}")
 

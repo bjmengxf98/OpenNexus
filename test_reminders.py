@@ -413,7 +413,7 @@ class ReminderConversationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_new_task_command_cancels_stale_reminder_planning(self):
         completions = _FakeCompletions([
-            SimpleNamespace(content="开始处理新任务。", tool_calls=None),
+            SimpleNamespace(content="请提供任务的截止日期？", tool_calls=None),
         ])
         assistant = Assistant.__new__(Assistant)
         assistant.provider = "deepseek"
@@ -439,7 +439,7 @@ class ReminderConversationTests(unittest.IsolatedAsyncioTestCase):
 
         reply = await assistant.chat(history, access_token="", uid=2)
 
-        self.assertEqual(reply, "开始处理新任务。")
+        self.assertEqual(reply, "请提供任务的截止日期？")
         self.assertIn("tools", completions.calls[0])
         self.assertEqual(completions.calls[0]["tool_choice"], "required")
         self.assertNotIn(

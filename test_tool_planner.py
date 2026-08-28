@@ -433,3 +433,120 @@ def test_all_tools_mode_really_sends_every_tool_while_smart_mode_routes():
     assert smart_count == 5
     assert all_count == len(TOOLS) == 52
     assert all_count > smart_count
+
+
+class _TaskCreateGuardCompletions:
+    def __init__(self):
+        self.calls = []
+
+    @staticmethod
+    def _call(call_id, name, arguments):
+        return SimpleNamespace(
+            id=call_id,
+            function=SimpleNamespace(
+                name=name,
+                arguments=json.dumps(arguments, ensure_ascii=False),
+            ),
+        )
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        index = len(self.calls) - 1
+        if index == 0:
+            message = SimpleNamespace(
+                content=None,
+                tool_calls=[self._call("read-before", "list_records", {
+                    "file_id": "file", "sheet_id": 31, "max_records": 1000,
+                })],
+                reasoning_content=None,
+            )
+        elif index == 1:
+            # 模拟真实故障：模型没有调用写工具，却凭空声称 WPS 403。
+            message = SimpleNamespace(
+                content="WPS API 返回403权限错误，无法创建任务。",
+                tool_calls=None,
+                reasoning_content=None,
+            )
+        elif index == 2:
+            message = SimpleNamespace(
+                content=None,
+                tool_calls=[self._call("create", "create_records", {
+                    "file_id": "file",
+                    "sheet_id": 31,
+                    "records": [{
+                        "任务名称": "建立部门月报制度",
+                        "执行人": ["李金文"],
+                    }],
+                })],
+                reasoning_content=None,
+            )
+        elif index == 3:
+            message = SimpleNamespace(
+                content=None,
+                tool_calls=[self._call("verify", "list_records", {
+                    "file_id": "file",
+                    "sheet_id": 31,
+                    "filter": {"任务名称": "建立部门月报制度"},
+                })],
+                reasoning_content=None,
+            )
+        else:
+            message = SimpleNamespace(
+                content="任务已创建并回读验证成功。",
+                tool_calls=None,
+                reasoning_content=None,
+            )
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+
+def test_task_create_cannot_invent_403_and_must_write_then_verify(monkeypatch):
+    from agent import assistant as assistant_module
+
+    reads = []
+    writes = []
+
+    async def fake_list_records(*_args, **kwargs):
+        reads.append(kwargs)
+        if len(reads) == 1:
+            return {"records": [], "has_more": False}
+        return {
+            "records": [{
+                "id": "new-task",
+                "fields": {"任务名称": "建立部门月报制度"},
+            }],
+            "has_more": False,
+        }
+
+    async def fake_create_records(_token, _file_id, _sheet_id, records):
+        writes.extend(records)
+        return {"records": [{"id": "new-task"}]}
+
+    monkeypatch.setattr(assistant_module, "list_records", fake_list_records)
+    monkeypatch.setattr(assistant_module, "create_records", fake_create_records)
+    completions = _TaskCreateGuardCompletions()
+    assistant = Assistant.__new__(Assistant)
+    assistant.provider = "mock"
+    assistant.model = "mock-model"
+    assistant.client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    assistant.supports_tools = True
+    assistant.supports_vision = False
+    assistant.reasoning_mode = "off"
+    assistant.reasoning_effort = "auto"
+    assistant.context_window = 0
+    assistant.max_output_tokens = 1024
+    assistant.smart_tool_routing = True
+    assistant._auto_learn = AsyncMock()
+
+    reply = asyncio.run(assistant.chat(
+        [{"role": "user", "content": (
+            "这个建立新的任务吧，任务名称是建立部门月报制度，执行人是李金文"
+        )}],
+        access_token="token",
+        default_file={"file_id": "file", "file_name": "部门事务", "sheet_id": 31},
+    ))
+
+    assert reply == "任务已创建并回读验证成功。"
+    assert len(completions.calls) == 5
+    assert len(writes) == 1
+    assert len(reads) == 2
+    assert "403" not in reply

@@ -56,7 +56,9 @@ qrcode.png
 !/docs/WorkBuddy-MCP接入指南.md
 !/docs/User-Guide-EN.md
 !/docs/WorkBuddy-MCP-Guide-EN.md
+!/docs/NEXT_MIGRATION_CHANGELOG.md
 /*.md
+!/AGENTS.md
 !/README.md
 !/README_EN.md
 !/CONTRIBUTING.md

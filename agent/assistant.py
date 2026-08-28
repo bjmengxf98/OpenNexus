@@ -2,6 +2,7 @@
 智能体核心 - 多模型支持 + WPS REST API 全量工具调用
 """
 import json
+import re
 import hashlib
 import mimetypes
 from pathlib import Path
@@ -2274,6 +2275,83 @@ def _detect_event_reminder_scene(user_msg: str) -> str:
     return "travel" if any(word in text for word in travel_words) else "event"
 
 
+_TASK_CREATE_KEYWORDS = (
+    "建立任务", "新建任务", "创建任务", "添加任务", "建任务",
+)
+
+
+def _contains_task_create_intent(text: str) -> bool:
+    value = (text or "").strip()
+    return (
+        any(keyword in value for keyword in _TASK_CREATE_KEYWORDS)
+        or re.search(r"(?:建立|新建|创建|添加|新增).{0,8}任务", value) is not None
+    )
+
+
+def _detect_task_create_requirement(
+    current_user: str,
+    previous_user: str = "",
+    previous_assistant: str = "",
+) -> bool:
+    """识别本轮是否必须产生真实的任务创建回执。"""
+    current = (current_user or "").strip()
+    if _contains_task_create_intent(current):
+        return True
+    # 用户先提出建任务，助手追问执行人，下一轮只回复姓名时仍属于同一写任务。
+    return bool(
+        current
+        and _contains_task_create_intent(previous_user)
+        and "执行人" in (previous_assistant or "")
+        and any(word in (previous_assistant or "") for word in ("请问", "是谁", "提供", "确认"))
+    )
+
+
+def _is_task_create_clarification(reply: str) -> bool:
+    """允许缺少必要信息时追问，但不能把虚构错误当成追问。"""
+    text = (reply or "").strip()
+    asks = any(mark in text for mark in ("？", "?", "请问", "请提供", "需要确认"))
+    missing = any(field in text for field in (
+        "执行人", "任务名称", "截止日期", "所属项目", "需要补充",
+    ))
+    false_error = any(word in text.lower() for word in (
+        "403", "forbidden", "权限错误", "权限限制", "api返回",
+    ))
+    return asks and missing and not false_error
+
+
+def _record_write_marker(records: list | None) -> str:
+    """从写入参数选择可用于回读确认的稳定业务标识。"""
+    preferred = ("任务名称", "任务名", "标题", "名称", "项目名称")
+    for record in records or []:
+        if not isinstance(record, dict):
+            continue
+        for key in preferred:
+            value = record.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for key, value in record.items():
+            if any(word in str(key) for word in ("名称", "标题", "任务")):
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    return ""
+
+
+def _record_list_confirms_marker(result: dict, marker: str) -> bool:
+    if not isinstance(result, dict) or result.get("error"):
+        return False
+    records = result.get("records") or result.get("data", {}).get("records") or []
+    if not records:
+        return False
+    if not marker:
+        return True
+    return marker in json.dumps(records, ensure_ascii=False, default=str)
+
+
+def _safe_tool_error(value) -> str:
+    text = " ".join(str(value or "未知工具错误").split())
+    return text[:500]
+
+
 class Assistant:
     def __init__(self, api_key: str, provider: str = "deepseek",
                  base_url: str = None, model: str = None,
@@ -2605,6 +2683,15 @@ class Assistant:
             if _seen_current_user and _history_msg.get("role") == "assistant":
                 _previous_assistant = str(_history_msg.get("content", "")).strip()
                 break
+        _user_contents = [
+            str(item.get("content", "")) for item in messages
+            if item.get("role") == "user"
+        ]
+        _previous_user = _user_contents[-2] if len(_user_contents) >= 2 else ""
+        _task_create_required = _detect_task_create_requirement(
+            _last_user_content, _previous_user, _previous_assistant,
+        )
+        _force_tool_first = _force_tool_first or _task_create_required
 
         _confirmation_text = _last_user_content.strip().lower().replace("。", "")
         _positive_confirmation = any(
@@ -2735,6 +2822,10 @@ class Assistant:
             )
         else:
             _active_tool_names = set(_all_business_tool_names)
+        if _task_create_required:
+            _active_tool_names.update({
+                "get_schema", "list_records", "create_records",
+            })
 
         def _tools_for_turn():
             if not self.supports_tools or _reminder_needs_planning:
@@ -2763,7 +2854,12 @@ class Assistant:
         _same_tool_batches = 0
         _premature_final_attempts = 0
         _context_recovery_attempts = 0
-        _create_records_success = False  # 追踪 create_records 是否成功
+        _task_create_success = False
+        _task_create_verified = False
+        _task_create_error = ""
+        _task_create_target: tuple[str, str] | None = None
+        _task_create_marker = ""
+        _task_create_completion_stalls = 0
         _reminder_created_success = False  # 追踪本轮提醒是否已真实写入数据库
         _turn = -1
         while True:
@@ -2977,6 +3073,50 @@ class Assistant:
                         )
                         continue
                     return "提醒未能写入系统，请稍后重试；本次没有虚假地标记为设置成功。"
+                if _task_create_required:
+                    candidate_reply = (msg.content or "").strip()
+                    if (
+                        not _task_create_success
+                        and _is_task_create_clarification(candidate_reply)
+                    ):
+                        # 缺少执行人等必要信息时允许正常追问，不强迫盲写。
+                        pass
+                    elif _task_create_error:
+                        return (
+                            "任务未能写入 WPS。实际工具错误："
+                            f"{_safe_tool_error(_task_create_error)}"
+                        )
+                    elif not _task_create_success or not _task_create_verified:
+                        _task_create_completion_stalls += 1
+                        if _task_create_completion_stalls <= 2:
+                            if not _task_create_success:
+                                correction = (
+                                    "The user explicitly requested creating a task. "
+                                    "No successful create_records receipt exists. Call get_schema/list_records "
+                                    "as needed, then call create_records. Do not claim any HTTP or permission "
+                                    "error unless an actual tool result contains that error."
+                                )
+                            else:
+                                target = _task_create_target or ("", "")
+                                correction = (
+                                    "create_records succeeded, but the new task has not been verified. "
+                                    "Do not create it again. Call list_records for the same target "
+                                    f"file_id={target[0]}, sheet_id={target[1]} and verify marker "
+                                    f"{_task_create_marker!r} before answering."
+                                )
+                            _append_system_instruction(
+                                "## 本轮任务写入完成门禁\n" + correction
+                            )
+                            continue
+                        if _task_create_success:
+                            return (
+                                "任务写入请求已经成功，但系统未能回读确认。为避免重复创建，"
+                                "本次没有再次写入；请刷新任务表核查该记录。"
+                            )
+                        return (
+                            "任务尚未创建：模型连续停止执行，但没有产生真实的 create_records "
+                            "成功回执。系统已阻止虚构权限错误，请重试或更换工具调用能力更强的模型。"
+                        )
                 reply = msg.content or ""
                 # 后台自动学习：不阻塞响应，fire-and-forget
                 import asyncio as _asyncio
@@ -3324,6 +3464,34 @@ class Assistant:
                         _r = TOOL_MAP[name](access_token, args)
                         result = await _r if _asyncio.iscoroutine(_r) else _r
 
+                        if _task_create_required and name == "create_records":
+                            _task_create_target = (
+                                str(args.get("file_id") or ""),
+                                str(args.get("sheet_id") or ""),
+                            )
+                            _task_create_marker = _record_write_marker(args.get("records"))
+                            if isinstance(result, dict) and not result.get("error"):
+                                _task_create_success = True
+                                _task_create_verified = False
+                                _task_create_error = ""
+                            else:
+                                _task_create_success = False
+                                _task_create_verified = False
+                                _task_create_error = (
+                                    result.get("error") if isinstance(result, dict) else result
+                                )
+
+                        if (
+                            _task_create_required
+                            and name == "list_records"
+                            and _task_create_success
+                            and _task_create_target
+                            and str(args.get("file_id") or "") == _task_create_target[0]
+                            and str(args.get("sheet_id") or "") == _task_create_target[1]
+                            and _record_list_confirms_marker(result, _task_create_marker)
+                        ):
+                            _task_create_verified = True
+
                         # AI 操作成功后主动写变更日志，和 webhook 保持一致
                         if name in {"create_records", "update_records", "delete_records"} and not result.get("error"):
                             _action_map = {"create_records": "createRecord", "update_records": "updateSheet", "delete_records": "removeRecord"}
@@ -3360,6 +3528,17 @@ class Assistant:
                     except UnicodeEncodeError:
                         sys.stdout.write(f"[TOOL ERROR] {name} 执行失败:\n{error_detail}\n")
                     result = {"error": str(e)}
+
+                # 捕获授权缺失、参数校验和执行异常等所有真实写工具错误。
+                # 这段位于统一异常处理之后，避免模型在没有工具回执时自行猜测 403。
+                if (
+                    _task_create_required
+                    and name == "create_records"
+                    and not _task_create_success
+                    and isinstance(result, dict)
+                    and result.get("error")
+                ):
+                    _task_create_error = result.get("error")
 
                 try:
                     print(f"[TOOL RESULT] {name} => {str(result)[:200]}")
