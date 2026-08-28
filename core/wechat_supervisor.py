@@ -138,4 +138,3 @@ class WechatRestartSupervisor:
             "next_retry_at": state.next_retry_at,
             "exit_code": state.exit_code,
         }
-

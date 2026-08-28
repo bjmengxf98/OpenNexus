@@ -38,4 +38,3 @@ def test_stable_bridge_resets_old_failure_series():
     assert decision.action == "wait"
     assert decision.failures == 1
     assert decision.delay_seconds == 10
-
