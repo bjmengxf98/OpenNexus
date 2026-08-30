@@ -109,6 +109,8 @@ def test_chat_shows_plan_and_persisted_token_metrics():
     assert "e.type==='plan'" in HTML
     assert "e.type==='usage'" in HTML
     assert "className='run-meta'" in HTML
+    assert "--meta-line:#c1c7d2" in HTML
+    assert "border-top:1px dashed var(--meta-line)" in HTML
     assert "tool_definition_saving_rate" not in HTML
     assert "工具上下文减少" not in HTML
     assert "m.metadata" in HTML

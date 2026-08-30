@@ -21,6 +21,7 @@ All notable public changes to OpenNexus are recorded here.
 - Reminder-list questions now route to `list_reminders` and render the current user's database-backed result instead of allowing models to deny an existing capability
 - Reminder confirmations now distinguish persisted schedules from best-effort delivery through currently available notification channels
 - Repeated unfiltered WPS record reads now receive a non-terminating strategy hint to use precise filters or aggregation tools without imposing a fixed tool-round limit
+- Conversation Token metadata now uses a higher-contrast separator in both light and dark themes
 
 ## [1.0.0] - 2026-08-09
 
