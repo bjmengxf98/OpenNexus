@@ -249,6 +249,40 @@ async def app_new_clear_conversation(conv_id: int, request: Request):
     return {"ok": True}
 
 
+@app_new_router.post("/api/app-new/conversations/batch-delete")
+async def app_new_batch_delete_conversations(request: Request):
+    uid, user = _current_user(request)
+    if not uid or not user:
+        return JSONResponse({"ok": False, "error": "未登录"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "请求格式不正确"}, status_code=400)
+    raw_ids = body.get("conversation_ids") if isinstance(body, dict) else None
+    if not isinstance(raw_ids, list):
+        return JSONResponse({"ok": False, "error": "conversation_ids 必须是数组"}, status_code=400)
+    if not raw_ids or len(raw_ids) > 500:
+        return JSONResponse({"ok": False, "error": "请选择 1 至 500 个对话"}, status_code=400)
+    if any(type(item) is not int or item <= 0 for item in raw_ids):
+        return JSONResponse({"ok": False, "error": "对话编号必须是正整数"}, status_code=400)
+    conversation_ids = list(raw_ids)
+    try:
+        deleted_ids = db.delete_conversations(conversation_ids, uid)
+    except PermissionError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
+    except RuntimeError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
+
+    from core.state import user_current_conv
+    if int(user_current_conv.get(uid) or 0) in deleted_ids:
+        user_current_conv.pop(uid, None)
+    return {
+        "ok": True,
+        "deleted_ids": deleted_ids,
+        "deleted_count": len(deleted_ids),
+    }
+
+
 @app_new_router.post("/api/app-new/wps/disconnect")
 async def app_new_disconnect_wps(request: Request):
     uid, user = _current_user(request)

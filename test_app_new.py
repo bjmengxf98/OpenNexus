@@ -11,6 +11,11 @@ def test_new_app_keeps_main_page_controls():
     required_ids = {
         "menuBtn",
         "newChat",
+        "batchManage",
+        "batchToolbar",
+        "batchSelectAll",
+        "batchDelete",
+        "batchCancel",
         "convList",
         "wpsBadge",
         "helpBtn",
@@ -54,6 +59,18 @@ def test_mobile_sidebar_places_new_chat_between_actions_and_conversations():
     new_chat = HTML.index('id="newChat"', sidebar_start, sidebar_end)
     conversations = HTML.index('id="convList"', sidebar_start, sidebar_end)
     assert mobile_actions < new_chat < conversations
+
+
+def test_conversation_batch_delete_has_selection_confirmation_and_single_request():
+    assert "selectedConversationIds:new Set()" in HTML
+    assert "class=\"conv-check\" type=\"checkbox\"" in HTML
+    assert "function toggleBatchSelectAll()" in HTML
+    assert "function deleteSelectedConversations()" in HTML
+    assert "'/api/app-new/conversations/batch-delete'" in HTML
+    assert "JSON.stringify({conversation_ids:ids})" in HTML
+    assert "将永久删除 " in HTML
+    assert "无法恢复" in HTML
+    assert "state.sending)return toast('请先停止当前回复')" in HTML
 
 
 def test_mobile_composer_has_rounded_corners_without_idle_scrollbar():

@@ -912,29 +912,76 @@ def rename_conversation(conv_id: int, user_id: int, title: str):
         )
 
 
-def delete_conversation(conv_id: int, user_id: int):
+def delete_conversations(conv_ids: list[int], user_id: int) -> list[int]:
+    """原子删除当前用户拥有的一组对话及其关联数据。"""
+    normalized: list[int] = []
+    seen: set[int] = set()
+    for raw_id in conv_ids:
+        conv_id = int(raw_id)
+        if conv_id <= 0 or conv_id in seen:
+            continue
+        seen.add(conv_id)
+        normalized.append(conv_id)
+    if not normalized:
+        return []
+
+    placeholders = ",".join("?" for _ in normalized)
     with get_conn() as conn:
+        owned_rows = conn.execute(
+            f"SELECT id FROM conversations WHERE user_id=? AND id IN ({placeholders})",
+            (user_id, *normalized),
+        ).fetchall()
+        owned_ids = [int(row["id"]) for row in owned_rows]
+        if set(owned_ids) != set(normalized):
+            raise PermissionError("部分对话不存在或无权删除")
+
+        active_placeholders = ",".join("?" for _ in _ACTIVE_AGENT_TURN_STATUSES)
+        active = conn.execute(
+            "SELECT 1 FROM agent_turns WHERE user_id=? "
+            f"AND conversation_id IN ({placeholders}) "
+            f"AND status IN ({active_placeholders}) LIMIT 1",
+            (user_id, *normalized, *_ACTIVE_AGENT_TURN_STATUSES),
+        ).fetchone()
+        if active:
+            raise RuntimeError("选中的对话中有正在执行的任务，请先停止任务")
+
         turn_rows = conn.execute(
-            "SELECT id FROM agent_turns WHERE conversation_id=? AND user_id=?",
-            (conv_id, user_id),
+            "SELECT id FROM agent_turns WHERE user_id=? "
+            f"AND conversation_id IN ({placeholders})",
+            (user_id, *normalized),
         ).fetchall()
         turn_ids = [str(row["id"]) for row in turn_rows]
         if turn_ids:
-            placeholders = ",".join("?" for _ in turn_ids)
+            turn_placeholders = ",".join("?" for _ in turn_ids)
             conn.execute(
-                f"DELETE FROM agent_turn_events WHERE turn_id IN ({placeholders})",
+                f"DELETE FROM agent_turn_events WHERE turn_id IN ({turn_placeholders})",
                 turn_ids,
             )
             conn.execute(
-                f"DELETE FROM agent_turns WHERE id IN ({placeholders})",
+                f"DELETE FROM agent_turns WHERE id IN ({turn_placeholders})",
                 turn_ids,
             )
-        conn.execute("DELETE FROM chat_history WHERE conversation_id=?", (conv_id,))
         conn.execute(
-            "DELETE FROM memory_items WHERE user_id=? AND scope_type='conversation' AND scope_id=?",
-            (user_id, str(conv_id)),
+            "DELETE FROM chat_history WHERE user_id=? "
+            f"AND conversation_id IN ({placeholders})",
+            (user_id, *normalized),
         )
-        conn.execute("DELETE FROM conversations WHERE id=? AND user_id=?", (conv_id, user_id))
+        scope_ids = [str(item) for item in normalized]
+        scope_placeholders = ",".join("?" for _ in scope_ids)
+        conn.execute(
+            "DELETE FROM memory_items WHERE user_id=? AND scope_type='conversation' "
+            f"AND scope_id IN ({scope_placeholders})",
+            (user_id, *scope_ids),
+        )
+        conn.execute(
+            f"DELETE FROM conversations WHERE user_id=? AND id IN ({placeholders})",
+            (user_id, *normalized),
+        )
+    return normalized
+
+
+def delete_conversation(conv_id: int, user_id: int):
+    delete_conversations([conv_id], user_id)
 
 
 def touch_conversation(conv_id: int):

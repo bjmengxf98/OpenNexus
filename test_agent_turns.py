@@ -81,6 +81,7 @@ def test_deleting_conversation_cleans_turns_and_events(monkeypatch, tmp_path):
     turn = db.create_agent_turn(1, conv_id, {"text": "测试"})
     db.add_agent_turn_event(turn["id"], "accepted", {"conversation_id": conv_id})
 
+    db.update_agent_turn_status(turn["id"], 1, "completed")
     db.delete_conversation(conv_id, 1)
 
     assert db.get_agent_turn(turn["id"], 1) is None
@@ -89,6 +90,94 @@ def test_deleting_conversation_cleans_turns_and_events(monkeypatch, tmp_path):
             "SELECT COUNT(*) FROM agent_turn_events WHERE turn_id=?", (turn["id"],),
         ).fetchone()[0]
     assert count == 0
+
+
+
+
+def test_batch_delete_is_atomic_owner_scoped_and_cleans_related_data(monkeypatch, tmp_path):
+    _fresh_db(monkeypatch, tmp_path)
+    first = db.create_conversation(1, "第一条")
+    second = db.create_conversation(1, "第二条")
+    other = db.create_conversation(2, "其他用户")
+    db.add_chat(1, "user", "一", first)
+    db.add_chat(1, "assistant", "二", second)
+    db.add_chat(2, "user", "保留", other)
+    turn = db.create_agent_turn(1, first, {"text": "已完成"})
+    db.add_agent_turn_event(turn["id"], "done", {"reply": "完成"})
+    db.update_agent_turn_status(turn["id"], 1, "completed")
+    with db.get_conn() as conn:
+        conn.executemany(
+            "INSERT INTO memory_items (user_id, scope_type, scope_id, content) "
+            "VALUES (?, 'conversation', ?, ?)",
+            [(1, str(first), "记忆一"), (1, str(second), "记忆二"), (2, str(other), "保留")],
+        )
+
+    with pytest.raises(PermissionError):
+        db.delete_conversations([first, other], 1)
+    assert db.get_conversation(first, 1) is not None
+
+    deleted = db.delete_conversations([first, second, first], 1)
+
+    assert deleted == [first, second]
+    assert db.get_conversation(first, 1) is None
+    assert db.get_conversation(second, 1) is None
+    assert db.get_conversation(other, 2) is not None
+    assert db.get_agent_turn(turn["id"], 1) is None
+    with db.get_conn() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM chat_history WHERE user_id=1",
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM memory_items WHERE user_id=1",
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM chat_history WHERE user_id=2",
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM memory_items WHERE user_id=2",
+        ).fetchone()[0] == 1
+
+
+def test_batch_delete_rejects_active_turn_and_api_reports_conflict(monkeypatch, tmp_path):
+    _fresh_db(monkeypatch, tmp_path)
+    conv_id = db.create_conversation(1, "运行中")
+    db.create_agent_turn(1, conv_id, {"text": "执行中"})
+    with pytest.raises(RuntimeError, match="正在执行"):
+        db.delete_conversations([conv_id], 1)
+    assert db.get_conversation(conv_id, 1) is not None
+
+    monkeypatch.setattr(
+        app_new_routes, "_current_user",
+        lambda _request: (1, {"username": "owner", "role": "staff"}),
+    )
+    app = FastAPI()
+    app.include_router(app_new_routes.app_new_router)
+    with TestClient(app) as client:
+        conflict = client.post(
+            "/api/app-new/conversations/batch-delete",
+            json={"conversation_ids": [conv_id]},
+        )
+    assert conflict.status_code == 409
+    assert "正在执行" in conflict.json()["error"]
+
+    with TestClient(app) as client:
+        invalid = client.post(
+            "/api/app-new/conversations/batch-delete",
+            json={"conversation_ids": []},
+        )
+    assert invalid.status_code == 400
+
+    with TestClient(app) as client:
+        invalid_id = client.post(
+            "/api/app-new/conversations/batch-delete",
+            json={"conversation_ids": [0]},
+        )
+        invalid_type = client.post(
+            "/api/app-new/conversations/batch-delete",
+            json={"conversation_ids": [1.5]},
+        )
+    assert invalid_id.status_code == 400
+    assert invalid_type.status_code == 400
 
 
 def test_existing_chat_endpoint_keeps_sse_contract_and_persists_turn(monkeypatch, tmp_path):

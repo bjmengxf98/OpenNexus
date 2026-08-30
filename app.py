@@ -992,7 +992,12 @@ async def api_delete_conversation(conv_id: int, request: Request):
     uid = request.session.get("uid")
     if not uid:
         return JSONResponse({"ok": False}, status_code=401)
-    db.delete_conversation(conv_id, uid)
+    try:
+        db.delete_conversation(conv_id, uid)
+    except PermissionError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
+    except RuntimeError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
     return JSONResponse({"ok": True})
 
 

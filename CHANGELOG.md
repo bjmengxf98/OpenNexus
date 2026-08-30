@@ -16,6 +16,7 @@ All notable public changes to OpenNexus are recorded here.
 - Legacy memory behavior remains available as a compatibility fallback
 - Task-creation replies now require a successful `create_records` tool receipt and post-write readback before claiming completion; fabricated WPS errors are blocked
 - Optional personal-WeChat bridges now use bounded exponential restart backoff, persistent child-process logs, and a failure circuit breaker without affecting the main service
+- Conversation sidebars now support owner-scoped batch selection and atomic deletion with explicit irreversible-action confirmation
 - Mobile PWA sidebars now place the new-conversation action directly above the conversation list and below the mobile function menu
 
 ## [1.0.0] - 2026-08-09
