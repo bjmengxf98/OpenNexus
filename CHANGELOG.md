@@ -18,6 +18,9 @@ All notable public changes to OpenNexus are recorded here.
 - Optional personal-WeChat bridges now use bounded exponential restart backoff, persistent child-process logs, and a failure circuit breaker without affecting the main service
 - Conversation sidebars now support owner-scoped batch selection and atomic deletion with explicit irreversible-action confirmation
 - Mobile PWA sidebars now place the new-conversation action directly above the conversation list and below the mobile function menu
+- Reminder-list questions now route to `list_reminders` and render the current user's database-backed result instead of allowing models to deny an existing capability
+- Reminder confirmations now distinguish persisted schedules from best-effort delivery through currently available notification channels
+- Repeated unfiltered WPS record reads now receive a non-terminating strategy hint to use precise filters or aggregation tools without imposing a fixed tool-round limit
 
 ## [1.0.0] - 2026-08-09
 

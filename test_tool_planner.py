@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from agent import wps_client
-from agent.assistant import Assistant
+from agent.assistant import Assistant, _record_query_strategy_hint
 from agent.tool_planner import (
     TaskPlanState,
     discover_tool_names,
@@ -34,6 +34,36 @@ def test_initial_routing_keeps_full_data_tools_but_not_unrelated_channels():
     assert "analyze_records" in selected
     assert "send_weixin_message" not in selected
     assert "generate_document" not in selected
+
+
+def test_reminder_query_routes_to_real_list_tool():
+    selected = initial_tool_names("我有哪些提醒？")
+    assert "list_reminders" in selected
+
+
+def test_targeted_record_query_gets_filter_strategy_hint_without_round_limit():
+    hint = _record_query_strategy_hint(
+        "王聪是哪个部门？", {"file_id": "file", "sheet_id": 1}, 1, False,
+    )
+    assert "精确 filter" in hint
+    assert "不是工具轮数限制" in hint
+    assert "直到满足任务完成条件" in hint
+
+
+def test_repeated_unfiltered_reads_get_one_strategy_hint():
+    args = {"file_id": "file", "sheet_id": 1}
+    assert _record_query_strategy_hint("总结部门情况", args, 2, False) == ""
+    hint = _record_query_strategy_hint("总结部门情况", args, 3, False)
+    assert "连续多次读取未筛选" in hint
+    assert _record_query_strategy_hint("总结部门情况", args, 4, True) == ""
+
+
+def test_filtered_record_query_does_not_get_redundant_strategy_hint():
+    args = {
+        "file_id": "file", "sheet_id": 1,
+        "filter": {"姓名": "王聪"},
+    }
+    assert _record_query_strategy_hint("王聪是哪个部门？", args, 1, False) == ""
 
 
 def test_discovery_falls_back_to_all_tools_when_no_match():

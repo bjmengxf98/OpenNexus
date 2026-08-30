@@ -2235,6 +2235,59 @@ def _detect_personal_reminder_intent(user_msg: str) -> tuple[bool, bool]:
     return True, has_clock
 
 
+def _detect_reminder_query_intent(user_msg: str) -> bool:
+    """识别查看待触发提醒的请求，避免弱模型把已存在的工具误判为未开放。"""
+    text = (user_msg or "").strip()
+    return any(phrase in text for phrase in (
+        "我的提醒", "有哪些提醒", "查看提醒", "查询提醒", "提醒列表",
+        "查提醒", "待触发提醒", "已设置的提醒", "设置了哪些提醒",
+    )) and not any(phrase in text for phrase in (
+        "取消提醒", "删除提醒", "建立提醒", "创建提醒",
+    ))
+
+
+def _format_reminder_list(rows: list[dict]) -> str:
+    """根据数据库真实结果生成稳定答复，不再让模型改写工具能力或提醒内容。"""
+    if not rows:
+        return "当前没有待触发提醒。"
+    lines = [f"您目前有 {len(rows)} 条待触发提醒："]
+    for index, row in enumerate(rows, 1):
+        reminder_id = row.get("id")
+        remind_at = str(row.get("remind_at") or "时间未记录")
+        content = str(row.get("content") or "未填写内容")
+        id_text = f"（ID：{reminder_id}）" if reminder_id is not None else ""
+        lines.append(f"{index}. {remind_at}｜{content}{id_text}")
+    return "\n".join(lines)
+
+
+def _record_query_strategy_hint(
+    user_text: str,
+    args: dict,
+    unfiltered_reads: int,
+    already_emitted: bool,
+) -> str:
+    """为重复全表读取提供一次策略纠偏，但不限制工具轮数或提前终止任务。"""
+    if already_emitted or args.get("filter"):
+        return ""
+    text = user_text or ""
+    targeted_query = any(marker in text for marker in (
+        "哪个部门", "所属部门", "什么部门", "谁负责", "负责人是谁",
+        "哪个项目", "哪项任务", "什么时候", "哪一天", "哪天",
+    ))
+    if not targeted_query and unfiltered_reads < 3:
+        return ""
+    reason = (
+        "当前问题是在查特定人员、部门、项目、任务或时间"
+        if targeted_query else
+        "本轮已连续多次读取未筛选的记录"
+    )
+    return (
+        f"策略提示：{reason}。后续优先给 list_records 传入精确 filter；"
+        "汇总统计优先使用 analyze_records，并根据已有结果改变参数或查询策略。"
+        "这不是工具轮数限制，请继续执行，直到满足任务完成条件。"
+    )
+
+
 def _detect_event_reminder_scene(user_msg: str) -> str:
     """
     区分用户说的是提醒时刻，还是事件发生时刻。
@@ -2665,6 +2718,7 @@ class Assistant:
         _force_tool_first = any(kw in _last_user_content for kw in _ACTION_KW)
 
         # 当前用户的未来提醒优先级高于“立即发微信”。
+        _reminder_query_intent = _detect_reminder_query_intent(_last_user_content)
         _reminder_intent, _reminder_has_time = _detect_personal_reminder_intent(
             _last_user_content
         )
@@ -2734,7 +2788,7 @@ class Assistant:
         )
         _reminder_needs_planning = (
             _event_reminder_scene == "travel"
-            or (_reminder_intent and not _reminder_has_time)
+            or (_reminder_intent and not _reminder_has_time and not _reminder_query_intent)
             or _continuing_reminder_planning
         )
 
@@ -2761,6 +2815,13 @@ class Assistant:
                 )
             _append_system_instruction(
                 "## 本轮最高优先级提醒规则\n" + _planning_instruction
+            )
+        elif _reminder_query_intent:
+            _append_system_instruction(
+                "## 本轮最高优先级提醒查询规则\n"
+                "必须调用 list_reminders 读取当前用户的真实待触发提醒。"
+                "工具返回是唯一事实依据；禁止声称该能力未开放、只有 add_reminder，"
+                "也禁止依据历史对话猜测提醒列表。"
             )
 
         # 检测微信发送意图 → 第一轮强制指定 send_weixin_message
@@ -2792,7 +2853,7 @@ class Assistant:
 
         if not self.supports_tools and any((
             _force_sheets_create, _force_change_log, _force_doc_gen,
-            _force_reminder, _force_weixin, _force_tool_first,
+            _force_reminder, _reminder_query_intent, _force_weixin, _force_tool_first,
         )):
             return (
                 "当前主模型配置为不支持工具调用，只能进行普通对话。"
@@ -2807,6 +2868,7 @@ class Assistant:
                 (_force_change_log, "get_change_log"),
                 (_force_doc_gen, "generate_document"),
                 (_force_reminder, "add_reminder"),
+                (_reminder_query_intent, "list_reminders"),
                 (_force_weixin, "send_weixin_message"),
             )
             if enabled
@@ -2861,6 +2923,10 @@ class Assistant:
         _task_create_marker = ""
         _task_create_completion_stalls = 0
         _reminder_created_success = False  # 追踪本轮提醒是否已真实写入数据库
+        _reminder_receipt_message = ""
+        _reminder_list_result: list[dict] | None = None
+        _unfiltered_record_reads = 0
+        _record_strategy_hint_emitted = False
         _turn = -1
         while True:
             _turn += 1
@@ -2934,6 +3000,9 @@ class Assistant:
             # 第一轮：文档生成意图 → 强制指定 generate_document
             elif _turn == 0 and _force_doc_gen and self.supports_tools and not _no_tool_choice:
                 _kwargs["tool_choice"] = {"type": "function", "function": {"name": "generate_document"}}
+            # 第一轮：提醒列表查询 → 强制读取真实提醒表
+            elif _turn == 0 and _reminder_query_intent and self.supports_tools and not _no_tool_choice:
+                _kwargs["tool_choice"] = {"type": "function", "function": {"name": "list_reminders"}}
             # 第一轮：当前用户的定时提醒 → 强制写入提醒表
             elif _turn == 0 and _force_reminder and self.supports_tools and not _no_tool_choice:
                 _kwargs["tool_choice"] = {"type": "function", "function": {"name": "add_reminder"}}
@@ -3063,6 +3132,14 @@ class Assistant:
                             "提醒规划：这项提醒还需要确认具体的提醒时刻或出行安排；"
                             "本次尚未创建提醒。"
                         )
+                if _reminder_query_intent and _reminder_list_result is None:
+                    if _turn == 0:
+                        _append_system_instruction(
+                            "## 本轮提醒查询纠正\n"
+                            "必须立即调用 list_reminders；不得用文字猜测工具能力或提醒内容。"
+                        )
+                        continue
+                    return "未能读取当前提醒列表，请稍后重试；本次没有依据历史对话猜测结果。"
                 if _force_reminder and not _reminder_created_success:
                     if _turn == 0:
                         # 某些模型不支持 tool_choice；明确纠正一次，但绝不把普通文字当作成功。
@@ -3117,7 +3194,13 @@ class Assistant:
                             "任务尚未创建：模型连续停止执行，但没有产生真实的 create_records "
                             "成功回执。系统已阻止虚构权限错误，请重试或更换工具调用能力更强的模型。"
                         )
-                reply = msg.content or ""
+                if _reminder_query_intent and _reminder_list_result is not None:
+                    reply = _format_reminder_list(_reminder_list_result)
+                elif _reminder_created_success and _reminder_receipt_message:
+                    # 数据库回执覆盖模型的“保证微信送达”等过度承诺。
+                    reply = _reminder_receipt_message
+                else:
+                    reply = msg.content or ""
                 # 后台自动学习：不阻塞响应，fire-and-forget
                 import asyncio as _asyncio
                 _asyncio.create_task(
@@ -3396,17 +3479,21 @@ class Assistant:
                                     except Exception:
                                         _has_weixin = False
                                     _channel_text = (
-                                        "已保存个人微信绑定；可在设置页用“发送测试消息”确认当前连接"
+                                        "已绑定个人微信；能否送达取决于届时桥接连接状态，"
+                                        "可在设置页用“发送测试消息”确认当前连接"
                                         if _has_weixin else
-                                        "尚未绑定个人微信，请在设置页绑定后再确认通知通道"
+                                        "尚未绑定个人微信；提醒仍保留在系统列表中，"
+                                        "可在设置页绑定并测试通知通道"
                                     )
                                     result = {"ok": True, "reminder_id": rid,
                                               "message": (
-                                                  f"提醒已保存，将在 {remind_at} 尝试发送："
+                                                  f"提醒已设置并保存，将在 {remind_at} "
+                                                  "通过届时已启用且可用的通知渠道尝试推送："
                                                   f"{content}（事件时间：{event_at}）。"
                                                   f"通知状态：{_channel_text}。"
                                               )}
                                     _reminder_created_success = True
+                                    _reminder_receipt_message = result["message"]
                                 except Exception as _e:
                                     result = {"error": f"提醒设置失败: {_e}"}
                     elif name == "list_reminders":
@@ -3414,10 +3501,11 @@ class Assistant:
                             result = {"error": "无法获取用户ID"}
                         else:
                             rows = _db_list_reminders(uid)
+                            _reminder_list_result = list(rows)
                             if not rows:
                                 result = {"ok": True, "reminders": [], "message": "当前没有待触发的提醒"}
                             else:
-                                result = {"ok": True, "reminders": rows,
+                                result = {"ok": True, "reminders": _reminder_list_result,
                                           "message": f"共 {len(rows)} 条待触发提醒"}
                     elif name == "cancel_reminder":
                         if not uid:
@@ -3463,6 +3551,21 @@ class Assistant:
                         import asyncio as _asyncio
                         _r = TOOL_MAP[name](access_token, args)
                         result = await _r if _asyncio.iscoroutine(_r) else _r
+
+                        if (
+                            name == "list_records"
+                            and isinstance(result, dict)
+                            and not result.get("error")
+                            and not args.get("filter")
+                        ):
+                            _unfiltered_record_reads += 1
+                            _hint = _record_query_strategy_hint(
+                                _last_user_content, args, _unfiltered_record_reads,
+                                _record_strategy_hint_emitted,
+                            )
+                            if _hint:
+                                result["_strategy_hint"] = _hint
+                                _record_strategy_hint_emitted = True
 
                         if _task_create_required and name == "create_records":
                             _task_create_target = (

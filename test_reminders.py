@@ -13,6 +13,7 @@ from agent.assistant import (
     _append_tool_result_user_bridge,
     _coalesce_system_messages,
     _detect_event_reminder_scene,
+    _detect_reminder_query_intent,
     _detect_personal_reminder_intent,
     _needs_tool_result_user_bridge,
 )
@@ -127,6 +128,13 @@ class ReminderIntentTests(unittest.TestCase):
             (False, False),
         )
 
+    def test_reminder_list_query_is_not_creation_planning(self):
+        self.assertTrue(_detect_reminder_query_intent("我有哪些提醒？"))
+        self.assertTrue(_detect_reminder_query_intent("看看已设置的提醒"))
+        self.assertTrue(_detect_reminder_query_intent("设置了哪些提醒"))
+        self.assertFalse(_detect_reminder_query_intent("明天九点设置提醒"))
+        self.assertFalse(_detect_reminder_query_intent("取消提醒 12"))
+
     def test_meeting_time_is_recognized_as_event_time(self):
         text = "下午两点开会，提醒我"
         self.assertEqual(_detect_personal_reminder_intent(text), (True, True))
@@ -160,6 +168,50 @@ class _FakeCompletions:
 
 
 class ReminderConversationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_weak_model_cannot_deny_reminder_list_after_successful_tool(self):
+        tool_call = SimpleNamespace(
+            id="list-reminders-real",
+            function=SimpleNamespace(name="list_reminders", arguments="{}"),
+        )
+        completions = _FakeCompletions([
+            SimpleNamespace(content=None, tool_calls=[tool_call]),
+            SimpleNamespace(
+                content="当前只开放了 add_reminder，不能查看提醒列表。",
+                tool_calls=None,
+            ),
+        ])
+        assistant = Assistant.__new__(Assistant)
+        assistant.provider = "mock"
+        assistant.model = "weak-free-model"
+        assistant.client = SimpleNamespace(
+            chat=SimpleNamespace(completions=completions)
+        )
+        assistant._auto_learn = AsyncMock(return_value=None)
+        rows = [{
+            "id": 12,
+            "content": "参加月报会",
+            "remind_at": "2026-09-04 08:30",
+        }]
+
+        with patch("agent.assistant._db_list_reminders", return_value=rows):
+            reply = await assistant.chat(
+                [{"role": "user", "content": "我有哪些提醒？"}],
+                access_token="",
+                uid=2,
+            )
+
+        self.assertIn("1 条待触发提醒", reply)
+        self.assertIn("2026-09-04 08:30｜参加月报会（ID：12）", reply)
+        self.assertNotIn("不能查看", reply)
+        self.assertEqual(
+            completions.calls[0]["tool_choice"]["function"]["name"],
+            "list_reminders",
+        )
+        visible_names = {
+            item["function"]["name"] for item in completions.calls[0]["tools"]
+        }
+        self.assertIn("list_reminders", visible_names)
+
     async def test_strict_qwen_gateway_retries_only_after_tool_result_error(self):
         tool_call = SimpleNamespace(
             id="list-reminders-qwen",
@@ -273,6 +325,8 @@ class ReminderConversationTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIn("已设置", reply)
+        self.assertIn("尝试推送", reply)
+        self.assertNotIn("一定送达", reply)
         self.assertIn("tools", completions.calls[0])
         # 正常支持 tool 结果的模型仍保持原始协议顺序，
         # 不会被千问的错误兼容分支改写。

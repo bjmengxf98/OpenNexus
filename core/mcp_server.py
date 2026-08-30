@@ -189,7 +189,14 @@ async def _execute_special(name: str, args: dict, identity: dict) -> dict | None
         if remind_dt <= db.beijing_now():
             return {"error": f"提醒时间 {remind_at} 已经过期"}
         reminder_id = db.add_reminder(user_id, content, remind_at, event_at=event_at)
-        return {"ok": True, "reminder_id": reminder_id, "message": f"提醒已设置，将在 {remind_at} 推送；事件时间 {event_at}"}
+        return {
+            "ok": True,
+            "reminder_id": reminder_id,
+            "message": (
+                f"提醒已设置并保存，将在 {remind_at} 通过届时已启用且可用的通知渠道"
+                f"尝试推送；事件时间 {event_at}。"
+            ),
+        }
     if name == "list_reminders":
         rows = db.list_reminders(user_id)
         return {"ok": True, "reminders": rows, "message": f"共 {len(rows)} 条待触发提醒"}
