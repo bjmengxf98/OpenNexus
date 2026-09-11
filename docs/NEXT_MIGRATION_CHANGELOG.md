@@ -43,6 +43,7 @@
 | STABLE-20260830-01 | 2026-08-30 | `95f158d` | P2 | 左侧会话列表支持安全的批量选择与原子删除 | 待迁移 | 待定 |
 | STABLE-20260830-02 | 2026-08-30 | `a0547a1` | P1 | 提醒查询事实门禁、通知话术降级与表格查询策略纠偏 | 待评估 | 待定 |
 | STABLE-20260830-03 | 2026-08-30 | `612275b` | P3 | 对话 Token 信息分界线增强 | 待迁移 | 待定 |
+| STABLE-20260911-01 | 2026-09-11 | 待提交 | P1 | Word 文档结构校验、错误上传门禁与模型重试回执 | 待迁移 | 待定 |
 
 ## 5. 单项记录模板
 
@@ -192,6 +193,48 @@
 - 新版实现提交：待定
 - 新版验收证据：待定
 - 备注：仅提升视觉可辨识度，不改变 Token 用量计算和展示口径。
+
+### STABLE-20260911-01：Word 文档结构校验与错误上传门禁
+
+- 日期：2026-09-11
+- 稳定版分支：`codex/main-release-20260827`
+- 稳定版提交：待提交
+- 优先级：P1
+- 新版状态：待迁移
+- 修改原因：弱模型偶尔把 `generate_document.content` 序列化成包含未转义内部引号的字符串；稳定版旧逻辑在 JSON 解析失败后按行转成普通段落并继续上传，导致 Word 正文直接显示 `{"sections": ...}` 源码，同时界面仍报告生成成功。
+- 用户可见行为：合法的对象、JSON 字符串、Markdown JSON 代码块、双重序列化字符串和带前置说明的 JSON 仍可生成；无法可靠解析或结构不合法时不创建、不上传文件，工具返回可重试错误，模型必须修正 `content` 后再次调用且未成功前不得宣称完成。
+- 涉及文件：`core/document_generator.py`、`agent/assistant.py`、`test_document_generator.py`、`CHANGELOG.md`、`DEVLOG.md`
+- 数据库变化：无。
+- API 或事件协议变化：`generate_document` 失败结果新增稳定字段 `code=invalid_document_structure`、`retryable=true`、`uploaded=false`；成功结果格式不变。
+- 配置、环境变量或依赖变化：无新增依赖；继续使用项目已有的 `python-docx`。
+- 权限、副作用和兼容性：上传前执行结构校验，失败路径不触发 WPS 写入；不修改 WPS 授权、文件目录或正常模板。未知 section 类型由原先静默忽略改为明确失败并要求模型重试，避免生成缺段文档。文档模块不再在解析失败日志中输出正文片段。
+- 稳定版验证：`C:\Python314\python.exe -m pytest -q -p no:cacheprovider test_document_generator.py`，专项 12 项通过；稳定版离线回归 135 项通过；相关文件均通过 `py_compile` 和 `git diff --check`。既有 `test_sheets_optype.py` 因仍导入已不存在的 `auth.db.get_db` 无法收集，与本次修改无关。
+- 建议迁移方式：按新版架构重新实现，不直接复制稳定版解析器或大型提示词。
+- 新版落点建议：在文档工具适配器入口设置 schema validation，在副作用端口前设置 fail-closed 写入门禁；把结构错误定义为显式可重试 ToolResult，并以契约测试固定“解析失败绝不上传”和“只有成功回执才能声明完成”。
+- 新版实现提交：待定
+- 新版验收证据：待定
+- 备注：该记录只描述稳定版变化，不表示新项目已经同步；新版还应评估使用类型化 DTO/JSON Schema 校验替代提示词容错。
+
+### STABLE-20260911-02：DeepSeek V4.1 模型、长上下文、多模态与空白回复保护
+
+- 日期：2026-09-11
+- 稳定版分支：`codex/main-release-20260827`
+- 稳定版提交：待提交
+- 优先级：P1
+- 新版状态：待迁移
+- 修改原因：DeepSeek 官方直接接口的当前模型名更新为 `deepseek-flash`，模型具备 1M 上下文和图片输入能力；旧预设仍使用 V4 名称、上下文留空且视觉能力关闭。思考模型在最大输出额度耗尽时还可能只返回 `reasoning_content` 而没有 `content`，旧逻辑会把空字符串保存为助手回复。
+- 用户可见行为：DeepSeek 新配置默认选择 `deepseek-flash`；设置页按模型显示 1,000,000 上下文、图片输入能力和建议输出上限。标准/思考模式的原有选择方式保持不变，自动思考强度按官方默认改为 `high`。旧 V4 Flash 名称继续可选兼容。思考请求若没有最终正文，系统自动关闭思考重试一次；仍失败时返回明确错误，不再出现只有 Token 统计、没有正文的空白消息。图片及扫描件可直接交给 `deepseek-flash` 识别，识图请求显式关闭思考以减少消耗。
+- 涉及文件：`agent/assistant.py`、`api/app_new_routes.py`、`api/settings_new_routes.py`、`static/settings_new.html`、`core/file_parser.py`、`core/dashboard_service.py`、`app.py`、`test_admin_settings_new.py`、`test_tool_planner.py`、`test_dashboard.py`、`CHANGELOG.md`、`DEVLOG.md`
+- 数据库变化：无；已有用户模型配置保持原值，不自动覆写 API Key、Base URL 或模型选择。用户在设置页选择并保存新模型后才持久化新名称和能力值。
+- API 或事件协议变化：设置页 bootstrap 的内置模型条目新增 `supports_vision`、`context_window`、`max_output_tokens` 元数据；原字段和自定义模型格式保持兼容。聊天流事件不变，自动重试会如实累计一次额外模型请求及其 Token。
+- 配置、环境变量或依赖变化：无新增依赖或环境变量。DeepSeek 新预设 Base URL 使用官方 `https://api.deepseek.com`；既有 `https://api.deepseek.com/v1` 配置继续可用。
+- 权限、副作用和兼容性：模型别名只在发请求前移除 `-reasoning`，不改变其他厂商和 SCNet 的专用模型名。已知 DeepSeek Flash 能力由服务端识别，即使旧配置的视觉复选值为 false 也可用于图片解析。短文本合规/知识辅助调用显式关闭 DeepSeek 思考，避免新模型默认思考造成空结果和额外 Token。工具循环完整回传同一任务内每次模型响应的 `reasoning_content`（包括空字符串）；新用户轮次把旧的可见对话折叠为普通用户上下文，不伪造或持久化跨轮思维链，既满足 DeepSeek 工具请求结构，又避免数据库保存隐式推理和 Token 膨胀。
+- 稳定版验证：DeepSeek/设置/智能体/仪表盘/聊天专项 57 项通过；稳定版离线回归 140 项通过；设置页 2 个 JavaScript 脚本块通过 Node 语法检查；相关 Python 文件通过 `py_compile`，`git diff --check` 无错误。回归仅有 1 条既存 Pydantic forward-reference 警告。
+- 建议迁移方式：按新版模型能力注册表、模型适配器和运行时失败策略重新实现，不直接复制稳定版预设字典或大型工具循环。
+- 新版落点建议：用类型化 ModelCapability/Profile 表达上下文、输出、多模态、工具和推理参数；在 DeepSeek adapter 内统一处理界面别名、thinking 参数、`reasoning_content` 续传和空正文降级；以契约测试固定“空正文绝不持久化”。
+- 新版实现提交：待定
+- 新版验收证据：待定
+- 备注：该记录只描述稳定版变化，不表示新项目已同步。新项目迁移时应重新核对 DeepSeek 当时的官方模型名称、上下文和图像输入协议。
 
 ## 8. 最终审计
 

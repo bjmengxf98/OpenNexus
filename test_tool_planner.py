@@ -6,7 +6,9 @@ from unittest.mock import AsyncMock
 import pytest
 
 from agent import wps_client
-from agent.assistant import Assistant, _record_query_strategy_hint
+from agent.assistant import (
+    Assistant, _record_query_strategy_hint, prepare_deepseek_tool_messages,
+)
 from agent.tool_planner import (
     TaskPlanState,
     discover_tool_names,
@@ -14,6 +16,36 @@ from agent.tool_planner import (
     is_complex_task,
     trim_history_to_budget,
 )
+
+
+def test_deepseek_tool_history_keeps_current_reasoning_without_persisting_old_chain():
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "上一轮问题"},
+        {"role": "assistant", "content": "上一轮可见答案"},
+        {"role": "user", "content": "继续处理"},
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "当前任务思考",
+            "tool_calls": [{"id": "call-1"}],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "工具结果"},
+    ]
+
+    prepared = prepare_deepseek_tool_messages(messages)
+
+    assert prepared[0] == messages[0]
+    assert prepared[1]["role"] == "user"
+    assert "上一轮问题" in prepared[1]["content"]
+    assert "上一轮可见答案" in prepared[1]["content"]
+    assert "继续处理" in prepared[1]["content"]
+    assert prepared[2]["reasoning_content"] == "当前任务思考"
+    assert prepared[3] == messages[5]
+    assert all(
+        item.get("reasoning_content") is not None
+        for item in prepared if item.get("role") == "assistant"
+    )
 
 
 def _tool(name, description=""):
@@ -580,3 +612,68 @@ def test_task_create_cannot_invent_403_and_must_write_then_verify(monkeypatch):
     assert len(writes) == 1
     assert len(reads) == 2
     assert "403" not in reply
+
+
+class _DeepSeekEmptyThenContent:
+    def __init__(self, stay_empty=False):
+        self.calls = []
+        self.stay_empty = stay_empty
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        retry = len(self.calls) > 1
+        message = SimpleNamespace(
+            content="" if (not retry or self.stay_empty) else "自动关闭思考后正常回复",
+            tool_calls=None,
+            reasoning_content="思考内容" if not retry else None,
+        )
+        choice = SimpleNamespace(
+            message=message,
+            finish_reason="length" if not retry else "stop",
+        )
+        usage = SimpleNamespace(
+            prompt_tokens=100,
+            completion_tokens=32768 if not retry else 20,
+        )
+        return SimpleNamespace(choices=[choice], usage=usage)
+
+
+def _deepseek_empty_reply_assistant(completions):
+    assistant = Assistant(
+        "test-key", "deepseek", model="deepseek-flash-reasoning",
+        advanced={"supports_tools": False},
+    )
+    assistant.client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    assistant._auto_learn = AsyncMock()
+    return assistant
+
+
+def test_deepseek_empty_reasoning_response_retries_once_without_thinking():
+    completions = _DeepSeekEmptyThenContent()
+    assistant = _deepseek_empty_reply_assistant(completions)
+
+    reply = asyncio.run(assistant.chat(
+        [{"role": "user", "content": "请给出一个简短答复"}], access_token="",
+    ))
+
+    assert reply == "自动关闭思考后正常回复"
+    assert len(completions.calls) == 2
+    assert completions.calls[0]["model"] == "deepseek-flash"
+    assert completions.calls[0]["reasoning_effort"] == "high"
+    assert completions.calls[0]["extra_body"] == {"thinking": {"type": "enabled"}}
+    assert "reasoning_effort" not in completions.calls[1]
+    assert completions.calls[1]["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert assistant.last_run_metrics["model_requests"] == 2
+
+
+def test_deepseek_never_persists_blank_reply_when_retry_is_also_empty():
+    completions = _DeepSeekEmptyThenContent(stay_empty=True)
+    assistant = _deepseek_empty_reply_assistant(completions)
+
+    reply = asyncio.run(assistant.chat(
+        [{"role": "user", "content": "请给出一个简短答复"}], access_token="",
+    ))
+
+    assert reply.strip()
+    assert "没有生成可显示的正文" in reply
+    assert len(completions.calls) == 2

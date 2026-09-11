@@ -111,13 +111,21 @@ LLM_PRESETS = {
     },
     "deepseek": {
         "name": "DeepSeek",
-        "base_url": "https://api.deepseek.com/v1",
-        "model": "deepseek-v4-flash",
+        "base_url": "https://api.deepseek.com",
+        "model": "deepseek-flash",
         "models": [
-            {"id": "deepseek-v4-flash",           "name": "V4 Flash · 标准模式（推荐）"},
-            {"id": "deepseek-v4-flash-reasoning", "name": "V4 Flash · 思考模式"},
-            {"id": "deepseek-v4-pro",             "name": "V4 Pro · 标准模式"},
-            {"id": "deepseek-v4-pro-reasoning",   "name": "V4 Pro · 思考模式"},
+            {"id": "deepseek-flash", "name": "V4.1 Flash · 标准模式（推荐，多模态）",
+             "supports_vision": True, "context_window": 1_000_000, "max_output_tokens": 8192},
+            {"id": "deepseek-flash-reasoning", "name": "V4.1 Flash · 思考模式（多模态）",
+             "supports_vision": True, "context_window": 1_000_000, "max_output_tokens": 32768},
+            {"id": "deepseek-v4-pro", "name": "V4 Pro · 标准模式",
+             "context_window": 1_000_000, "max_output_tokens": 8192},
+            {"id": "deepseek-v4-pro-reasoning", "name": "V4 Pro · 思考模式",
+             "context_window": 1_000_000, "max_output_tokens": 32768},
+            {"id": "deepseek-v4-flash", "name": "V4 Flash · 旧名称兼容",
+             "supports_vision": True, "context_window": 1_000_000, "max_output_tokens": 8192},
+            {"id": "deepseek-v4-flash-reasoning", "name": "V4 Flash · 旧名称兼容（思考）",
+             "supports_vision": True, "context_window": 1_000_000, "max_output_tokens": 32768},
         ],
     },
     "claude": {
@@ -216,6 +224,71 @@ LLM_PRESETS = {
     },
 }
 
+_DEEPSEEK_API_MODELS = {
+    "deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro", "deepseek-reasoner",
+}
+_DEEPSEEK_VISION_MODELS = {"deepseek-flash", "deepseek-v4-flash"}
+
+
+def base_model_id(model: str | None) -> str:
+    value = str(model or "").strip()
+    if value.lower().endswith("-reasoning"):
+        value = value[:-len("-reasoning")]
+    return value
+
+
+def is_deepseek_api_model(provider: str | None, model: str | None) -> bool:
+    return str(provider or "").lower() == "deepseek" and base_model_id(model).lower() in _DEEPSEEK_API_MODELS
+
+
+def model_supports_vision(provider: str | None, model: str | None, advanced: dict | None = None) -> bool:
+    if str(provider or "").lower() == "deepseek" and base_model_id(model).lower() in _DEEPSEEK_VISION_MODELS:
+        return True
+    return bool((advanced or {}).get("supports_vision", False))
+
+def prepare_deepseek_tool_messages(messages: list[dict]) -> list[dict]:
+    """Avoid replaying historical assistant messages without their hidden reasoning.
+
+    DeepSeek requires reasoning_content for every assistant message replayed while
+    tools are present. Stable chat storage intentionally keeps only visible text,
+    so older turns are folded into the current user context. Messages produced in
+    the active tool loop remain untouched and retain their reasoning_content.
+    """
+    if len(messages) < 3:
+        return messages
+    first_tool_assistant = next(
+        (
+            index for index, item in enumerate(messages)
+            if item.get("role") == "assistant" and item.get("tool_calls")
+        ),
+        len(messages),
+    )
+    current_user_index = next(
+        (
+            index for index in range(first_tool_assistant - 1, 0, -1)
+            if messages[index].get("role") == "user"
+        ),
+        -1,
+    )
+    if current_user_index <= 1:
+        return messages
+    prior = messages[1:current_user_index]
+    if not any(item.get("role") == "assistant" for item in prior):
+        return messages
+    transcript = []
+    for item in prior:
+        if item.get("role") not in {"user", "assistant"}:
+            continue
+        label = "用户" if item.get("role") == "user" else "助手"
+        transcript.append(f"{label}：{str(item.get('content') or '').strip()}")
+    current = dict(messages[current_user_index])
+    current["content"] = (
+        "[此前可见对话，仅供理解本轮上下文]\n" + "\n".join(transcript)
+        + "\n\n[当前用户请求]\n" + str(current.get("content") or "")
+    )
+    return [messages[0], current, *messages[current_user_index + 1:]]
+
+
 SYSTEM_PROMPT_TEMPLATE = """你是 {username} 的全能工作助手，同时也是业务管理专家。
 
 ## 【首要规则】每次响应前先判断话题
@@ -264,6 +337,7 @@ SYSTEM_PROMPT_TEMPLATE = """你是 {username} 的全能工作助手，同时也�
 
 ### ⚠️ content 参数格式（重要）
 content 参数是一个 JSON 对象（不是字符串），包含 sections 数组。每个 section 有 type 和 text 字段。直接传递对象，不需要将其序列化为字符串。
+如果 generate_document 返回 `code=invalid_document_structure` 且 `retryable=true`，必须修正 content 并重新调用；未取得 `ok=true` 前不得声称文档已经生成，也不得把 JSON 源码当作正文。
 
 **关键规则**：
 1. **单位名称**：必须是"民航机场规划设计研究总院有限公司"（绝对不能用"中国民航机场建设集团公司"）
@@ -324,7 +398,7 @@ content 参数是一个 JSON 对象（不是字符串），包含 sections 数�
 
 **参数**：
 - title：文档标题（用于文件命名）
-- content：JSON 字符串（上述格式）
+- content：JSON 对象（上述格式，不要序列化为字符串）
 - dbsheet_file_id：当前活跃多维表格的 file_id
 - doc_type：official_red（红头公文）/ official（普通公文）/ report（报告）/ notice（通知）/ minutes（纪要）
 - metadata：可选
@@ -1607,6 +1681,7 @@ TOOLS = [
                 "生成 Word 文档（.docx）并上传到 WPS 网盘。"
                 "用户说「生成报告」「写通知」「生成纪要」「导出文档」「生成word」「生成文档」「写文档」「导出word」时调用此工具。"
                 "\n\n【content 参数是 JSON 对象，不是字符串】直接传递对象，无需序列化。"
+                "若返回 code=invalid_document_structure 且 retryable=true，修正 content 后重新调用，未取得 ok=true 前不得报告成功。"
                 "\n\n【支持的 section 类型】"
                 "\n- org_header: 发文机关标志（红色大字，仅红头公文使用）"
                 "\n- doc_number: 发文字号"
@@ -1616,6 +1691,8 @@ TOOLS = [
                 "\n- heading2: 第二层次标题（（一）（二）（三））"
                 "\n- heading3: 第三层次标题"
                 "\n- paragraph: 正文段落"
+                "\n- recipient: 通知或公文称谓行"
+                "\n- ending: 结尾语"
                 "\n- signature: 发文机关署名"
                 "\n- date: 成文日期"
                 "\n- space: 空行"
@@ -1646,7 +1723,14 @@ TOOLS = [
                                 "items": {
                                     "type": "object",
                                     "properties": {
-                                        "type": {"type": "string"},
+                                        "type": {
+                                            "type": "string",
+                                            "enum": [
+                                                "org_header", "doc_number", "red_line", "title",
+                                                "heading1", "heading2", "heading3", "paragraph",
+                                                "recipient", "ending", "signature", "date", "space"
+                                            ]
+                                        },
                                         "text": {"type": "string"}
                                     },
                                     "required": ["type"]
@@ -2417,6 +2501,10 @@ class Assistant:
         )
         self.model = model or preset["model"]
         self.advanced = advanced or {}
+        _model_meta = next(
+            (item for item in preset.get("models", []) if item.get("id") == self.model),
+            {},
+        )
         self.supports_tools = bool(self.advanced.get("supports_tools", True))
         _smart_routing = self.advanced.get("smart_tool_routing", True)
         if isinstance(_smart_routing, str):
@@ -2425,15 +2513,19 @@ class Assistant:
             }
         self.smart_tool_routing = bool(_smart_routing)
         self.last_run_metrics = {}
-        self.supports_vision = bool(self.advanced.get("supports_vision", False))
+        self.supports_vision = model_supports_vision(provider, self.model, self.advanced)
         self.reasoning_mode = str(self.advanced.get("reasoning_mode") or "auto").lower()
         self.reasoning_effort = str(self.advanced.get("reasoning_effort") or "auto").lower()
         try:
-            self.context_window = int(self.advanced.get("context_window") or 0)
+            self.context_window = int(
+                self.advanced.get("context_window") or _model_meta.get("context_window") or 0
+            )
         except (TypeError, ValueError):
             self.context_window = 0
         try:
-            self.max_output_tokens = int(self.advanced.get("max_output_tokens") or 8192)
+            self.max_output_tokens = int(
+                self.advanced.get("max_output_tokens") or _model_meta.get("max_output_tokens") or 8192
+            )
         except (TypeError, ValueError):
             self.max_output_tokens = 8192
         self.max_output_tokens = max(128, min(self.max_output_tokens, 262_144))
@@ -2953,14 +3045,21 @@ class Assistant:
             _current_tools = _tools_for_turn()
             if _current_tools:
                 _kwargs["tools"] = _current_tools
+            if (
+                _current_tools and _enable_reasoning
+                and is_deepseek_api_model(self.provider, _actual_model)
+            ):
+                _kwargs["messages"] = prepare_deepseek_tool_messages(
+                    _kwargs["messages"]
+                )
             # 规划阶段只允许自然语言澄清/提案，彻底禁止提前写入提醒。
             if _reminder_needs_planning:
                 _kwargs.pop("tools", None)
             # DeepSeek 思考模式控制
-            if self.provider == "deepseek" and _actual_model in {"deepseek-v4-flash", "deepseek-v4-pro"}:
+            if is_deepseek_api_model(self.provider, _actual_model):
                 if _enable_reasoning:
                     _kwargs["reasoning_effort"] = (
-                        "max" if self.reasoning_effort == "auto" else self.reasoning_effort
+                        "high" if self.reasoning_effort == "auto" else self.reasoning_effort
                     )
                     _kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
                 else:
@@ -2983,9 +3082,7 @@ class Assistant:
                 _kwargs["reasoning_effort"] = effort
             # 千问 3.6-plus 和 deepseek-reasoner/v4系列 不支持任何形式的 tool_choice
             _is_qwen_36plus = (self.provider == "qwen" and _actual_model == "qwen3.6-plus")
-            _is_deepseek_no_tc = (self.provider == "deepseek" and _actual_model in {
-                "deepseek-reasoner", "deepseek-v4-flash", "deepseek-v4-pro"
-            })
+            _is_deepseek_no_tc = is_deepseek_api_model(self.provider, _actual_model)
             _no_tool_choice = _is_qwen_36plus or _is_deepseek_no_tc
 
             # 规划阶段不允许 tool_choice；其余场景按意图强制工具。
@@ -3091,18 +3188,65 @@ class Assistant:
                 _compat_kwargs["messages"] = _coalesce_system_messages(full_messages)
                 resp = await self.client.chat.completions.create(**_compat_kwargs)
             msg = resp.choices[0].message
-            _metrics.tool_calls += len(msg.tool_calls or [])
             _metrics.record_response(
                 resp,
                 messages=_kwargs.get("messages") or [],
                 tools=_current_tools,
             )
+
+            # DeepSeek 思考输出可能恰好耗尽 max_tokens，只留下 reasoning_content
+            # 而没有最终正文。自动关闭思考重试一次，绝不把空字符串保存成回复。
+            _empty_reply_retry_error = None
+            if (
+                not (msg.tool_calls or [])
+                and not str(msg.content or "").strip()
+                and _enable_reasoning
+                and is_deepseek_api_model(self.provider, _actual_model)
+            ):
+                _finish_reason = getattr(resp.choices[0], "finish_reason", None) or "unknown"
+                _reasoning_chars = len(str(getattr(msg, "reasoning_content", None) or ""))
+                print(
+                    "[LLM EMPTY CONTENT] DeepSeek returned reasoning without final content; "
+                    f"model={_actual_model} finish_reason={_finish_reason} "
+                    f"reasoning_chars={_reasoning_chars}; retrying with thinking disabled"
+                )
+                _retry_kwargs = dict(_kwargs)
+                _retry_kwargs.pop("reasoning_effort", None)
+                _retry_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+                try:
+                    _retry_resp = await self.client.chat.completions.create(**_retry_kwargs)
+                    _metrics.record_response(
+                        _retry_resp,
+                        messages=_retry_kwargs.get("messages") or [],
+                        tools=_current_tools,
+                    )
+                    resp = _retry_resp
+                    msg = resp.choices[0].message
+                except Exception as _retry_error:
+                    _empty_reply_retry_error = _retry_error
+                    print(
+                        "[LLM EMPTY CONTENT] non-thinking retry failed: "
+                        f"{_retry_error.__class__.__name__}"
+                    )
+
+            _metrics.tool_calls += len(msg.tool_calls or [])
             self.last_run_metrics = _metrics.snapshot()
             await _publish_agent_event(
                 "usage",
                 round=_turn + 1,
                 metrics=self.last_run_metrics,
             )
+
+            if not (msg.tool_calls or []) and not str(msg.content or "").strip():
+                if _empty_reply_retry_error is not None:
+                    return (
+                        "模型本次只返回了思考过程，没有生成最终答复；系统自动关闭思考重试时"
+                        "模型服务又发生异常。请稍后重试或切换到标准模式。"
+                    )
+                return (
+                    "模型本次没有生成可显示的正文。系统已避免保存空白回复；"
+                    "请稍后重试或切换到标准模式。"
+                )
 
             if not msg.tool_calls:
                 if _plan_state.goal and not _plan_state.terminal:
@@ -3221,8 +3365,9 @@ class Assistant:
                 ],
             }
             # 思考模式下 reasoning_content 必须回传，否则 API 返回 400
-            if getattr(msg, "reasoning_content", None):
-                _assistant_msg["reasoning_content"] = msg.reasoning_content
+            _reasoning_content = getattr(msg, "reasoning_content", None)
+            if _reasoning_content is not None:
+                _assistant_msg["reasoning_content"] = _reasoning_content
             full_messages.append(_assistant_msg)
             _compact_after_plan = False
 

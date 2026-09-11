@@ -426,12 +426,12 @@ async def _enrich_report_with_llm(user_id: int, payload: dict) -> dict:
             "response_format": {"type": "json_object"},
         }
         # 与主聊天保持一致：-reasoning 是界面别名，不是接口模型名。
-        if cfg.get("provider") == "deepseek" and actual_model in {"deepseek-v4-flash", "deepseek-v4-pro"}:
+        if cfg.get("provider") == "deepseek" and actual_model in {"deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro"}:
             request_kwargs["extra_body"] = {
                 "thinking": {"type": "enabled" if enable_reasoning else "disabled"}
             }
             if enable_reasoning:
-                request_kwargs["reasoning_effort"] = "max"
+                request_kwargs["reasoning_effort"] = "high"
         else:
             request_kwargs["temperature"] = 0.25
         response = await asyncio.wait_for(
@@ -451,7 +451,7 @@ async def _enrich_report_with_llm(user_id: int, payload: dict) -> dict:
             retry_kwargs = dict(request_kwargs)
             retry_kwargs["max_tokens"] = 5000
             retry_kwargs.pop("reasoning_effort", None)
-            if cfg.get("provider") == "deepseek" and actual_model in {"deepseek-v4-flash", "deepseek-v4-pro"}:
+            if cfg.get("provider") == "deepseek" and actual_model in {"deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro"}:
                 retry_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
             retry_response = await asyncio.wait_for(
                 client.chat.completions.create(**retry_kwargs), timeout=40,

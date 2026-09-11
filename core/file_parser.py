@@ -169,6 +169,9 @@ def _parse_image(file_path: str, api_key: str, base_url: str = None,
 
     base_url = base_url.rstrip("/")
     model = model or "qwen-vl-plus"  # 默认用千问视觉模型
+    if model.lower().endswith("-reasoning"):
+        # 设置页的 -reasoning 是界面别名，不是厂商实际模型 ID。
+        model = model[:-len("-reasoning")]
 
     payload = {
         "model": model,
@@ -183,6 +186,10 @@ def _parse_image(file_path: str, api_key: str, base_url: str = None,
             ]
         }]
     }
+    if "api.deepseek.com" in base_url.lower() and model.lower() in {
+        "deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro",
+    }:
+        payload["thinking"] = {"type": "disabled"}
 
     try:
         resp = httpx.post(
@@ -193,6 +200,7 @@ def _parse_image(file_path: str, api_key: str, base_url: str = None,
             timeout=60,
         )
         resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
+        content = resp.json()["choices"][0]["message"].get("content")
+        return content or "[图片识别失败: 模型未返回识别结果]"
     except Exception as e:
         return f"[图片识别失败: {e}]"

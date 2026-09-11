@@ -75,7 +75,7 @@ class DashboardAggregationTests(unittest.TestCase):
             "provider": "deepseek",
             "api_key": "test",
             "base_url": "https://example.invalid/v1",
-            "model": "deepseek-v4-flash-reasoning",
+            "model": "deepseek-flash-reasoning",
         }
         payload = {"view": "daily", "date": "2026-08-02", "report": {"overview": "规则总结"}, "sections": []}
         with patch.object(dashboard_service.db, "get_llm_key", return_value=cfg), patch.object(
@@ -83,8 +83,8 @@ class DashboardAggregationTests(unittest.TestCase):
         ):
             result = asyncio.run(dashboard_service._enrich_report_with_llm(1, payload))
 
-        self.assertEqual(captured["model"], "deepseek-v4-flash")
-        self.assertEqual(captured["reasoning_effort"], "max")
+        self.assertEqual(captured["model"], "deepseek-flash")
+        self.assertEqual(captured["reasoning_effort"], "high")
         self.assertEqual(captured["extra_body"]["thinking"]["type"], "enabled")
         self.assertEqual(captured["response_format"], {"type": "json_object"})
         self.assertEqual(captured["max_tokens"], 8000)

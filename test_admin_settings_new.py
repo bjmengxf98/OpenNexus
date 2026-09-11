@@ -61,6 +61,7 @@ def test_all_pages_have_no_server_ui_runtime():
     assert "全部工具模式（兼容模式；通常无需开启）" in settings_html
     assert 'data-advanced="smart_tool_routing" data-inverted="true"' in settings_html
     assert "el.dataset.inverted==='true'?!el.checked:el.checked" in settings_html
+    assert "selectedModelDefaults" in settings_html
     assert 'id="tokenScopes"' in settings_html
     assert 'id="approvalList"' in settings_html
     assert "selectedScopes()" in settings_html
@@ -392,6 +393,30 @@ def test_assistant_uses_declared_model_capabilities():
     assert assistant.max_output_tokens == 12000
 
 
+def test_deepseek_flash_preset_has_current_capabilities_and_runtime_defaults():
+    from agent.assistant import Assistant, LLM_PRESETS, model_supports_vision
+    from api.settings_new_routes import _preset_payload
+
+    preset = LLM_PRESETS["deepseek"]
+    assert preset["model"] == "deepseek-flash"
+    payload_model = next(
+        item for item in _preset_payload()["deepseek"]["models"]
+        if item["id"] == "deepseek-flash"
+    )
+    assert payload_model["supports_vision"] is True
+    assert payload_model["context_window"] == 1_000_000
+    assert payload_model["max_output_tokens"] == 8192
+    assert model_supports_vision("deepseek", "deepseek-flash", {}) is True
+
+    standard = Assistant("test-key", "deepseek", model="deepseek-flash")
+    reasoning = Assistant("test-key", "deepseek", model="deepseek-flash-reasoning")
+    legacy = Assistant("test-key", "deepseek", model="deepseek-v4-flash-reasoning")
+    assert standard.context_window == reasoning.context_window == legacy.context_window == 1_000_000
+    assert standard.max_output_tokens == 8192
+    assert reasoning.max_output_tokens == legacy.max_output_tokens == 32768
+    assert standard.supports_vision is True
+
+
 def test_image_parser_uses_configured_output_limit(monkeypatch, tmp_path):
     import httpx
     from core.file_parser import parse_file
@@ -421,3 +446,35 @@ def test_image_parser_uses_configured_output_limit(monkeypatch, tmp_path):
     assert captured["url"] == "https://example.com/v1/chat/completions"
     assert captured["json"]["model"] == "omni-2.5"
     assert captured["json"]["max_tokens"] == 6000
+
+
+def test_image_parser_uses_deepseek_flash_multimodal_without_thinking(monkeypatch, tmp_path):
+    import httpx
+    from core.file_parser import parse_file
+
+    captured = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "图片已识别"}}]}
+
+    def fake_post(url, **kwargs):
+        captured["url"] = url
+        captured["json"] = kwargs["json"]
+        return Response()
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    image = tmp_path / "sample.png"
+    image.write_bytes(b"image-bytes")
+    result = parse_file(
+        str(image), image.name, "test-key", "https://api.deepseek.com",
+        "deepseek-flash-reasoning", 6000,
+    )
+
+    assert result == "图片已识别"
+    assert captured["url"] == "https://api.deepseek.com/chat/completions"
+    assert captured["json"]["model"] == "deepseek-flash"
+    assert captured["json"]["thinking"] == {"type": "disabled"}

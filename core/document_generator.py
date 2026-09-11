@@ -3,9 +3,11 @@
 使用结构化 JSON + 预定义模板，支持多种文档格式。
 流程：AI 生成 JSON → Python 渲染 → 上传 WPS
 """
+import ast
 import io
 import json
 import logging
+import re
 from datetime import datetime
 from typing import Optional, Dict, Any
 from docx import Document
@@ -15,6 +17,151 @@ from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
 logger = logging.getLogger(__name__)
+
+
+SUPPORTED_SECTION_TYPES = {
+    "org_header",
+    "doc_number",
+    "red_line",
+    "title",
+    "heading1",
+    "heading2",
+    "heading3",
+    "paragraph",
+    "recipient",
+    "ending",
+    "signature",
+    "date",
+    "space",
+}
+SECTION_TYPES_WITHOUT_TEXT = {"red_line", "space"}
+
+
+class DocumentStructureError(ValueError):
+    """文档结构无法安全渲染时抛出，避免把 JSON 源码写进 Word。"""
+
+
+def _strip_markdown_fence(value: str) -> str:
+    """兼容模型偶尔返回的 ```json ... ``` 包装。"""
+    match = re.fullmatch(
+        r"\s*```(?:json)?\s*(.*?)\s*```\s*",
+        value,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    return match.group(1).strip() if match else value.strip()
+
+
+def _parse_json_candidate(value: str) -> Any:
+    """解析一个 JSON 候选，允许前后有少量说明文字。"""
+    errors = []
+    for candidate in (value, value.lstrip("\ufeff")):
+        try:
+            return json.loads(candidate, strict=False)
+        except (json.JSONDecodeError, TypeError) as exc:
+            errors.append(exc)
+
+    # 有些模型会在对象前后附一句说明；只接受可完整解码出的第一个对象。
+    first_brace = value.find("{")
+    if first_brace >= 0:
+        try:
+            parsed, _ = json.JSONDecoder(strict=False).raw_decode(value[first_brace:])
+            return parsed
+        except json.JSONDecodeError as exc:
+            errors.append(exc)
+
+    # 兼容历史模型输出的 Python 字面量（单引号等），仍需经过后续结构校验。
+    try:
+        return ast.literal_eval(value)
+    except (ValueError, SyntaxError) as exc:
+        errors.append(exc)
+
+    detail = errors[0] if errors else "未知解析错误"
+    raise DocumentStructureError(f"content 不是合法的文档结构：{detail}")
+
+
+def _looks_like_raw_document_payload(text: str) -> bool:
+    """识别被错误塞进段落中的整个 sections JSON。"""
+    compact = _strip_markdown_fence(text).lstrip("\ufeff").lstrip()
+    return bool(
+        compact.startswith("{")
+        and re.search(r'["\']sections["\']\s*:', compact[:500], re.IGNORECASE)
+    )
+
+
+def _normalize_document_structure(content: Any) -> Dict[str, Any]:
+    """把兼容输入规范化为经过严格校验、可安全渲染的文档结构。"""
+    structure = content
+    if isinstance(structure, str):
+        current = _strip_markdown_fence(structure)
+        if not current:
+            raise DocumentStructureError("content 不能为空")
+        # 最多解两层，兼容模型把对象重复序列化为 JSON 字符串。
+        for _ in range(2):
+            structure = _parse_json_candidate(current)
+            if not isinstance(structure, str):
+                break
+            current = _strip_markdown_fence(structure)
+
+    if not isinstance(structure, dict):
+        raise DocumentStructureError("content 必须是包含 sections 数组的对象")
+
+    sections = structure.get("sections")
+    if not isinstance(sections, list) or not sections:
+        raise DocumentStructureError("sections 必须是非空数组")
+
+    normalized_sections = []
+    has_visible_content = False
+    for index, section in enumerate(sections, start=1):
+        if not isinstance(section, dict):
+            raise DocumentStructureError(f"第 {index} 个 section 必须是对象")
+
+        section_type = section.get("type")
+        if not isinstance(section_type, str):
+            raise DocumentStructureError(f"第 {index} 个 section 缺少字符串 type")
+        section_type = section_type.strip().lower()
+        if section_type not in SUPPORTED_SECTION_TYPES:
+            raise DocumentStructureError(
+                f"第 {index} 个 section 类型 {section_type!r} 不受支持"
+            )
+
+        normalized = dict(section)
+        normalized["type"] = section_type
+        if section_type not in SECTION_TYPES_WITHOUT_TEXT:
+            text = section.get("text")
+            if not isinstance(text, str) or not text.strip():
+                raise DocumentStructureError(
+                    f"第 {index} 个 {section_type} section 必须包含非空字符串 text"
+                )
+            if _looks_like_raw_document_payload(text):
+                raise DocumentStructureError(
+                    "检测到 sections JSON 被作为正文传入，已阻止生成和上传"
+                )
+            normalized["text"] = text
+            has_visible_content = True
+        else:
+            normalized.pop("text", None)
+        normalized_sections.append(normalized)
+
+    if not has_visible_content:
+        raise DocumentStructureError("sections 中没有可写入文档的正文内容")
+
+    normalized_structure = dict(structure)
+    normalized_structure["sections"] = normalized_sections
+    return normalized_structure
+
+
+def _invalid_structure_result(error: Exception) -> Dict[str, Any]:
+    return {
+        "ok": False,
+        "code": "invalid_document_structure",
+        "retryable": True,
+        "uploaded": False,
+        "error": (
+            f"文档结构解析失败，未生成或上传任何文件：{error}。"
+            "请重新调用 generate_document，并将 content 直接传为包含 sections 数组的对象；"
+            "不要把对象序列化为字符串，也不要使用 Markdown 代码块。"
+        ),
+    }
 
 
 async def generate_and_upload_document(
@@ -32,7 +179,7 @@ async def generate_and_upload_document(
         access_token: WPS OAuth token
         dbsheet_file_id: 多维表格 ID
         title: 文档标题（用于文件命名）
-        content: JSON 字符串，描述文档结构
+        content: 文档结构对象；兼容合法 JSON 字符串
         doc_type: 文档类型 - official/report/notice/minutes/other
         metadata: 元数据（author/date/doc_number 等）
 
@@ -58,62 +205,23 @@ async def generate_and_upload_document(
         return {"ok": False, "error": "标题和内容不能为空"}
 
     try:
-        # 解析文档结构：支持 dict（AI 直接传对象）和 str（旧格式兼容）
-        if isinstance(content, dict):
-            structure = content
-            logger.info(f"[DOC] 接收到 dict，sections数量={len(structure.get('sections', []))}")
-        else:
-            print(f"[DOC] content type={type(content)}, len={len(content)}, first100={content[:100]}")
-            try:
-                structure = json.loads(content)
-                print(f"[DOC] JSON解析成功，sections数量={len(structure.get('sections', []))}")
-            except json.JSONDecodeError as _je:
-                print(f"[DOC] JSON解析失败: {_je}")
-                logger.error(f"JSON解析失败: {_je}\n原始content前300字符: {content[:300]}")
+        # 解析失败时绝不降级为普通文本，否则会把整段 JSON 原样写进 Word。
+        try:
+            structure = _normalize_document_structure(content)
+        except DocumentStructureError as exc:
+            logger.warning(
+                "[DOC] 文档结构校验失败，已阻止生成和上传: type=%s, length=%s, error=%s",
+                type(content).__name__,
+                len(content) if hasattr(content, "__len__") else "unknown",
+                exc,
+            )
+            return _invalid_structure_result(exc)
 
-                # 尝试多种修复策略
-                _fixed = content
-                _strategies = []
-
-                # 策略1：替换中文引号为标准ASCII引号
-                _chn_left_quote = chr(8220)
-                _chn_right_quote = chr(8221)
-                if _chn_left_quote in _fixed or _chn_right_quote in _fixed:
-                    _fixed = _fixed.replace(_chn_left_quote, '"').replace(_chn_right_quote, '"')
-                    _strategies.append("替换中文引号")
-
-                # 策略2：处理未转义的真实换行符
-                import re as _re
-                _fixed = _re.sub(r'("text":\s*)"([^"]*)\n([^"]*)"', r'\1"\2\\n\3"', _fixed)
-                if '\\n' in _fixed and '\n' in content:
-                    _strategies.append("处理未转义换行符")
-
-                # 策略3：移除可能导致解析失败的控制字符
-                _fixed = ''.join(c for c in _fixed if ord(c) >= 32 or c in '\n\t\r')
-
-                # 策略4：尝试修复缺失的逗号
-                _fixed = _re.sub(r'}\s*{', '},{', _fixed)
-                if '},{' in _fixed:
-                    _strategies.append("修复缺失逗号")
-
-                _tried_strategies = []
-                structure = None
-                for _strategy_name in _strategies:
-                    try:
-                        structure = json.loads(_fixed)
-                        print(f"[DOC] JSON修复成功: {_strategy_name}")
-                        _tried_strategies.append(_strategy_name)
-                        break
-                    except json.JSONDecodeError:
-                        _tried_strategies.append(f"{_strategy_name}(失败)")
-                        continue
-
-                if structure is None or "sections" not in structure:
-                    print(f"[DOC] JSON所有修复都失败，退化为行拆分模式")
-                    structure = {"sections": [{"type": "paragraph", "text": line} for line in content.split("\n") if line.strip()]}
-                    logger.warning(f"JSON解析全部失败，已转换为普通文本模式。尝试的修复策略: {_tried_strategies}")
-                else:
-                    logger.info(f"JSON修复成功，使用策略: {_tried_strategies}")
+        logger.info(
+            "[DOC] 文档结构校验通过: input_type=%s, sections=%d",
+            type(content).__name__,
+            len(structure["sections"]),
+        )
 
         # 生成文档
         doc = Document()

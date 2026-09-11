@@ -11,6 +11,8 @@ All notable public changes to OpenNexus are recorded here.
 
 ### Changed
 
+- DeepSeek direct-API presets now use `deepseek-flash`, advertise its 1M context and multimodal capability, preserve legacy model aliases, apply the official default reasoning effort, and retry once without thinking instead of saving an empty response
+- Word generation now validates and normalizes structured sections before rendering; malformed model output is rejected with a retryable receipt and is never uploaded as visible JSON source text
 - Conversation summaries are isolated per topic and exclude assistant-generated claims
 - Live WPS data remains authoritative; runtime file and sheet selection is not persisted as memory
 - Legacy memory behavior remains available as a compatibility fallback

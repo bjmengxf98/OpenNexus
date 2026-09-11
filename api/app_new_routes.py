@@ -16,7 +16,7 @@ import markdown
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 
-from agent.assistant import Assistant
+from agent.assistant import Assistant, model_supports_vision
 from auth import db
 from auth.wps_oauth import build_auth_url, calc_expires_at, is_token_expired, refresh_access_token
 from core import upload_queue
@@ -432,7 +432,11 @@ async def app_new_chat(request: Request):
 
                 image_cfg = db.get_image_llm_key(uid) if files_to_send else None
                 main_advanced = llm_cfg.get("advanced") or {}
-                main_vision_cfg = llm_cfg if main_advanced.get("supports_vision") else None
+                main_vision_cfg = (
+                    llm_cfg if model_supports_vision(
+                        llm_cfg.get("provider"), llm_cfg.get("model"), main_advanced,
+                    ) else None
+                )
                 image_advanced = (image_cfg or {}).get("advanced") or {}
                 fallback_vision_cfg = (
                     image_cfg

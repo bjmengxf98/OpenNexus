@@ -101,14 +101,21 @@ def _extract_file_id(raw: str) -> str:
 def _preset_payload():
     result = {}
     for key, value in LLM_PRESETS.items():
+        models = []
+        for item in value.get("models", []):
+            model_item = {
+                "id": item.get("id", ""),
+                "name": item.get("name", item.get("id", "")),
+            }
+            for field in ("supports_vision", "context_window", "max_output_tokens"):
+                if field in item:
+                    model_item[field] = item[field]
+            models.append(model_item)
         result[key] = {
             "name": value.get("name", key),
             "base_url": value.get("base_url", ""),
             "model": value.get("model", ""),
-            "models": [
-                {"id": item.get("id", ""), "name": item.get("name", item.get("id", ""))}
-                for item in value.get("models", [])
-            ],
+            "models": models,
         }
     result[_CUSTOM_PROVIDER] = {
         "name": "自定义 OpenAI 兼容接口",

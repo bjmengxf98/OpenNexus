@@ -33,6 +33,19 @@ from starlette.responses import Response as StarletteResponse
 from core import upload_queue as _uq
 from core.wechat_supervisor import WechatRestartSupervisor
 
+
+def _short_text_llm_kwargs(llm_row: dict) -> dict:
+    """规范短文本辅助调用，避免把界面思考别名直接发给厂商。"""
+    from agent.assistant import base_model_id, is_deepseek_api_model
+
+    configured_model = llm_row.get("model") or "deepseek-flash"
+    kwargs = {"model": base_model_id(configured_model)}
+    if is_deepseek_api_model(llm_row.get("provider"), configured_model):
+        # 合规检查、知识提炼等短任务不需要消耗思考额度；DeepSeek
+        # 官方模型默认开启思考，因此这里必须显式关闭。
+        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+    return kwargs
+
 # ── 上传 iframe HTML ────────────────────────────────────────
 
 _CHAT_UPLOAD_HTML = """\
@@ -1201,10 +1214,6 @@ async def _run_distill(uid: int, access_token: str, llm_row: dict, files: list):
         api_key=llm_row["api_key"],
         base_url=llm_row.get("base_url") or "https://api.deepseek.com",
     )
-    model = llm_row.get("model") or "deepseek-chat"
-    if model.endswith("-reasoning"):
-        model = model[:-len("-reasoning")]
-
     REWRITE_PROMPT = """你是填报规范专家。以下是一条真实填报记录（可能不规范）：
 
 {content}
@@ -1277,7 +1286,7 @@ async def _run_distill(uid: int, access_token: str, llm_row: dict, files: list):
                     content_lines = "\n".join(f"{k}: {v}" for k, v in nonempty.items())
                     try:
                         resp = await client.chat.completions.create(
-                            model=model,
+                            **_short_text_llm_kwargs(llm_row),
                             messages=[{"role": "user", "content": REWRITE_PROMPT.format(content=content_lines)}],
                             max_tokens=300, temperature=0.2,
                         )
@@ -1659,7 +1668,7 @@ async def _generate_compliance_example(fields: dict, issues: list) -> str:
             base_url=llm_row.get("base_url") or "https://api.deepseek.com",
         )
         resp = await client.chat.completions.create(
-            model=llm_row.get("model") or "deepseek-chat",
+            **_short_text_llm_kwargs(llm_row),
             messages=[{"role": "user", "content": prompt}],
             max_tokens=250,
             temperature=0.3,
@@ -1759,7 +1768,7 @@ async def _llm_compliance_check(sheet_name: str, all_fields: list, filled_fields
             base_url=llm_row.get("base_url") or "https://api.deepseek.com",
         )
         resp = await client.chat.completions.create(
-            model=llm_row.get("model") or "deepseek-chat",
+            **_short_text_llm_kwargs(llm_row),
             messages=[{"role": "user", "content": prompt}],
             max_tokens=300,
             temperature=0.3,
@@ -1872,7 +1881,7 @@ async def _knowledge_guide_push(
             base_url=llm_row.get("base_url") or "https://api.deepseek.com",
         )
         resp = await client.chat.completions.create(
-            model=llm_row.get("model") or "deepseek-chat",
+            **_short_text_llm_kwargs(llm_row),
             messages=[{"role": "user", "content": prompt}],
             max_tokens=400,
             temperature=0.4,
