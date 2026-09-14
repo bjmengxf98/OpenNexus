@@ -15,7 +15,7 @@ SMTP_PORT = int(os.environ.get("SMTP_PORT", str(SMTP_PORT)))
 SENDER_EMAIL = os.environ.get("SMTP_SENDER_EMAIL", "").strip()
 SENDER_PASSWORD = os.environ.get("SMTP_SENDER_PASSWORD", "").strip()
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "http://localhost:8000").rstrip("/")
-SENDER_NAME = "多维表格智能助手"
+SENDER_NAME = "OpenNexus 业务智能助手"
 
 
 def send_email(to_email: str, subject: str, html_body: str) -> tuple[bool, str]:
@@ -41,7 +41,7 @@ def send_verify_email(to_email: str, username: str, token: str, base_url: str | 
     link = f"{base_url}/verify?token={token}"
     html = f"""
     <div style="font-family:'Microsoft YaHei',sans-serif;max-width:500px;margin:0 auto;padding:32px">
-      <h2 style="color:#0055ff;margin-bottom:8px">多维表格智能助手</h2>
+      <h2 style="color:#0055ff;margin-bottom:8px">OpenNexus 业务智能助手</h2>
       <p style="color:#666;margin-bottom:24px">请验证您的邮箱以完成注册</p>
       <p>你好，<strong>{username}</strong>！</p>
       <p style="margin:16px 0">点击下方按钮验证邮箱：</p>
@@ -51,7 +51,7 @@ def send_verify_email(to_email: str, username: str, token: str, base_url: str | 
       </a>
       <p style="color:#999;font-size:12px;margin-top:24px">链接24小时内有效。如非本人操作请忽略。</p>
     </div>"""
-    return send_email(to_email, "【多维表格智能助手】邮箱验证", html)
+    return send_email(to_email, "【OpenNexus 业务智能助手】邮箱验证", html)
 
 
 def send_reset_email(to_email: str, username: str, token: str, base_url: str | None = None):
@@ -59,7 +59,7 @@ def send_reset_email(to_email: str, username: str, token: str, base_url: str | N
     link = f"{base_url}/reset?token={token}"
     html = f"""
     <div style="font-family:'Microsoft YaHei',sans-serif;max-width:500px;margin:0 auto;padding:32px">
-      <h2 style="color:#0055ff;margin-bottom:8px">多维表格智能助手</h2>
+      <h2 style="color:#0055ff;margin-bottom:8px">OpenNexus 业务智能助手</h2>
       <p style="color:#666;margin-bottom:24px">密码重置请求</p>
       <p>你好，<strong>{username}</strong>！</p>
       <p style="margin:16px 0">点击下方按钮重置密码：</p>
@@ -69,4 +69,4 @@ def send_reset_email(to_email: str, username: str, token: str, base_url: str | N
       </a>
       <p style="color:#999;font-size:12px;margin-top:24px">链接24小时内有效。如非本人操作请忽略。</p>
     </div>"""
-    return send_email(to_email, "【多维表格智能助手】密码重置", html)
+    return send_email(to_email, "【OpenNexus 业务智能助手】密码重置", html)

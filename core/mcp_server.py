@@ -43,7 +43,7 @@ _MAX_REMOTE_FILE_BYTES = 20 * 1024 * 1024
 
 
 mcp_server = FastMCP(
-    "OpenNexus 部门智能管理助手",
+    "OpenNexus 业务智能助手",
     instructions=(
         "使用当前令牌所属用户的身份操作 OpenNexus。可查询和维护 WPS 多维表格/传统表格，"
         "查询驾驶舱与知识库，生成文档，设置提醒，并通过 WPS、企业微信和个人微信发送消息。"

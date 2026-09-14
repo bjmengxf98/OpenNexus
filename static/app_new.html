@@ -10,7 +10,7 @@
   <link rel="icon" href="/static/icon-192.png">
   <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
   <script defer src="/static/pwa.js?v=20260821-1"></script>
-  <title>OpenNexus 多维表格智能助手</title>
+  <title>OpenNexus 业务智能助手</title>
   <script>
     (function(){
       var choice=localStorage.getItem('appearance_theme')||'system';
@@ -50,7 +50,7 @@
 <body>
 <div class="app">
   <header class="topbar">
-    <div class="top-left"><button class="menu-btn" id="menuBtn" aria-label="打开会话列表">☰</button><span class="brand">OpenNexus</span><span class="brand-sub">多维表格智能助手</span></div>
+    <div class="top-left"><button class="menu-btn" id="menuBtn" aria-label="打开会话列表">☰</button><span class="brand">OpenNexus</span><span class="brand-sub">业务智能助手</span></div>
     <div class="top-right">
       <select id="fileSelect" class="pill file-select" title="当前多维表格"></select>
       <span id="roleBadge" class="pill role"></span><span id="displayName" class="who"></span>
@@ -109,7 +109,7 @@ function toolLabel(name){return({discover_tools:'准备所需能力',update_task
 function addMessage(role,content,htmlValue='',created='',autoScroll=true,metadata=null){if(created){const now=parseConversationTime(created),prev=state.lastMessageAt?parseConversationTime(state.lastMessageAt):null;if(!prev||!now||now-prev>=300000)addTimestamp(created);state.lastMessageAt=created}const row=document.createElement('div');row.className='message '+role;if(role==='assistant'){row.innerHTML='<div class="avatar">✦</div><div class="bubble">'+(htmlValue||esc(content).replace(/\n/g,'<br>'))+'</div>'}else{row.innerHTML='<div class="bubble">'+esc(content).replace(/\n/g,'<br>')+'</div>'}chat.append(row);if(role==='assistant')addRunMeta(row,metadata);if(autoScroll)scrollBottom(true);return row}
 function setStatus(text,kind=''){let el=$('#liveStatus');if(!el){el=document.createElement('div');el.id='liveStatus';chat.append(el)}el.className='status '+kind;el.textContent=text;scrollBottom(true)}
 function clearStatus(){const e=$('#liveStatus');if(e)e.remove()}
-function welcome(){state.lastMessageAt=null;chat.innerHTML='<div class="welcome"><div class="message assistant"><div class="avatar">✦</div><div class="bubble"><p>你好，'+esc(state.user?.display_name||'')+'！我是你的多维表格智能助手。</p><p>你可以直接查询任务、人员和工作进展，也可以上传文件让我分析或写入表格。</p><p>'+ (state.wps?.default_file?'已配置默认表格：<b>'+esc(state.wps.default_file.file_name||state.wps.default_file.file_id)+'</b>':'请先在设置中添加多维表格链接') +'</p></div></div></div>'}
+function welcome(){state.lastMessageAt=null;chat.innerHTML='<div class="welcome"><div class="message assistant"><div class="avatar">✦</div><div class="bubble"><p>你好，'+esc(state.user?.display_name||'')+'！我是你的业务智能助手。</p><p>你可以直接查询任务、人员和工作进展，也可以上传文件让我分析或写入表格。</p><p>'+ (state.wps?.default_file?'已配置默认表格：<b>'+esc(state.wps.default_file.file_name||state.wps.default_file.file_id)+'</b>':'请先在设置中添加多维表格链接') +'</p></div></div></div>'}
 function parseConversationTime(value){if(!value)return null;let text=String(value).trim().replace(' ','T');if(!/[zZ]|[+-]\d\d:?\d\d$/.test(text))text+='Z';const date=new Date(text);return Number.isNaN(date.getTime())?null:date}
 function conversationTimeLabel(value){const date=parseConversationTime(value);if(!date)return'';const now=new Date(),pad=n=>String(n).padStart(2,'0');return date.toDateString()===now.toDateString()?pad(date.getHours())+':'+pad(date.getMinutes()):(date.getFullYear()===now.getFullYear()?pad(date.getMonth()+1)+'/'+pad(date.getDate()):pad(date.getFullYear()%100)+'/'+pad(date.getMonth()+1)+'/'+pad(date.getDate()))}
 function renderConversations(){const box=$('#convList');box.innerHTML='';if(!state.conversations.length){box.innerHTML='<div class="group-label">暂无对话</div>';updateBatchControls();return}const now=new Date(),startToday=new Date(now.getFullYear(),now.getMonth(),now.getDate()),startYesterday=new Date(startToday);startYesterday.setDate(startYesterday.getDate()-1);const startSeven=new Date(startToday);startSeven.setDate(startSeven.getDate()-7);const groups=[['今天',[]],['昨天',[]],['7天内',[]],['更早',[]]];state.conversations.forEach(c=>{const d=parseConversationTime(c.updated_at);if(d&&d>=startToday)groups[0][1].push(c);else if(d&&d>=startYesterday)groups[1][1].push(c);else if(d&&d>=startSeven)groups[2][1].push(c);else groups[3][1].push(c)});groups.forEach(([name,items])=>{if(!items.length)return;const label=document.createElement('div');label.className='group-label';label.textContent=name;box.append(label);items.forEach(c=>{const id=Number(c.id),selected=state.selectedConversationIds.has(id),e=document.createElement('div');e.className='conv '+(id===Number(state.currentId)?'active ':'')+(selected?'selected':'');e.dataset.id=c.id;e.innerHTML='<input class="conv-check" type="checkbox" aria-label="选择对话 '+esc(c.title||'新对话')+'" '+(selected?'checked':'')+'><span class="conv-title">'+esc(c.title||'新对话')+'</span><span class="conv-time">'+esc(conversationTimeLabel(c.updated_at))+'</span><button class="conv-menu" title="更多">⋯</button>';e.onclick=()=>state.batchMode?toggleBatchSelection(id):selectConversation(id);e.querySelector('.conv-check').onclick=ev=>{ev.stopPropagation();toggleBatchSelection(id)};e.querySelector('.conv-menu').onclick=ev=>{ev.stopPropagation();conversationMenu(c)};box.append(e)})});updateBatchControls()}

@@ -1,4 +1,4 @@
-# OpenNexus 多维表格智能助手
+# OpenNexus 业务智能助手
 
 <p align="center">
   <img src="static/icon-512.png" width="112" alt="OpenNexus logo">

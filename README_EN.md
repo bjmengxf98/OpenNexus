@@ -1,4 +1,4 @@
-# OpenNexus — AI Workspace for Teams
+# OpenNexus — Business AI Assistant for Teams
 
 <p align="center">
   <img src="static/icon-512.png" width="112" alt="OpenNexus logo">
@@ -12,7 +12,7 @@
 
 <p align="center"><a href="https://github.com/bjmengxf98/OpenNexus">github.com/bjmengxf98/OpenNexus</a></p>
 
-OpenNexus is an open-source, self-hosted AI workspace designed for departments and small teams. It turns structured data in WPS multidimensional spreadsheets into business-aware conversations, automations, dashboards, reminders, and tools that other AI clients can call through MCP.
+OpenNexus is an open-source, self-hosted business AI assistant designed for departments and small teams. It turns structured data in WPS multidimensional spreadsheets into business-aware conversations, automations, dashboards, reminders, and tools that other AI clients can call through MCP.
 
 OpenNexus is not merely a chatbot for spreadsheets. Its goal is to provide a practical AI operating layer for day-to-day team work.
 

@@ -794,7 +794,7 @@ async def api_mcp_info(request: Request):
     endpoint = str(request.base_url).rstrip("/") + "/mcp/"
     return JSONResponse({
         "ok": True,
-        "name": "OpenNexus 部门智能管理助手",
+        "name": "OpenNexus 业务智能助手",
         "transport": "Streamable HTTP",
         "endpoint": endpoint,
         "authorization": "Bearer <在设置页创建的 MCP 令牌>",
@@ -1062,7 +1062,7 @@ async def api_get_conversation_messages(conv_id: int, request: Request):
         )
         name = (user.get("display_name") or user.get("username", "")) if user else ""
         welcome = (
-            f"你好，{name}！我是你的多维表格智能助手。\n\n"
+            f"你好，{name}！我是你的业务智能助手。\n\n"
             "你可以：\n"
             "- 直接说'查看任务列表'、'帮我更新任务进度'等指令\n"
             "- 拖拽上传 Word / PDF / 图片，我会自动提取内容写入表格\n"
@@ -3135,7 +3135,7 @@ async def weixin_bind(request: Request):
 async def pwa_manifest():
     return JSONResponse({
         "id": "/",
-        "name": "OpenNexus 多维表格智能助手",
+        "name": "OpenNexus 业务智能助手",
         "short_name": "OpenNexus",
         "description": "面向部门事务、任务、项目、知识库和消息提醒的智能工作助手",
         "start_url": "/",

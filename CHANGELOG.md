@@ -11,6 +11,7 @@ All notable public changes to OpenNexus are recorded here.
 
 ### Changed
 
+- Product-facing name is now `业务智能助手` across login, workspace, PWA, email, MCP metadata, and current help pages; WPS multidimensional spreadsheets remain a supported capability.
 - DeepSeek direct-API presets now use `deepseek-flash`, advertise its 1M context and multimodal capability, preserve legacy model aliases, apply the official default reasoning effort, and retry once without thinking instead of saving an empty response
 - Word generation now validates and normalizes structured sections before rendering; malformed model output is rejected with a retryable receipt and is never uploaded as visible JSON source text
 - Conversation summaries are isolated per topic and exclude assistant-generated claims
