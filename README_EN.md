@@ -19,7 +19,7 @@ OpenNexus is not merely a chatbot for spreadsheets. Its goal is to provide a pra
 ## Highlights
 
 - Query and maintain WPS multidimensional spreadsheets using natural language
-- Daily progress, task, project, and department-level dashboards
+- A business intelligence dashboard that derives summaries from the selected spreadsheet's actual worksheets and fields, with dedicated daily progress, task, and project views when applicable
 - Business-aware reminders with retryable delivery through WeCom, WPS messaging, and an experimental personal-WeChat bridge
 - File upload, image understanding, document generation, and RAG-based knowledge retrieval
 - Topic-based conversations, users, roles, audit records, and feedback management

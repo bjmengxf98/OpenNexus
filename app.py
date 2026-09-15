@@ -1137,7 +1137,7 @@ from core.knowledge_rag import embed_knowledge_doc as _embed_knowledge_doc, embe
 from api.kb_embed_routes import kb_embed_router
 fastapi_app.include_router(kb_embed_router)
 
-# 独立 HTML 部门驾驶舱及其 JSON API
+# 独立 HTML 业务智能驾驶舱及其 JSON API
 from api.dashboard_routes import dashboard_router
 fastapi_app.include_router(dashboard_router)
 
@@ -3137,7 +3137,7 @@ async def pwa_manifest():
         "id": "/",
         "name": "OpenNexus 业务智能助手",
         "short_name": "OpenNexus",
-        "description": "面向部门事务、任务、项目、知识库和消息提醒的智能工作助手",
+        "description": "面向多种业务表格、任务、项目、知识库和消息提醒的智能工作助手",
         "start_url": "/",
         "scope": "/",
         "lang": "zh-CN",
@@ -3154,7 +3154,7 @@ async def pwa_manifest():
         ],
         "shortcuts": [
             {"name": "开始对话", "short_name": "对话", "url": "/", "icons": [{"src": "/static/icon-192.png", "sizes": "192x192"}]},
-            {"name": "部门驾驶舱", "short_name": "驾驶舱", "url": "/dashboard", "icons": [{"src": "/static/icon-192.png", "sizes": "192x192"}]},
+            {"name": "业务智能驾驶舱", "short_name": "驾驶舱", "url": "/dashboard", "icons": [{"src": "/static/icon-192.png", "sizes": "192x192"}]},
         ],
     })
 

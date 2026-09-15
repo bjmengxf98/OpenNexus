@@ -1,4 +1,4 @@
-"""部门驾驶舱聚合与快照测试。"""
+"""业务智能驾驶舱聚合与快照测试。"""
 
 from __future__ import annotations
 
@@ -84,6 +84,8 @@ class DashboardAggregationTests(unittest.TestCase):
             result = asyncio.run(dashboard_service._enrich_report_with_llm(1, payload))
 
         self.assertEqual(captured["model"], "deepseek-flash")
+        self.assertIn("你是面向不同业务场景的高级数据分析助手", captured["messages"][0]["content"])
+        self.assertNotIn("部门负责人身边", captured["messages"][0]["content"])
         self.assertEqual(captured["reasoning_effort"], "high")
         self.assertEqual(captured["extra_body"]["thinking"]["type"], "enabled")
         self.assertEqual(captured["response_format"], {"type": "json_object"})

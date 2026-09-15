@@ -1,4 +1,4 @@
-"""部门驾驶舱：从 WPS 多维表格聚合数据并保存 HTML 前端所需快照。"""
+"""业务智能驾驶舱：从 WPS 多维表格聚合数据并保存 HTML 前端所需快照。"""
 
 from __future__ import annotations
 
@@ -304,7 +304,7 @@ def _daily_report(items: list[dict], selected_count: int, filled: int, blank: in
     overview = (
         f"当日共读取 {selected_count} 条进展记录，{len(people)} 人提交了 {filled} 条有实质内容的工作进展"
         f"{f'，另有 {blank} 条空白记录需要补充' if blank else ''}。"
-        f"部门工作呈现“{category_text}”并行推进的特点。"
+        f"当日业务事项呈现“{category_text}”并行推进的特点。"
     )
     grouped: dict[str, dict] = {}
     for item in valid:
@@ -338,7 +338,7 @@ def _daily_report(items: list[dict], selected_count: int, filled: int, blank: in
         followups.append({"title": f"{blank} 条空白记录", "body": "仅填写了日期或缺少具体工作内容，建议补填或清理，避免影响后续分析。"})
     recommendations = []
     if highlights:
-        recommendations.append({"title": "沉淀高价值工作方法", "body": "把高工作量、可复用的处理方法整理为部门模板或标准操作流程，供其他成员复用。"})
+        recommendations.append({"title": "沉淀高价值工作方法", "body": "把高工作量、可复用的处理方法整理为业务模板或标准操作流程，供其他成员复用。"})
     if followups:
         recommendations.append({"title": "形成待办闭环", "body": "为未成功、存在风险或需要协调的事项明确责任人和下一次检查时间。"})
     if blank:
@@ -409,9 +409,24 @@ async def _enrich_report_with_llm(user_id: int, payload: dict) -> dict:
         ],
         "rule_report": report,
     }
-    prompt = f"""你是部门负责人身边的高级业务分析秘书。请根据下面的真实数据，写出正式工作情况分析报告的结构化总结。
-要求：只能使用输入数据，绝不虚构；overview 写120—220字总体概况，归纳工作主线和特征，不能只重复数字；highlights 提炼2—6项成果或效率亮点，每项含 title、body、tag；people 按人员归并工作，每项含 name、tag、items 字符串数组，非人员日报可为空；followups 提取未成功、逾期、阻塞、风险和待协调项，每项含 title、body；recommendations 给出2—5条具体可执行建议，每项含 title、body；不要空洞表扬，不要 Markdown。只返回合法 JSON，对象键必须是 overview、highlights、people、followups、recommendations。
-    数据：{json.dumps(compact, ensure_ascii=False)[:24000]}"""
+    if payload.get("analysis_version") == 2:
+        compact["distributions"] = payload.get("distributions", [])[:6]
+        compact["records"] = [
+            {"sheet": section.get("title"), "fields": {
+                column["label"]: item.get(column["key"])
+                for column in section.get("columns", [])
+            }}
+            for section in payload.get("sections", [])
+            for item in section.get("items", [])[:12]
+        ][:80]
+    semantic_guard = (
+        "当前为任意业务表格的通用概览；不要把记录数当作成果，不要推断表格未提供的逾期、责任人或完成情况。"
+        "没有直接证据的亮点、人员、风险和建议可返回空数组。"
+        if payload.get("analysis_version") == 2 else ""
+    )
+    prompt = f"""你是面向不同业务场景的高级数据分析助手。请根据下面的真实数据，写出正式业务情况分析报告的结构化总结。
+要求：只能使用输入数据，绝不虚构；overview 写120—220字总体概况，归纳业务主线和特征，不能只重复数字；highlights 提炼2—6项成果或效率亮点，每项含 title、body、tag；people 按人员归并工作，每项含 name、tag、items 字符串数组，非人员日报可为空；followups 提取未成功、逾期、阻塞、风险和待协调项，每项含 title、body；recommendations 给出2—5条具体可执行建议，每项含 title、body；不要空洞表扬，不要 Markdown。只返回合法 JSON，对象键必须是 overview、highlights、people、followups、recommendations。
+    {semantic_guard}数据：{json.dumps(compact, ensure_ascii=False)[:24000]}"""
     try:
         client = AsyncOpenAI(api_key=cfg["api_key"], base_url=cfg.get("base_url") or None, timeout=35, max_retries=0)
         actual_model = cfg["model"]
@@ -529,7 +544,7 @@ def _daily_payload(records: list[dict], target: date, source: dict, lookup: dict
 
     payload = {
         "view": "daily",
-        "title": f"{source.get('file_name') or '部门'} · {target.strftime('%Y/%m/%d')} 工作情况分析",
+        "title": f"{source.get('file_name') or '业务数据'} · {target.strftime('%Y/%m/%d')} 工作情况分析",
         "date": target.isoformat(),
         "source": source,
         "kpis": [
@@ -668,7 +683,7 @@ def _overview_payload(daily: dict, tasks: dict, projects: dict, target: date, so
     ]
     payload = {
         "view": "overview",
-        "title": "部门整体驾驶舱",
+        "title": "业务智能驾驶舱",
         "date": target.isoformat(),
         "source": source,
         "kpis": [
@@ -715,6 +730,36 @@ def _overview_payload(daily: dict, tasks: dict, projects: dict, target: date, so
     return payload
 
 
+def _normalize_cached_dashboard_labels(payload: dict) -> dict:
+    """只调整旧快照的固定系统文案，不改业务表名、原始记录或 AI 历史分析。"""
+    result = dict(payload)
+    title = result.get("title")
+    if result.get("view") == "overview" and title == "部门整体驾驶舱":
+        result["title"] = "业务智能驾驶舱"
+    elif result.get("view") == "daily" and isinstance(title, str) and title.startswith("部门 · "):
+        result["title"] = "业务数据" + title[len("部门"):]
+
+    report = result.get("report")
+    if not isinstance(report, dict) or report.get("source") != "rules":
+        return result
+    normalized_report = dict(report)
+    overview = normalized_report.get("overview")
+    if isinstance(overview, str):
+        normalized_report["overview"] = overview.replace("部门工作呈现“", "当日业务事项呈现“")
+    old_body = "把高工作量、可复用的处理方法整理为部门模板或标准操作流程，供其他成员复用。"
+    new_body = "把高工作量、可复用的处理方法整理为业务模板或标准操作流程，供其他成员复用。"
+    recommendations = normalized_report.get("recommendations")
+    if isinstance(recommendations, list):
+        normalized_report["recommendations"] = [
+            {**item, "body": new_body}
+            if isinstance(item, dict) and item.get("title") == "沉淀高价值工作方法" and item.get("body") == old_body
+            else item
+            for item in recommendations
+        ]
+    result["report"] = normalized_report
+    return result
+
+
 def _cache_fresh(snapshot: dict | None, target: date, max_age_seconds: int = 300) -> bool:
     if not snapshot or not snapshot.get("report"):
         return False
@@ -725,6 +770,20 @@ def _cache_fresh(snapshot: dict | None, target: date, max_age_seconds: int = 300
         return (datetime.now() - generated).total_seconds() < max_age_seconds
     except Exception:
         return False
+
+
+def _generic_cache_for_kind(user_id: int, file_id: str, kind: str) -> dict | None:
+    """通用概览已经完整读取该工作表时，专用页直接复用本地数据。"""
+    index = db.get_dashboard_data_cache(user_id, file_id, "generic_index") or {}
+    sheet = _pick_sheet(index.get("schema_sheets") or [], kind)
+    if not sheet:
+        return None
+    sheet_id = str(_sheet_id(sheet))
+    meta = next((item for item in index.get("sheets", []) if str(item.get("id")) == sheet_id), None)
+    if not meta or not meta.get("complete"):
+        return None
+    cached = db.get_dashboard_data_cache(user_id, file_id, f"generic_sheet:{sheet_id}")
+    return {**cached, "sheet_name": _sheet_name(sheet)} if cached is not None else None
 
 
 async def generate_dashboard(
@@ -743,58 +802,135 @@ async def generate_dashboard(
     except ValueError as exc:
         raise DashboardError("日期格式必须为 YYYY-MM-DD") from exc
 
-    cached = db.get_dashboard_snapshot(user_id, file_id, view_type, target.isoformat())
-    if not force and _cache_fresh(cached, target):
-        cached["cached"] = True
-        return cached
-
     files = db.list_wps_files(user_id)
     file_row = next((item for item in files if item.get("file_id") == file_id), None)
     if not file_row:
         raise DashboardError("该 WPS 文件未配置或无权访问")
 
-    required = {"people"}
+    overview_index = None
     if view_type == "overview":
-        required.update(("daily", "tasks", "projects"))
-    else:
-        required.add(view_type)
-    missing = [kind for kind in required if not db.get_dashboard_data_cache(user_id, file_id, kind)]
-    if missing:
-        # 仅首次使用会等待一次全量预热；后续所有页面和日期均只读 SQLite。
+        from core.dashboard_generic_cache import GENERIC_CACHE_VERSION
+        overview_index = db.get_dashboard_data_cache(user_id, file_id, "generic_index")
+
+    cached = db.get_dashboard_snapshot(user_id, file_id, view_type, target.isoformat())
+    status = {row["data_kind"]: row["synced_at"] for row in db.get_dashboard_cache_status(user_id, file_id)}
+    source_synced_at = status.get("generic_index", "") if view_type == "overview" else max(
+        status.get(view_type, ""), status.get("generic_index", "")
+    )
+    reusable = bool(cached and cached.get("report") and cached.get("generated_at"))
+    if view_type == "overview":
+        from core.dashboard_planner import DESIGN_VERSION
+
+        if cached and cached.get("analysis_version") != 2:
+            reusable = False
+        if not overview_index or overview_index.get("version") != GENERIC_CACHE_VERSION:
+            reusable = False
+        if cached and cached.get("dashboard_design_version") != DESIGN_VERSION:
+            reusable = False
+    if cached and source_synced_at > cached.get("generated_at", ""):
+        reusable = False
+    if view_type == "daily" and cached and any(
+        item.get("label") == "当日进展记录" and item.get("value") == 0
+        for item in cached.get("kpis", [])
+    ):
+        # 昨日空快照不能永久有效；新填报可能在快照生成后到达。
+        reusable = reusable and _cache_fresh(cached, date.today())
+    if not force and reusable:
+        result = _normalize_cached_dashboard_labels(cached)
+        result["cached"] = True
+        return result
+
+    if view_type == "overview":
+        from core.dashboard_generic import build_generic_dashboard
+        from core.dashboard_generic_cache import GENERIC_CACHE_VERSION, sync_generic_dashboard_cache
+        index = overview_index
+        missing_sheet_cache = bool(index and any(
+            db.get_dashboard_data_cache(user_id, file_id, f"generic_sheet:{sheet['id']}") is None
+            for sheet in index.get("sheets", [])
+        ))
+        if not index or index.get("version") != GENERIC_CACHE_VERSION or missing_sheet_cache:
+            try:
+                await sync_generic_dashboard_cache(user_id, file_id)
+            except Exception as exc:
+                raise DashboardError(f"同步 WPS 业务表格失败：{exc}") from exc
+            index = db.get_dashboard_data_cache(user_id, file_id, "generic_index") or {}
+        if not index.get("sheets"):
+            raise DashboardError("业务表格缓存不完整，请刷新数据后重试")
+        source = {"file_id": file_id, "file_name": file_row.get("file_name") or file_id}
+        load_generic_sheet = lambda sheet_id: db.get_dashboard_data_cache(
+            user_id, file_id, f"generic_sheet:{sheet_id}"
+        )
+        payload = build_generic_dashboard(
+            index, load_generic_sheet, target, source,
+        )
+        from core.dashboard_planner import apply_design, get_or_create_design
+        design, design_meta = await get_or_create_design(
+            user_id, file_id, source["file_name"], index, load_generic_sheet,
+            force=use_ai,
+            allow_model=use_ai,
+        )
+        payload = apply_design(payload, index, load_generic_sheet, design, design_meta)
+        if use_ai:
+            payload = await _enrich_report_with_llm(user_id, payload)
+        payload["generated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        payload["cached"] = False
+        db.save_dashboard_snapshot(user_id, file_id, view_type, target.isoformat(), payload)
+        return payload
+
+    def current_cache(kind: str) -> dict | None:
+        legacy = db.get_dashboard_data_cache(user_id, file_id, kind)
+        generic = _generic_cache_for_kind(user_id, file_id, kind)
+        if generic and (not legacy or generic.get("synced_at", "") >= legacy.get("synced_at", "")):
+            return generic
+        return legacy
+
+    view_cache = current_cache(view_type)
+    if view_cache is None:
+        # 人员表是可选的；只同步当前专用页，避免每次切换都拉取无关工作表。
         try:
             from core.dashboard_cache import sync_dashboard_cache
-            await sync_dashboard_cache(user_id, file_id, full=True, target_dates=[target])
+            summary = await sync_dashboard_cache(
+                user_id, file_id, full=False, target_dates=[target], kinds={view_type, "people"}
+            )
+            if not summary["ok"]:
+                raise RuntimeError("、".join(summary["errors"]))
         except Exception as exc:
-            raise DashboardError(f"首次同步 WPS 数据失败：{exc}") from exc
+            raise DashboardError(f"同步 WPS {view_type} 数据失败：{exc}") from exc
+        view_cache = current_cache(view_type)
+        just_synced = True
+    else:
+        just_synced = False
 
-    people_cache = db.get_dashboard_data_cache(user_id, file_id, "people") or {}
+    if view_type == "daily" and view_cache and not just_synced and not any(
+        _field_date(_record_fields(record), DATE_ALIASES) == target
+        for record in view_cache.get("records", [])
+    ):
+        # 当前日期不在缓存中时只按该日期补拉，不重新读取全部任务/项目。
+        try:
+            from core.dashboard_cache import sync_dashboard_cache
+            summary = await sync_dashboard_cache(
+                user_id, file_id, full=False, target_dates=[target], kinds={"daily"}
+            )
+            if not summary["ok"]:
+                raise RuntimeError("、".join(summary["errors"]))
+        except Exception as exc:
+            raise DashboardError(f"核对当日 WPS 进展失败：{exc}") from exc
+        view_cache = current_cache(view_type)
+
+    people_cache = current_cache("people") or {}
     lookup = _people_lookup(people_cache.get("records", []))
     source_base = {"file_id": file_id, "file_name": file_row.get("file_name") or file_id}
 
-    def build(kind: str) -> dict:
-        cache = db.get_dashboard_data_cache(user_id, file_id, kind) or {}
-        records = cache.get("records", [])
-        source = {
-            **source_base,
-            "sheet_name": cache.get("sheet_name") or "未找到",
-            "synced_at": cache.get("synced_at") or "",
-        }
-        if kind == "daily":
-            return _daily_payload(records, target, source, lookup)
-        return _work_payload(records, kind, target, source, lookup)
-
+    view_cache = view_cache or {}
+    records = view_cache.get("records", [])
+    source = {
+        **source_base,
+        "sheet_name": view_cache.get("sheet_name") or "未找到",
+        "synced_at": view_cache.get("synced_at") or "",
+    }
     try:
-        if view_type == "daily":
-            payload = build("daily")
-        elif view_type == "tasks":
-            payload = build("tasks")
-        elif view_type == "projects":
-            payload = build("projects")
-        else:
-            daily = build("daily")
-            tasks = build("tasks")
-            projects = build("projects")
-            payload = _overview_payload(daily, tasks, projects, target, source_base)
+        payload = (_daily_payload(records, target, source, lookup) if view_type == "daily"
+                   else _work_payload(records, view_type, target, source, lookup))
     except DashboardError:
         raise
     except Exception as exc:

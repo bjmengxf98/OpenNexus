@@ -1,4 +1,4 @@
-const CACHE_VERSION = 'opennexus-pwa-v5';
+const CACHE_VERSION = 'opennexus-pwa-v6';
 const STATIC_CACHE = `${CACHE_VERSION}-static`;
 const OFFLINE_URL = '/offline';
 const PRECACHE = [

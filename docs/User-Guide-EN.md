@@ -56,9 +56,17 @@ Examples:
 - `What is the current status of Project A?`
 - `Who is on leave today?`
 
-## 5. Department Dashboard
+## 5. Business Intelligence Dashboard
 
-The dashboard contains department overview, daily progress, task, and project views. Daily snapshots can be browsed by date. **Refresh Data** updates the local cache from WPS; **Regenerate Intelligent Analysis** asks the configured model to rebuild the narrative analysis.
+The overview works with any selected WPS multidimensional spreadsheet. It first shows a model-free basic overview. After the user clicks **Redesign and Analyze** and confirms, the configured model selects suitable indicators, charts, and detail tables from the real worksheet names and field schema. The server accepts only existing fields and allowlisted aggregations; every displayed number is calculated locally from cached WPS records. A validated design is cached per user, file, model, and schema and is regenerated after a schema change or an explicit redesign.
+
+The overview is a management summary rather than a field inventory: it keeps at most four KPIs and six indicators in total, removes duplicates, and rejects IDs, account numbers, employee numbers, phone numbers, numeric-looking text, selections, and configuration switches as numeric metrics. WPS record-link IDs are resolved to business labels from the same cached file where possible; cascade fields show their business hierarchy without internal markers such as `Common`.
+
+Dashboard design sends worksheet and field metadata plus fetched counts, not record bodies, to the configured model. Narrative generation for the current page still uses the summarized page data described in the confirmation dialog. Built-in dashboards, freeform paper, instruction pages, and other non-record pages are safely skipped and reported. Daily progress, task, and project tabs remain specialized views that appear only for matching data worksheets; other business files use the model-designed overview. **Refresh Data** updates the local cache from WPS.
+
+Switching files returns to the overview. When opening Daily Progress without a manually chosen date, the dashboard selects the latest cached date for that file. A first read of a new file still requires WPS synchronization; later switches reuse local data where possible. Previously empty daily snapshots are rechecked after cache updates or expiry, without substituting records from another date. Refreshing a specialized view reads only its relevant worksheet(s). If a switched file fails to load, the previous file's dashboard remains hidden so it cannot be mistaken for current data.
+
+A worksheet is paged up to 5,000 records. If WPS cannot provide a continuation token or the limit is reached, the dashboard labels the results as partial; fetched counts must not be interpreted as full-table totals.
 
 ## 6. Smart Reminders
 

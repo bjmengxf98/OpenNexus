@@ -11,6 +11,13 @@ All notable public changes to OpenNexus are recorded here.
 
 ### Changed
 
+- Dashboard summaries now reject identifier-like and nonnumeric fields as numeric indicators, translate WPS link/cascade internals into business labels, deduplicate indicators, and keep the overview to a small set of decision-useful metrics.
+- Model-designed dashboard charts now share an auto-fitting responsive grid with metrics and hints, preventing a variable number of charts from stacking in one narrow column while leaving the other column empty.
+- Dashboard overviews can now use the configured model to create a validated declarative design from real worksheet schemas; calculations remain local, plans are cached per user/file/schema, and model access requires the existing explicit confirmation.
+- Dashboard overview synchronization now reads only WPS database-sheet types, skips and reports dashboards, instruction pages, and other non-record pages, and no longer reveals the previous file's dashboard after a failed file switch.
+- The dashboard now rechecks stale empty daily snapshots, selects the latest cached date for a switched file, and avoids refetching unrelated worksheets when opening or refreshing a specialized view.
+- The dashboard overview now reads every worksheet in the selected WPS multidimensional file and derives record counts, numeric metrics, categorical distributions, and previews from actual fields; task/project/daily tabs appear only for matching sheets, and partial reads are explicitly labeled.
+- The dashboard is presented as `业务智能驾驶舱` across its page, reports, PWA shortcut, help and MCP skill; historical rule-generated snapshots display updated generic labels without rewriting WPS records or saved AI prose.
 - Product-facing name is now `业务智能助手` across login, workspace, PWA, email, MCP metadata, and current help pages; WPS multidimensional spreadsheets remain a supported capability.
 - DeepSeek direct-API presets now use `deepseek-flash`, advertise its 1M context and multimodal capability, preserve legacy model aliases, apply the official default reasoning effort, and retry once without thinking instead of saving an empty response
 - Word generation now validates and normalizes structured sections before rendering; malformed model output is rejected with a retryable receipt and is never uploaded as visible JSON source text

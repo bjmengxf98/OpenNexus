@@ -1,4 +1,4 @@
-"""部门驾驶舱页面与 JSON API。"""
+"""业务智能驾驶舱页面与 JSON API。"""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from auth import db
 from core.dashboard_service import DashboardError, VALID_VIEWS, generate_dashboard
 from core.dashboard_cache import cached_daily_dates, sync_dashboard_cache
+from core.dashboard_generic_cache import sync_generic_dashboard_cache
 
 
 dashboard_router = APIRouter()
@@ -99,9 +100,15 @@ async def dashboard_data(
                 target_date = date.fromisoformat(target)
             except ValueError:
                 target_date = date.today()
-            await sync_dashboard_cache(
-                user["id"], file_id, full=True, target_dates=[target_date]
-            )
+            if view == "overview":
+                await sync_generic_dashboard_cache(user["id"], file_id)
+            else:
+                summary = await sync_dashboard_cache(
+                    user["id"], file_id, full=view != "daily",
+                    target_dates=[target_date], kinds={view, "people"},
+                )
+                if not summary["ok"]:
+                    raise DashboardError("刷新 WPS 数据失败：" + "、".join(summary["errors"]))
         payload = await generate_dashboard(
             user["id"], file_id, view, target,
             force=refresh or ai_summary, use_ai=ai_summary

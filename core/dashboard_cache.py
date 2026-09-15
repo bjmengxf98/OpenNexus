@@ -133,6 +133,7 @@ async def sync_dashboard_cache(
     *,
     full: bool = False,
     target_dates: list[date] | None = None,
+    kinds: set[str] | None = None,
 ) -> dict:
     """同步驾驶舱数据；首次全量，之后只增量拉取近日日报。"""
     key = (user_id, file_id)
@@ -144,11 +145,12 @@ async def sync_dashboard_cache(
         if not sheets:
             raise RuntimeError("WPS 未返回工作表结构")
         db.save_dashboard_data_cache(user_id, file_id, "schema", {"schema": schema, "records": []})
+        wanted = kinds if kinds is not None else {"daily", "people", "tasks", "projects"}
 
         existing_daily = db.get_dashboard_data_cache(user_id, file_id, "daily")
         daily_sheet = _pick(sheets, "daily")
         jobs: list[tuple[str, dict, Any]] = []
-        if daily_sheet:
+        if daily_sheet and "daily" in wanted:
             if full or not existing_daily:
                 jobs.append((
                     "daily", daily_sheet,
@@ -159,6 +161,8 @@ async def sync_dashboard_cache(
                 jobs.append(("daily_incremental", daily_sheet, _load_daily_dates(access_token, file_id, daily_sheet, dates)))
 
         for kind in ("people", "tasks", "projects"):
+            if kind not in wanted:
+                continue
             sheet = _pick(sheets, kind)
             if sheet and (full or not db.get_dashboard_data_cache(user_id, file_id, kind)):
                 jobs.append((kind, sheet, _load_all(access_token, file_id, sheet)))
@@ -186,12 +190,18 @@ async def sync_dashboard_cache(
 
 
 def cached_daily_dates(user_id: int, file_id: str) -> list[str]:
-    from core.dashboard_service import DATE_ALIASES, _field_date, _record_fields
+    from core.dashboard_service import DATE_ALIASES, _field_date, _pick_sheet, _record_fields
 
     cached = db.get_dashboard_data_cache(user_id, file_id, "daily") or {}
+    record_groups = [cached.get("records", [])]
+    index = db.get_dashboard_data_cache(user_id, file_id, "generic_index") or {}
+    sheet = _pick_sheet(index.get("schema_sheets") or [], "daily")
+    if sheet:
+        generic = db.get_dashboard_data_cache(user_id, file_id, f"generic_sheet:{_sheet_id(sheet)}") or {}
+        record_groups.append(generic.get("records", []))
     values = {
         parsed.isoformat()
-        for record in cached.get("records", [])
+        for group in record_groups for record in group
         if (parsed := _field_date(_record_fields(record), DATE_ALIASES))
     }
     return sorted(values, reverse=True)

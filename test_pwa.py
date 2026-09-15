@@ -33,7 +33,7 @@ def test_service_worker_has_safe_offline_and_update_flow():
     assert "sessionStorage.getItem('pwa-install-dismissed')" not in runtime
     assert "controllerchange" in runtime
     assert "checkForUpdate" in runtime
-    assert "opennexus-pwa-v5" in worker
+    assert "opennexus-pwa-v6" in worker
     assert "'/static/pwa.js?v=20260821-1'" in worker
     assert ".then(() => self.skipWaiting())" in worker
     assert "setInterval(()=>reconnect(false),2000)" in offline

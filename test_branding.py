@@ -43,7 +43,7 @@ def test_pwa_and_mcp_display_names_are_consistent():
     assert f'"{PRODUCT}"' in mcp
     assert "我是你的业务智能助手" in app
     assert OLD_NAME not in app
-    assert "opennexus-pwa-v5" in (ROOT / "static" / "service-worker.js").read_text(encoding="utf-8")
+    assert "opennexus-pwa-v6" in (ROOT / "static" / "service-worker.js").read_text(encoding="utf-8")
 
 
 def test_authentication_emails_use_new_brand(monkeypatch):

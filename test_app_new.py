@@ -118,7 +118,7 @@ def test_chat_shows_plan_and_persisted_token_metrics():
 
 def test_user_help_covers_current_major_features():
     required_topics = (
-        "部门智能驾驶舱",
+        "业务智能驾驶舱",
         "智能提醒",
         "个人微信",
         "知识库与长期记忆",

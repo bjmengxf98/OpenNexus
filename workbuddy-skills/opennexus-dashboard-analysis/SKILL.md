@@ -1,7 +1,7 @@
 ---
 name: opennexus-dashboard-analysis
 description: >
-  使用 OpenNexus MCP 获取部门驾驶舱、每日进展、任务分析、项目分析和整体情况的指标、历史日期及快照，并由 WorkBuddy 做进一步解读。用户提到“驾驶舱”“仪表盘”“看某天数据”“整体情况”“任务/项目分析”时使用。
+  使用 OpenNexus MCP 获取业务智能驾驶舱、每日进展、任务分析、项目分析和整体情况的指标、历史日期及快照，并由 WorkBuddy 做进一步解读。用户提到“驾驶舱”“仪表盘”“看某天数据”“整体情况”“任务/项目分析”时使用。
 ---
 
 # OpenNexus 驾驶舱分析
@@ -14,7 +14,7 @@ description: >
    - `view=daily`：每日进展
    - `view=tasks`：任务分析
    - `view=projects`：项目分析
-   - `view=overview`：整体情况
+   - `view=overview`：所选文件全部工作表的通用概览；指标取自实际字段，部分读取必须提示范围。专用视图只适用于对应业务表。
 4. 默认显式设置 `ai_summary=false`，由 WorkBuddy 当前模型分析返回的结构化结果，避免第二次大模型消耗。
 
 ## 数据新鲜度
