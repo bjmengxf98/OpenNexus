@@ -29,6 +29,8 @@ Always review the returned record, event time, reminder time, recipient, and wri
 
 The left sidebar organizes conversations by time and lets you create, rename, switch, or delete a topic. Keeping separate topics for projects, reminders, and policy research improves context quality.
 
+Every turn includes an authoritative Beijing-time calendar for the day before yesterday, yesterday, today, and tomorrow, with full years, dates, and weekdays. The assistant must use these supplied values instead of calculating relative weekdays itself.
+
 The `+` menu supports file upload, attachment mode, conversation clearing, and uploaded-file removal. Images can also be pasted directly into the input box.
 
 The top bar provides the current WPS file selector, connection status, dashboard, help, settings, administration, and sign-out actions. On mobile, less frequent actions move into the drawer.

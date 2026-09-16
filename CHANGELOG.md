@@ -11,6 +11,7 @@ All notable public changes to OpenNexus are recorded here.
 
 ### Changed
 
+- Assistant prompts now include an authoritative Beijing-time calendar for the day before yesterday, yesterday, today, and tomorrow, preventing models from calculating relative weekdays with the wrong year.
 - Dashboard summaries now reject identifier-like and nonnumeric fields as numeric indicators, translate WPS link/cascade internals into business labels, deduplicate indicators, and keep the overview to a small set of decision-useful metrics.
 - Model-designed dashboard charts now share an auto-fitting responsive grid with metrics and hints, preventing a variable number of charts from stacking in one narrow column while leaving the other column empty.
 - Dashboard overviews can now use the configured model to create a validated declarative design from real worksheet schemas; calculations remain local, plans are cached per user/file/schema, and model access requires the existing explicit confirmation.

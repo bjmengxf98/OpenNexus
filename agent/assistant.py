@@ -625,14 +625,38 @@ MEMORY_SUMMARIZE_PROMPT = """你是用户专属记忆管理器，负责维护用
 请输出更新后的完整记忆档案："""
 
 
+def _beijing_calendar_context(now=None) -> str:
+    """生成模型可直接引用的北京时间和相对日期，避免模型自行推算星期。"""
+    from datetime import datetime, timezone, timedelta
+
+    beijing_tz = timezone(timedelta(hours=8))
+    if now is None:
+        current = datetime.now(tz=beijing_tz)
+    elif now.tzinfo is None:
+        current = now.replace(tzinfo=beijing_tz)
+    else:
+        current = now.astimezone(beijing_tz)
+    weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+    def format_day(offset: int) -> str:
+        target = current + timedelta(days=offset)
+        return target.strftime("%Y年%m月%d日") + "（" + weekdays[target.weekday()] + "）"
+
+    return "\n".join([
+        f"北京时间：{format_day(0)} {current.strftime('%H:%M')}",
+        "相对日期日历（必须直接使用，禁止自行换算日期或星期）：",
+        f"- 前天：{format_day(-2)}",
+        f"- 昨天：{format_day(-1)}",
+        f"- 今天：{format_day(0)}",
+        f"- 明天：{format_day(1)}",
+    ])
+
+
 def build_system_prompt(username: str, role: str,
                         default_file: dict | None,
                         all_files: list | None = None,
-                        memory: str = "") -> str:
-    from datetime import datetime, timezone, timedelta
-    now = datetime.now(tz=timezone(timedelta(hours=8)))
-    weekdays = ["周一","周二","周三","周四","周五","周六","周日"]
-    today = now.strftime("%Y年%m月%d日") + "（" + weekdays[now.weekday()] + "）" + now.strftime(" %H:%M")
+                        memory: str = "",
+                        now=None) -> str:
     if not all_files:
         # 兼容只传 default_file 的旧调用
         if default_file:
@@ -678,7 +702,7 @@ def build_system_prompt(username: str, role: str,
         default_header = f"## ⚠️ 当前默认表\n**{_df_name}**（file_id: {_df_id}）\n如用户未指定表格，必须使用此表；如用户明确指定了其他已配置表格，直接使用用户指定的。\n\n"
     else:
         default_header = ""
-    time_header = "## 当前时间\n北京时间：" + today + "\n\n"
+    time_header = "## 当前时间与相对日期\n" + _beijing_calendar_context(now) + "\n\n"
     # 转义用户来源字符串中的 { }，防止 str.format() 将记忆/文件名中的 JSON 花括号误当占位符
     safe_memory_hint = memory_hint.replace("{", "{{").replace("}", "}}")
     safe_file_hint = file_hint.replace("{", "{{").replace("}", "}}")
@@ -2710,9 +2734,8 @@ class Assistant:
                 print(f"[AGENT EVENT] {kind} publish failed: {event_error}")
         from datetime import datetime, timezone, timedelta
         _now = datetime.now(tz=timezone(timedelta(hours=8)))
-        _wd  = ["周一","周二","周三","周四","周五","周六","周日"][_now.weekday()]
-        _today = _now.strftime("%Y年%m月%d日") + "(" + _wd + ")" + _now.strftime(" %H:%M")
-        system_prompt = build_system_prompt(username, role, default_file, all_files, memory)
+        _calendar_context = _beijing_calendar_context(_now)
+        system_prompt = build_system_prompt(username, role, default_file, all_files, memory, now=_now)
         if self.supports_tools and self.smart_tool_routing:
             system_prompt += (
                 "\n\n## Goal-driven tool execution\n"
@@ -2767,7 +2790,7 @@ class Assistant:
         injected = list(_flatten(messages))
         if injected and injected[-1].get("role") == "user":
             injected[-1] = dict(injected[-1])
-            _base = f"[当前北京时间：{_today}]\n{injected[-1]['content']}"
+            _base = f"[当前时间与相对日期基准\n{_calendar_context}]\n{injected[-1]['content']}"
             if _filing_guide:
                 _base += f"\n\n{_filing_guide}"
             injected[-1]["content"] = _base
