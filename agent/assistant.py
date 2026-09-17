@@ -2537,6 +2537,7 @@ class Assistant:
             }
         self.smart_tool_routing = bool(_smart_routing)
         self.last_run_metrics = {}
+        self.last_tool_receipts = []
         self.supports_vision = model_supports_vision(provider, self.model, self.advanced)
         self.reasoning_mode = str(self.advanced.get("reasoning_mode") or "auto").lower()
         self.reasoning_effort = str(self.advanced.get("reasoning_effort") or "auto").lower()
@@ -2701,6 +2702,7 @@ class Assistant:
                    all_files: list = None, memory: str = "",
                    uid: int = 0, conv_id: int = 0,
                    on_agent_event=None) -> str:
+        self.last_tool_receipts = []
         # 兼容旧测试、插件或外部代码通过 Assistant.__new__ 构造的实例；
         # 正常运行时这些值均由 __init__ 从高级配置写入。
         if not hasattr(self, "supports_tools"):
@@ -3817,6 +3819,7 @@ class Assistant:
                 except UnicodeEncodeError:
                     sys.stdout.write(f"[TOOL RESULT] {name} => {str(result)[:200]}\n")
                 _turn_receipts.append({"name": name, "args": args, "result": result})
+                self.last_tool_receipts.append({"name": name, "args": args, "result": result})
                 full_messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,

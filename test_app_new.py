@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from api.app_new_routes import _display_user_text
+from api.app_new_routes import _display_user_text, _public_message_metadata
 
 
 HTML = (Path(__file__).parent / "static" / "app_new.html").read_text(encoding="utf-8")
@@ -91,6 +91,25 @@ def test_history_restore_jumps_to_bottom_without_replaying_smooth_scroll():
 def test_history_hides_parsed_payload_but_keeps_attachment_name():
     saved = "请处理附件\n【文件：汇报材料.docx】\n这里是解析后的长文本"
     assert _display_user_text(saved) == "请处理附件\n📎 汇报材料.docx"
+
+
+def test_history_hides_attachment_mode_server_path_using_upload_metadata():
+    saved = (
+        "附到任务上\n\n[系统提示：用户上传了文件 参数.docx，"
+        "当前对话保留路径为 /srv/private/random.docx。]"
+    )
+    metadata = {
+        "uploads": [{
+            "name": "参数.docx",
+            "path": "/srv/private/random.docx",
+            "status": "pending",
+        }],
+    }
+    assert _display_user_text(saved, metadata) == "附到任务上\n📎 参数.docx"
+    assert "/srv/private" not in _display_user_text(saved, metadata)
+    assert _public_message_metadata("user", metadata) == {
+        "uploads": [{"name": "参数.docx", "status": "pending"}],
+    }
 
 
 def test_chat_turn_can_resume_and_be_cancelled_without_replacing_chat_entrypoint():

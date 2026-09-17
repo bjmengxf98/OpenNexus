@@ -96,6 +96,8 @@ WeCom and WPS messaging can be configured independently. Always confirm recipien
 
 OpenNexus supports common document, spreadsheet, text, PDF, and image formats. An uploaded image is marked for image recognition; Word/PDF and other documents are marked for document processing. Files may be analyzed by the AI or uploaded as WPS record attachments, depending on the selected mode.
 
+If the assistant must clarify the target record, field, or content first, the upload remains attached to the current conversation and can be used in the next turn without asking the user to upload it again. A managed file is removed after a confirmed WPS attachment write, or when the conversation is cleared or deleted. Internal server paths are never displayed in the chat UI.
+
 Generated documents should be reviewed before external distribution.
 
 ## 9. Knowledge and Memory

@@ -7,7 +7,6 @@ from __future__ import annotations
 import asyncio
 import html
 import json
-import os
 import re
 import secrets
 from pathlib import Path
@@ -123,14 +122,40 @@ def _render_markdown(text: str) -> str:
     return _markdown.convert(text or "")
 
 
-def _display_user_text(text: str) -> str:
+def _display_user_text(text: str, metadata: dict | None = None) -> str:
     """历史记录保存的是增强后的全文，展示时隐藏解析内容和服务器路径。"""
     raw = text or ""
-    names = re.findall(r"【(?:文件|图片)：([^】]+)】", raw)
-    visible = re.split(r"\n*【(?:文件|图片)：", raw, maxsplit=1)[0].strip()
+    uploads = (metadata or {}).get("uploads") or []
+    names = [
+        str(item.get("name") or "").strip()
+        for item in uploads if isinstance(item, dict) and item.get("name")
+    ]
+    if not names:
+        names = re.findall(r"【(?:文件|图片)：([^】]+)】", raw)
+        names.extend(re.findall(r"\[系统提示：用户上传了文件 ([^，]+)，", raw))
+    visible = re.split(
+        r"\n*(?:【(?:文件|图片)：|\[系统提示：)", raw, maxsplit=1,
+    )[0].strip()
     lines = [visible] if visible else []
     lines.extend(f"📎 {name}" for name in names)
     return "\n".join(lines) or "已上传附件"
+
+
+def _public_message_metadata(role: str, metadata: dict | None) -> dict:
+    """Remove server-only attachment paths from chat history responses."""
+    public = dict(metadata) if isinstance(metadata, dict) else {}
+    if role != "user" or not isinstance(public.get("uploads"), list):
+        return public
+    public["uploads"] = [
+        {
+            key: item.get(key)
+            for key in ("name", "status", "mode")
+            if item.get(key) is not None
+        }
+        for item in public["uploads"]
+        if isinstance(item, dict)
+    ]
+    return public
 
 
 def _current_user(request: Request):
@@ -228,12 +253,14 @@ async def app_new_messages(conv_id: int, request: Request):
     messages = []
     for row in rows:
         content = row.get("content") or ""
+        role = row.get("role")
+        metadata = row.get("metadata") or {}
         messages.append({
-            "role": row.get("role"),
-            "content": _display_user_text(content) if row.get("role") == "user" else content,
-            "html": "" if row.get("role") == "user" else _render_markdown(content),
+            "role": role,
+            "content": _display_user_text(content, metadata) if role == "user" else content,
+            "html": "" if role == "user" else _render_markdown(content),
             "created_at": row.get("created_at") or "",
-            "metadata": row.get("metadata") or {},
+            "metadata": _public_message_metadata(role, metadata),
         })
     return {"ok": True, "messages": messages}
 
@@ -245,7 +272,12 @@ async def app_new_clear_conversation(conv_id: int, request: Request):
         return JSONResponse({"ok": False, "error": "未登录"}, status_code=401)
     if not db.get_conversation(conv_id, uid):
         return JSONResponse({"ok": False, "error": "会话不存在"}, status_code=404)
+    upload_paths = [
+        item.get("path", "")
+        for item in db.list_conversation_uploads(uid, conv_id)
+    ]
     db.clear_chat_history(uid, conv_id=conv_id)
+    upload_queue.delete_paths(upload_paths)
     return {"ok": True}
 
 
@@ -266,6 +298,13 @@ async def app_new_batch_delete_conversations(request: Request):
     if any(type(item) is not int or item <= 0 for item in raw_ids):
         return JSONResponse({"ok": False, "error": "对话编号必须是正整数"}, status_code=400)
     conversation_ids = list(raw_ids)
+    upload_paths_by_conversation = {
+        conv_id: [
+            item.get("path", "")
+            for item in db.list_conversation_uploads(uid, conv_id)
+        ]
+        for conv_id in conversation_ids
+    }
     try:
         deleted_ids = db.delete_conversations(conversation_ids, uid)
     except PermissionError as exc:
@@ -276,6 +315,11 @@ async def app_new_batch_delete_conversations(request: Request):
     from core.state import user_current_conv
     if int(user_current_conv.get(uid) or 0) in deleted_ids:
         user_current_conv.pop(uid, None)
+    upload_queue.delete_paths(
+        path
+        for conv_id in deleted_ids
+        for path in upload_paths_by_conversation.get(conv_id, [])
+    )
     return {
         "ok": True,
         "deleted_ids": deleted_ids,
@@ -392,7 +436,8 @@ async def app_new_chat(request: Request):
             raise _TurnLeaseLost(current.get("error") or "Turn 租约已失效")
 
     async def worker():
-        pending_cleanup: list[str] = []
+        files_to_send: list[dict] = []
+        uploads_recorded = False
         assistant = None
         heartbeat_task = None
         try:
@@ -450,13 +495,13 @@ async def app_new_chat(request: Request):
                 for file_info in files_to_send:
                     name = file_info["name"]
                     path = file_info["path"]
-                    pending_cleanup.append(path)
                     await emit("file", name=name, status="parsing")
                     if as_attachment:
                         file_contents.append(
-                            f'[系统提示：用户上传了文件 {name}，服务器临时路径为 {path}。'
-                            f'请直接调用 upload_attachment(file_id=..., file_path="{path}", file_name="{name}") '
-                            '将其上传为附件，无需解析内容。]'
+                            f'[系统提示：用户上传了文件 {name}，当前对话保留路径为 {path}。'
+                            f'请直接调用 upload_and_attach(file_id=..., file_path="{path}", file_name="{name}") '
+                            '将其上传为附件，无需解析内容。若需要先向用户确认，后续轮次仍可使用同一路径，'
+                            '不得要求用户重复上传。]'
                         )
                         continue
 
@@ -480,8 +525,8 @@ async def app_new_chat(request: Request):
                     else:
                         file_contents.append(
                             f"【文件：{name}】\n{content}\n"
-                            f'[系统提示：此文件的服务器临时路径为 {path}。'
-                            f'如需上传到 WPS 附件字段，请调用 upload_attachment('
+                            f'[系统提示：此文件的当前对话保留路径为 {path}。'
+                            f'如需上传到 WPS 附件字段，请调用 upload_and_attach('
                             f'file_id=..., file_path="{path}", file_name="{name}")]'
                         )
                     await emit("file", name=name, status="done")
@@ -490,10 +535,42 @@ async def app_new_chat(request: Request):
                 if file_contents:
                     full_text = (text + "\n\n" if text else "") + "\n\n".join(file_contents)
 
+                current_paths = {str(item.get("path") or "") for item in files_to_send}
+                retained_uploads = [
+                    item for item in db.list_conversation_uploads(
+                        uid, conv_id, pending_only=True,
+                    )
+                    if str(item.get("path") or "") not in current_paths
+                    and Path(str(item.get("path") or "")).is_file()
+                ]
+                if retained_uploads:
+                    retained_lines = [
+                        f'- {item.get("name") or Path(item["path"]).name}: {item["path"]}'
+                        for item in retained_uploads
+                    ]
+                    full_text += (
+                        "\n\n[系统提示：本对话仍保留以下尚未完成处理的用户附件，"
+                        "可直接继续使用原路径，不得要求用户重新上传：\n"
+                        + "\n".join(retained_lines) + "\n]"
+                    )
+
                 history_rows = db.get_chat_history(uid, conv_id=conv_id, limit=20)
                 history = [{"role": row["role"], "content": row["content"]} for row in history_rows]
                 history.append({"role": "user", "content": full_text})
-                db.add_chat(uid, "user", full_text, conv_id=conv_id)
+                upload_metadata = [
+                    {
+                        "name": item.get("name", ""),
+                        "path": item.get("path", ""),
+                        "status": "pending",
+                        "mode": "attachment" if as_attachment else "content",
+                    }
+                    for item in files_to_send
+                ]
+                db.add_chat(
+                    uid, "user", full_text, conv_id=conv_id,
+                    metadata={"uploads": upload_metadata} if upload_metadata else None,
+                )
+                uploads_recorded = True
 
                 all_files = db.list_wps_files(uid)
                 default_file = db.get_default_wps_file(uid) or (all_files[0] if all_files else None)
@@ -581,17 +658,30 @@ async def app_new_chat(request: Request):
             await emit("error", message=f"{type(exc).__name__}: {exc}")
             db.update_agent_turn_status(turn_id, uid, "failed", f"{type(exc).__name__}: {exc}")
         finally:
+            # Tool side effects may already have succeeded even when response
+            # generation is cancelled or fails afterwards. Reconcile the
+            # durable receipt before closing the turn so the same attachment
+            # is never offered to WPS twice.
+            for receipt in getattr(assistant, "last_tool_receipts", []) or []:
+                if receipt.get("name") not in {"upload_and_attach", "upload_attachment"}:
+                    continue
+                result = receipt.get("result") or {}
+                args = receipt.get("args") or {}
+                file_path = str(args.get("file_path") or "")
+                if not file_path or not isinstance(result, dict) or result.get("ok") is not True:
+                    continue
+                if db.mark_conversation_upload_status(
+                    uid, conv_id, file_path, "attached",
+                ):
+                    upload_queue.delete_paths([file_path])
             if heartbeat_task:
                 heartbeat_task.cancel()
                 try:
                     await heartbeat_task
                 except asyncio.CancelledError:
                     pass
-            for path in pending_cleanup:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+            if files_to_send and not uploads_recorded:
+                upload_queue.requeue(uid, files_to_send)
             _publish_turn_event(turn_id, {"type": "close"})
 
     task = asyncio.create_task(worker(), name=f"agent-turn:{turn_id}")

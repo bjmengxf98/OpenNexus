@@ -1040,6 +1040,71 @@ def get_chat_history(user_id: int, conv_id: int = None, limit: int = 20) -> list
         return result
 
 
+def list_conversation_uploads(
+    user_id: int,
+    conv_id: int,
+    *,
+    pending_only: bool = False,
+) -> list[dict]:
+    """Return upload metadata retained by user messages in one conversation."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, metadata FROM chat_history "
+            "WHERE user_id=? AND conversation_id=? AND role='user' ORDER BY id",
+            (user_id, conv_id),
+        ).fetchall()
+    uploads: list[dict] = []
+    for row in rows:
+        try:
+            metadata = json.loads(row["metadata"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        for value in metadata.get("uploads") or []:
+            if not isinstance(value, dict) or not value.get("path"):
+                continue
+            item = dict(value)
+            item["message_id"] = row["id"]
+            item.setdefault("status", "pending")
+            if pending_only and item["status"] != "pending":
+                continue
+            uploads.append(item)
+    return uploads
+
+
+def mark_conversation_upload_status(
+    user_id: int,
+    conv_id: int,
+    file_path: str,
+    status: str,
+) -> bool:
+    """Update one retained upload after a confirmed attachment tool result."""
+    changed = False
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, metadata FROM chat_history "
+            "WHERE user_id=? AND conversation_id=? AND role='user'",
+            (user_id, conv_id),
+        ).fetchall()
+        for row in rows:
+            try:
+                metadata = json.loads(row["metadata"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            uploads = metadata.get("uploads") or []
+            row_changed = False
+            for item in uploads:
+                if isinstance(item, dict) and str(item.get("path") or "") == str(file_path):
+                    item["status"] = status
+                    row_changed = True
+                    changed = True
+            if row_changed:
+                conn.execute(
+                    "UPDATE chat_history SET metadata=? WHERE id=?",
+                    (json.dumps(metadata, ensure_ascii=False, default=str), row["id"]),
+                )
+    return changed
+
+
 def clear_chat_history(user_id: int, conv_id: int = None):
     with get_conn() as conn:
         if conv_id is not None:

@@ -990,10 +990,7 @@ async def api_upload_temp(request: Request, file: UploadFile):
     if not uid:
         return JSONResponse({"ok": False, "error": "未登录"})
     suffix = Path(file.filename).suffix
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=tempfile.gettempdir())
-    tmp.write(await file.read())
-    tmp.close()
-    _uq.enqueue(uid, file.filename, tmp.name)
+    _uq.store(uid, file.filename, await file.read())
     icons = {".pdf": "📄", ".docx": "📝", ".doc": "📝", ".xlsx": "📊", ".xls": "📊",
              ".png": "🖼️", ".jpg": "🖼️", ".jpeg": "🖼️", ".webp": "🖼️",
              ".txt": "📃", ".md": "📃"}
@@ -1070,12 +1067,17 @@ async def api_delete_conversation(conv_id: int, request: Request):
     uid = request.session.get("uid")
     if not uid:
         return JSONResponse({"ok": False}, status_code=401)
+    upload_paths = [
+        item.get("path", "")
+        for item in db.list_conversation_uploads(uid, conv_id)
+    ]
     try:
         db.delete_conversation(conv_id, uid)
     except PermissionError as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
     except RuntimeError as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
+    _uq.delete_paths(upload_paths)
     return JSONResponse({"ok": True})
 
 
