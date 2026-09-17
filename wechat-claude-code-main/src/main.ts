@@ -5,11 +5,16 @@ import { join } from 'node:path';
 import { unlinkSync, writeFileSync, mkdirSync } from 'node:fs';
 import { createServer } from 'node:http';
 
-import { WeChatApi, TokenExpiredError } from './wechat/api.js';
+import {
+  ContextUnavailableError,
+  WeChatApi,
+  TokenExpiredError,
+} from './wechat/api.js';
 import { saveAccount, loadAccount, loadLatestAccount, type AccountData } from './wechat/accounts.js';
 import { startQrLogin, waitForQrScan } from './wechat/login.js';
 import { createMonitor, type MonitorCallbacks } from './wechat/monitor.js';
 import { createSender } from './wechat/send.js';
+import { createOutboundStateStore } from './wechat/outbound-state.js';
 import { downloadImage, extractText, extractFirstImageUrl } from './wechat/media.js';
 import { createSessionStore, type Session } from './session.js';
 import { createPermissionBroker } from './permission.js';
@@ -193,11 +198,13 @@ async function runDaemon(accountId?: string, port?: number): Promise<void> {
   }
 
   const sender = createSender(api, account.accountId);
-  const sharedCtx = { lastContextToken: '' };
+  const outboundStore = createOutboundStateStore(account.accountId);
+  const instanceId = process.env.OPENNEXUS_WECHAT_INSTANCE_ID || '';
   const activeControllers = new Map<string, AbortController>();
   const permissionBroker = createPermissionBroker(async () => {
     try {
-      await sender.sendText(account.userId ?? '', sharedCtx.lastContextToken, '⏰ 权限请求超时，已自动拒绝。');
+      const contextToken = outboundStore.getContext(account.userId ?? '')?.token ?? '';
+      await sender.sendText(account.userId ?? '', contextToken, '⏰ 权限请求超时，已自动拒绝。');
     } catch {
       logger.warn('Failed to send permission timeout message');
     }
@@ -207,19 +214,26 @@ async function runDaemon(accountId?: string, port?: number): Promise<void> {
 
   const callbacks: MonitorCallbacks = {
     onMessage: async (msg: WeixinMessage) => {
-      await handleMessage(msg, account, session, sessionStore, permissionBroker, sender, config, sharedCtx, activeControllers, api);
+      await handleMessage(
+        msg, account, session, sessionStore, permissionBroker, sender, config,
+        outboundStore, activeControllers, api,
+      );
     },
     onSessionExpired: () => {
-      logger.warn('Session expired, will keep retrying...');
+      logger.warn('Session expired or taken over; rescan is required');
+      outboundStore.clearContext(account.userId ?? '');
       console.error('⚠️ 微信会话已过期，请重新运行 setup 扫码绑定');
-      // 用自己的 bot 给自己发一条提醒（过期前最后一次机会）
-      sender.sendText(account.userId, '', '⚠️ 你的微信连接已过期，请登录系统设置页重新扫码绑定。').catch(() => {});
       // 通知 app.py token 已过期
       const apiBaseUrl = (config.apiUrl || 'http://127.0.0.1:8000').replace(/\/+$/, '');
       fetch(`${apiBaseUrl}/api/weixin/session_expired`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ accountId: account.accountId, userId: account.userId }),
+        body: JSON.stringify({
+          accountId: account.accountId,
+          userId: account.userId,
+          instanceId,
+          token: config.apiToken || '',
+        }),
       }).catch(() => {});
       // 退出进程，让 app.py 感知到进程死了
       setTimeout(() => process.exit(1), 2000);
@@ -251,11 +265,16 @@ async function runDaemon(accountId?: string, port?: number): Promise<void> {
     // must not be reported as successful merely because the child process was
     // spawned: it may have exited immediately (for example, on a port clash).
     if (req.method === 'GET' && req.url === '/health') {
+      const primaryContext = outboundStore.getContext(account.userId ?? '');
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({
         ok: true,
         accountId: account.accountId,
         userId: account.userId,
+        instanceId,
+        activated: Boolean(primaryContext),
+        contextUpdatedAt: primaryContext?.updatedAt ?? null,
+        pendingCount: outboundStore.listPending(account.userId ?? '').length,
       }));
       return;
     }
@@ -265,23 +284,69 @@ async function runDaemon(accountId?: string, port?: number): Promise<void> {
     let body = '';
     req.on('data', (chunk) => { body += chunk; });
     req.on('end', async () => {
+      let to = '';
+      let text = '';
+      let queueIfInactive = false;
       try {
         const data = JSON.parse(body);
         if (localSendToken && data.token !== localSendToken) {
           res.writeHead(401); res.end(JSON.stringify({ error: 'unauthorized' })); return;
         }
-        const { to, text } = data;
+        to = typeof data.to === 'string' ? data.to.trim() : '';
+        text = typeof data.text === 'string' ? data.text.trim() : '';
+        queueIfInactive = data.queueIfInactive === true;
         if (!to || !text) {
           res.writeHead(400); res.end(JSON.stringify({ error: 'missing to or text' })); return;
         }
-        await sender.sendText(to, '', text);
-        console.log(`[本地发送] 已发送给 ${to}`);
-        res.writeHead(200); res.end(JSON.stringify({ ok: true }));
+        const context = outboundStore.getContext(to);
+        if (!context) {
+          if (queueIfInactive) outboundStore.enqueue(to, text);
+          res.writeHead(queueIfInactive ? 202 : 409, {
+            'Content-Type': 'application/json; charset=utf-8',
+          });
+          res.end(JSON.stringify({
+            ok: false,
+            queued: queueIfInactive,
+            code: 'wechat_activation_required',
+            error: queueIfInactive
+              ? '微信已连接，但主动消息尚未激活；消息已暂存。请先在微信中向助手发送一条消息，系统随后自动补发。'
+              : '微信已连接，但主动消息尚未激活；请先在微信中向助手发送一条消息。',
+          }));
+          return;
+        }
+        // Interactive/API sends fail fast on rate limiting. OpenNexus owns the
+        // retry policy and must not block one request for 70+ seconds here.
+        const receipt = await sender.sendText(to, context.token, text, { maxRetries: 0 });
+        if (!receipt.confirmed) {
+          res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({
+            ok: false,
+            code: 'delivery_unconfirmed',
+            error: '微信服务接受了请求，但没有返回消息编号，无法确认手机已收到。',
+          }));
+          return;
+        }
+        console.log(`[本地发送] 已确认发送给 ${to} messageId=${receipt.messageId}`);
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, messageId: receipt.messageId }));
       } catch (e) {
         if (e instanceof TokenExpiredError) {
           console.error('⚠️ sendMessage token expired, triggering session expired handler');
           callbacks.onSessionExpired();
           res.writeHead(401); res.end(JSON.stringify({ error: 'token_expired' }));
+        } else if (e instanceof ContextUnavailableError && to) {
+          if (queueIfInactive) outboundStore.enqueue(to, text);
+          res.writeHead(queueIfInactive ? 202 : 409, {
+            'Content-Type': 'application/json; charset=utf-8',
+          });
+          res.end(JSON.stringify({
+            ok: false,
+            queued: queueIfInactive,
+            code: 'wechat_send_deferred',
+            error: queueIfInactive
+              ? '微信暂时拒绝发送（可能是限流或会话状态波动）；消息已暂存。系统不会清除已保存的会话，可稍后重试；若持续失败，可从微信发送一条消息刷新会话。'
+              : '微信暂时拒绝发送（可能是限流或会话状态波动）。系统不会清除已保存的会话，请稍后重试；若持续失败，可从微信发送一条消息刷新会话。',
+          }));
         } else {
           res.writeHead(500); res.end(JSON.stringify({ error: String(e) }));
         }
@@ -307,7 +372,7 @@ async function handleMessage(
   permissionBroker: ReturnType<typeof createPermissionBroker>,
   sender: ReturnType<typeof createSender>,
   config: ReturnType<typeof loadConfig>,
-  sharedCtx: { lastContextToken: string },
+  outboundStore: ReturnType<typeof createOutboundStateStore>,
   activeControllers: Map<string, AbortController>,
   api: WeChatApi,
 ): Promise<void> {
@@ -317,7 +382,33 @@ async function handleMessage(
 
   const contextToken = msg.context_token ?? '';
   const fromUserId = msg.from_user_id;
-  sharedCtx.lastContextToken = contextToken;
+  if (contextToken) {
+    outboundStore.rememberContext(fromUserId, contextToken);
+    for (const pending of outboundStore.listPending(fromUserId)) {
+      try {
+        const receipt = await sender.sendText(
+          fromUserId,
+          contextToken,
+          pending.text,
+          { maxRetries: 0 },
+        );
+        outboundStore.removePending(pending.id);
+        logger.info('Queued interactive WeChat message flushed', {
+          toUserId: fromUserId,
+          pendingId: pending.id,
+          confirmed: receipt.confirmed,
+          messageId: receipt.messageId,
+        });
+      } catch (error) {
+        logger.warn('Queued interactive WeChat message flush failed', {
+          toUserId: fromUserId,
+          pendingId: pending.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        break;
+      }
+    }
+  }
 
   // Extract text from items
   const userText = extractTextFromItems(msg.item_list);

@@ -21,6 +21,18 @@ export class TokenExpiredError extends Error {
   }
 }
 
+export class ContextUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ContextUnavailableError';
+  }
+}
+
+export interface SendMessageReceipt {
+  messageId?: string;
+  confirmed: boolean;
+}
+
 export class WeChatApi {
   private readonly token: string;
   private readonly baseUrl: string;
@@ -103,8 +115,8 @@ export class WeChatApi {
   }
 
   /** Send a message to a user. Supports both old `ret` and current responses. */
-  async sendMessage(req: SendMessageReq): Promise<void> {
-    const MAX_RETRIES = 3;
+  async sendMessage(req: SendMessageReq, maxRetries: number = 3): Promise<SendMessageReceipt> {
+    const MAX_RETRIES = Math.max(0, Math.min(3, maxRetries));
     const TOKEN_EXPIRED_CODES = [11, -13, -14];
     let delay = 10_000;
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
@@ -122,8 +134,10 @@ export class WeChatApi {
       }
       if (code === -2) {
         if (attempt === MAX_RETRIES) {
-          logger.warn('sendMessage rate-limited after max retries', { attempts: MAX_RETRIES });
-          throw new Error(`sendMessage rate-limited after ${MAX_RETRIES + 1} attempts`);
+          logger.warn('sendMessage context unavailable or throttled', { attempts: MAX_RETRIES });
+          throw new ContextUnavailableError(
+            `sendMessage context unavailable or throttled after ${MAX_RETRIES + 1} attempts`,
+          );
         }
         logger.warn('sendMessage rate-limited (ret:-2), retrying', { attempt, delayMs: delay });
         await new Promise(r => setTimeout(r, delay));
@@ -138,8 +152,10 @@ export class WeChatApi {
       if (res.message_id === undefined && code === undefined) {
         throw new Error('sendMessage returned neither message_id nor status');
       }
-      return;
+      const messageId = res.message_id === undefined ? undefined : String(res.message_id);
+      return { messageId, confirmed: Boolean(messageId) };
     }
+    throw new Error('sendMessage retry loop exited unexpectedly');
   }
 
   /** Get a presigned upload URL for media files. */

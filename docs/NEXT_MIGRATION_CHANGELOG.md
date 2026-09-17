@@ -54,6 +54,9 @@
 | STABLE-20260915-06 | 2026-09-15 | `342ba4f` | P2 | 不定数量驾驶舱图表响应式均衡排列 | 待迁移 | 待定 |
 | STABLE-20260915-07 | 2026-09-15 | `342ba4f` | P1 | 驾驶舱字段语义门禁、关联值解码与核心指标精简 | 待迁移 | 待定 |
 | STABLE-20260916-01 | 2026-09-16 | `0380904` | P1 | 模型相对日期与星期权威日历注入 | 待迁移 | 待定 |
+| STABLE-20260916-02 | 2026-09-16 | 待提交 | P1 | 提醒过期门禁与有限重试 | 待迁移 | 待定 |
+| STABLE-20260916-03 | 2026-09-16 | 待提交 | P1 | 个人微信多部署单一连接与桥接隔离 | 待迁移 | 待定 |
+| STABLE-20260917-01 | 2026-09-17 | 待提交 | P1 | 个人微信会话激活、上下文持久化与主动发送真值门禁 | 待迁移 | 待定 |
 
 ## 5. 单项记录模板
 
@@ -442,6 +445,69 @@
 - 稳定版验证：时间上下文、工具规划与工具治理专项 31 项通过；20 份稳定版离线回归测试共 174 项通过，仅有 1 条既有 Pydantic forward-reference 警告。固定时钟测试覆盖 2026-09-16 周三及前后相对日期，相关 Python 文件通过编译。
 - 建议迁移方式：按新版架构重新实现统一 `Clock`/`RelativeDateContext` 服务，不直接复制稳定版提示词拼接。
 - 新版落点建议：所有智能体、提醒解析和报告生成共享同一个注入时钟；以固定时钟测试跨年、月末、闰年、夏令时无关性和中文相对日期，业务输出引用系统解析后的 ISO 日期而不是模型自行计算。
+- 新版实现提交：待定
+- 新版验收证据：待定
+- 备注：本记录只反映稳定版，不表示 `OpenNexus-Next` 已同步；本次未修改新项目。
+
+### STABLE-20260916-02：提醒过期门禁与有限重试
+
+- 日期：2026-09-16
+- 稳定版分支：`codex/main-release-20260827`
+- 稳定版提交：待提交
+- 优先级：P1
+- 新版状态：待迁移
+- 修改原因：提醒队列原先只按 `remind_at <= 当前时间` 取数，失败后长期保留并以最长 60 分钟间隔无限重试；个人微信桥接恢复或服务重启时会把历史积压提醒重新发送。
+- 用户可见行为：个人微信短时断线仍会退避重试；普通定时提醒超过原定时间 30 分钟、提前提醒已经晚于独立事项时间，或累计发送失败达到 5 次后自动过期，不再补发。过期原因可在投递审计中追溯。
+- 涉及文件：`app.py`、`auth/db.py`、`test_reminders.py`、`docs/用户帮助.md`、`docs/User-Guide-EN.md`、`CHANGELOG.md`、`DEVLOG.md`、`docs/NEXT_MIGRATION_CHANGELOG.md`。
+- 数据库变化：无表结构迁移；复用 `reminders.retry_count`、`reminders.remind_at`、`reminders.event_at` 与既有 `reminder_delivery_log`。过期记录先以 `status=expired` 写入审计，再从待发送队列删除。
+- API 或事件协议变化：无外部 API 变化；`mark_reminder_failed` 内部返回值由无返回改为累计失败次数，现有忽略返回值的调用保持兼容。
+- 配置、环境变量或依赖变化：无；稳定版内置最大迟到 30 分钟、最大失败 5 次。
+- 权限、副作用和兼容性：只处理当前提醒队列，不修改 WPS 数据、用户绑定或已经成功的投递记录。部署重启后，既有过期积压在下一次符合扫描条件时记录为过期并删除，不调用任何通知通道；仍处于 30 分钟窗口且未达到次数上限的提醒继续正常重试。
+- 稳定版验证：提醒与微信专项 43 项通过；20 份稳定版离线回归测试共 180 项通过，仅有 1 条既有 Pydantic 警告和 1 条当前沙箱的 pytest 缓存目录警告。相关 Python 文件通过编译。
+- 建议迁移方式：在新项目按新版边界重新实现，不直接复制稳定版 lifespan 调度代码。
+- 新版落点建议：建立类型化 `ReminderPolicy`、`ReminderRepository` 和幂等 `DeliveryWorker`；把补发窗口、事项截止、最大次数、租户隔离、并发领取、终态审计及可配置策略写入契约测试。
+- 新版实现提交：待定
+- 新版验收证据：待定
+- 备注：本记录只反映稳定版，不表示 `OpenNexus-Next` 已同步；本次未修改新项目。
+
+### STABLE-20260916-03：个人微信多部署单一连接与桥接隔离
+
+- 日期：2026-09-16
+- 稳定版分支：`codex/main-release-20260827`
+- 稳定版提交：待提交
+- 优先级：P1
+- 新版状态：待迁移
+- 修改原因：服务器稳定版、本地稳定版和 V2 曾共用 `~/.wechat-claude-code/accounts`、相同低位端口，并扫描 3001–3010 寻找桥接，导致一个系统可能杀掉、重启或借用另一个系统的个人微信进程；Node 限流重试和模型二次调用还会让测试消息等待很久并可能重复发送。
+- 用户可见行为：每个 OpenNexus 部署只使用自己的微信凭据目录、端口段和实例标识。同一个个人微信在另一个系统重新扫码后，原连接失效，原系统停止自动恢复并要求重新扫码；不会借用另一个系统的在线桥接。交互发送限流时快速失败，同一智能体轮次最多尝试发送一次。
+- 涉及文件：`app.py`、`agent/assistant.py`、`core/wechat_delivery.py`、`core/wechat_instance.py`、`core/mcp_server.py`、`.env.example`、`wechat-claude-code-main/src/config.ts`、`src/logger.ts`、`src/main.ts`、`src/wechat/accounts.ts`、`src/wechat/api.ts`、`src/wechat/send.ts`、`test_wechat_delivery.py`、`test_wechat_instance.py`、`test_wechat_qr.py`、`docs/用户帮助.md`、`docs/User-Guide-EN.md`、`CHANGELOG.md`、`DEVLOG.md`、`docs/NEXT_MIGRATION_CHANGELOG.md`。
+- 数据库变化：无。
+- API 或事件协议变化：桥接 `GET /health` 新增 `instanceId`；桥接调用 `POST /api/weixin/session_expired` 时新增 `instanceId`，稳定版拒绝不属于当前实例的回调，并在已配置内部令牌时校验回调令牌；凭据删除只接受安全的账号文件名；`POST /local/send` 在限流或发送错误时立即返回，不再在 Node 内部等待 10/20/40 秒重试。现有外部个人微信通知 API 路径不变。
+- 配置、环境变量或依赖变化：新增可选 `OPENNEXUS_WECHAT_INSTANCE_ID`、`OPENNEXUS_WECHAT_DATA_DIR`、`OPENNEXUS_WECHAT_PORT_BASE`、`OPENNEXUS_WECHAT_PORT_COUNT`、`OPENNEXUS_INTERNAL_URL`。没有新增依赖；桥接源码更新后必须执行 `npm run build`。
+- 权限、副作用和兼容性：旧公共目录中的微信凭据不自动迁移，升级后每个需要微信能力的部署必须重新扫码一次。当前实例只清理自己的失效凭据，不触碰其他系统目录。跨服务器接管依赖微信服务使旧 token 失效；若上游未来允许同一账号同时维持多个 token，新版还需用中心租约实现严格全局单活。
+- 稳定版验证：Python 语法检查通过；TypeScript `npm run build` 通过；微信实例、投递、二维码、监护、提醒和工具路由专项 75 项通过；排除 4 个既有脚本式或失效测试入口后，其余稳定版自动化回归 187 项通过。未修改或启动 V2，未部署服务器。
+- 建议迁移方式：按新版架构重新实现，不直接复制稳定版全局变量、lifespan 监护或端口映射代码。
+- 新版落点建议：建立类型化 `WechatConnectionLease`、部署实例身份、加密凭据存储和桥接进程适配器。连接租约应以租户与微信账号为键，支持原子接管、撤销旧持有者、心跳、终态审计、幂等发送和跨主机协调；对 `/health`、接管事件和发送回执建立契约测试。
+- 新版实现提交：待定
+- 新版验收证据：待定
+- 备注：本记录只反映稳定版，不表示 `OpenNexus-Next` 已同步；本次未修改新项目。
+
+### STABLE-20260917-01：个人微信会话激活、上下文持久化与主动发送真值门禁
+
+- 日期：2026-09-17
+- 稳定版分支：`codex/main-release-20260827`
+- 稳定版提交：待提交
+- 优先级：P1
+- 新版状态：待迁移
+- 修改原因：个人微信桥接原本以“微信入站、智能体回复”为主，入站消息虽然携带 `context_token`，稳定版却只把它放在内存变量中；`POST /local/send` 主动发送始终传空令牌，并把部分仅受理或无消息编号的响应报告为成功，导致扫码后系统显示 `ok:true` 而手机未收到，只有用户先从微信发一句后才可能恢复。
+- 用户可见行为：设置页现在区分“桥接已连接”和“主动消息已激活”。扫码后用户需从微信向助手发送任意一句话完成首次激活；最新上下文按桥接账号和联系人持久化，进程重启后可以恢复，且不会因为长时间没有微信入站而由 OpenNexus 主动过期。未激活时，设置页测试消息和智能体明确要求的即时个人微信最多暂存 30 分钟，收到该联系人的首条微信后自动补发；界面和工具会明确说明“尚未发送”，不再误报成功。定时提醒和业务 webhook 不进入该队列，继续遵守各自的过期与重试规则。
+- 涉及文件：`app.py`、`agent/assistant.py`、`core/mcp_server.py`、`core/wechat_delivery.py`、`static/settings_new.html`、`wechat-claude-code-main/src/main.ts`、`src/wechat/api.ts`、`src/wechat/send.ts`、`src/wechat/outbound-state.ts`、`src/tests/outbound-state.test.ts`、`test_wechat_delivery.py`、`test_wechat_qr.py`、中英文帮助、`CHANGELOG.md`、`DEVLOG.md`。
+- 数据库变化：无；桥接在当前部署的 `WCC_DATA_DIR/outbound-state/<accountId>.json` 保存每联系人最新上下文和短期待发消息，非 Windows 系统沿用现有存储器的 0600 文件权限。
+- API 或事件协议变化：桥接 `GET /health` 新增 `activated`、`contextUpdatedAt`、`pendingCount`；`POST /local/send` 新增可选 `queueIfInactive`，未激活返回 `202/409`、`code=wechat_activation_required`，已保存上下文遭遇模糊限流或临时波动返回 `202/409`、`code=wechat_send_deferred` 且不清除上下文，未取得消息编号返回 `502`、`code=delivery_unconfirmed`，确认成功时返回 `messageId`。设置页状态与测试接口透传激活和暂存语义。
+- 配置、环境变量或依赖变化：无新增依赖或环境变量；桥接 TypeScript 修改后必须执行 `npm run build`，部署主程序和桥接均需重启。
+- 权限、副作用和兼容性：上下文令牌只在本部署、同一 bot 账号、同一联系人范围内使用，不写日志、不跨账号复用，也不设置静默超时；每次微信入站只会刷新它。只有整个登录会话明确过期或被另一部署接管时才清除；上游 `ret=-2` 同时可能表示限流或临时状态波动，因此不得据此删除上下文。暂存仅对调用方显式启用的交互消息生效，按接收人和正文去重，最多保存 50 条且 30 分钟自动清理；定时提醒默认不暂存，避免与提醒数据库重试叠加或补发历史消息。扫码后第一次主动发送仍受上游个人微信协议约束，需要一次微信入站激活。
+- 稳定版验证：TypeScript 编译通过；Node 会话状态测试 3 项通过；23 份稳定版离线 Python 回归共 191 项通过，另有 1 条既有 Pydantic forward-reference 警告；最终微信、设置页和实例隔离专项 38 项通过；相关 Python 文件通过编译，设置页 3 个内联脚本通过 Node 语法解析，`git diff --check` 通过。新增测试覆盖上下文跨重启恢复、账号/联系人隔离、待发去重与过期、连接但未激活状态、202 暂存回执及源码不再传空上下文。既有脚本式 `test_wps_api.py` 在 Python 3.14 下会关闭 pytest 捕获流，未纳入离线回归，与本次微信修改无关。
+- 建议迁移方式：按新版架构重新实现，不直接复制稳定版 Node 进程内 HTTP 服务。
+- 新版落点建议：建立类型化 `WechatConversationCapability`、加密上下文存储、`DeliveryReceipt` 和带 TTL/幂等键的交互待发箱；把“连接、激活、已受理、已确认、未知、失败”建模为不同状态，并以官方主动通知通道承接必须保证送达的业务消息。
 - 新版实现提交：待定
 - 新版验收证据：待定
 - 备注：本记录只反映稳定版，不表示 `OpenNexus-Next` 已同步；本次未修改新项目。

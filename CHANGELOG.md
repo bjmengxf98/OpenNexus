@@ -11,6 +11,9 @@ All notable public changes to OpenNexus are recorded here.
 
 ### Changed
 
+- Personal-WeChat outbound delivery now persists the latest per-account conversation context without an inactivity timeout, distinguishes connected from activated, refuses false success without a confirmed message ID, and can hold only explicitly interactive messages for up to 30 minutes until the user sends the first WeChat message; scheduled reminders are never placed in this bridge queue, and ambiguous upstream throttling no longer erases a valid saved context.
+- Personal-WeChat bridges are now isolated per OpenNexus deployment by credential directory, port range, and instance identity; a process never borrows another checkout's bridge, takeover or token expiry stops automatic restart and requires a new QR scan, while interactive sends fail fast and are attempted at most once per assistant turn.
+- Reminder delivery now expires messages more than 30 minutes late, past their separate event time, or after five failed attempts; terminal expiry is audited and historical backlog is not replayed after WeChat reconnects.
 - Assistant prompts now include an authoritative Beijing-time calendar for the day before yesterday, yesterday, today, and tomorrow, preventing models from calculating relative weekdays with the wrong year.
 - Dashboard summaries now reject identifier-like and nonnumeric fields as numeric indicators, translate WPS link/cascade internals into business labels, deduplicate indicators, and keep the overview to a small set of decision-useful metrics.
 - Model-designed dashboard charts now share an auto-fitting responsive grid with metrics and hints, preventing a variable number of charts from stacking in one narrow column while leaving the other column empty.

@@ -12,6 +12,11 @@ from pathlib import Path
 DB_PATH = Path(__file__).parent.parent / "data" / "app.db"
 BEIJING_TZ = timezone(timedelta(hours=8))
 
+# 只在有限窗口内补发定时提醒，避免微信桥接恢复或服务重启后发送历史积压。
+# 有独立事项时间时，该时间也是硬截止；失败重试同样不得无限持续。
+REMINDER_MAX_LATE_MINUTES = 30
+REMINDER_MAX_RETRIES = 5
+
 
 def beijing_now() -> datetime:
     """返回明确的北京时间，不依赖服务器操作系统时区。"""
@@ -1991,7 +1996,11 @@ def get_due_reminders(now: datetime | None = None) -> list:
     返回所有已到期的提醒（remind_at <= 当前本地时间）。
     调用方在推送后负责调用 delete_reminder 删除记录。
     """
-    now_text = (now or beijing_now()).strftime("%Y-%m-%d %H:%M:%S")
+    current = now or beijing_now()
+    now_text = current.strftime("%Y-%m-%d %H:%M:%S")
+    late_cutoff_text = (
+        current - timedelta(minutes=REMINDER_MAX_LATE_MINUTES)
+    ).strftime("%Y-%m-%d %H:%M:%S")
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT r.id, r.user_id, r.content, r.remind_at, r.event_at, "
@@ -1999,11 +2008,54 @@ def get_due_reminders(now: datetime | None = None) -> list:
             "       u.weixin_id, u.personal_weixin_id, u.display_name "
             "FROM reminders r JOIN users u ON u.id = r.user_id "
             "WHERE r.remind_at <= ? "
-            "  AND (r.next_retry_at IS NULL OR r.next_retry_at = '' "
+            "  AND (r.retry_count >= ? "
+            "       OR datetime(r.remind_at) < datetime(?) "
+            "       OR (datetime(r.event_at) > datetime(r.remind_at) "
+            "           AND datetime(r.event_at) < datetime(?)) "
+            "       OR r.next_retry_at IS NULL OR r.next_retry_at = '' "
             "       OR r.next_retry_at <= ?)",
-            (now_text, now_text),
+            (
+                now_text,
+                REMINDER_MAX_RETRIES,
+                late_cutoff_text,
+                now_text,
+                now_text,
+            ),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def reminder_expiry_reason(
+    reminder: dict,
+    now: datetime | None = None,
+) -> str:
+    """返回提醒不应再投递的原因；空字符串表示仍可尝试投递。"""
+    current = now or beijing_now()
+    retry_count = int(reminder.get("retry_count") or 0)
+    if retry_count >= REMINDER_MAX_RETRIES:
+        return f"已达到最大重试次数（{REMINDER_MAX_RETRIES}次）"
+
+    remind_text = str(reminder.get("remind_at") or "").strip()
+    event_text = str(reminder.get("event_at") or "").strip()
+    try:
+        remind_at = datetime.strptime(remind_text, "%Y-%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return "提醒时间无效"
+    try:
+        event_at = (
+            datetime.strptime(event_text, "%Y-%m-%d %H:%M")
+            if event_text else None
+        )
+    except (TypeError, ValueError):
+        return "事项时间无效"
+
+    # 提前提醒不得在事项发生后补发。event_at == remind_at 表示普通定时提醒，
+    # 仍允许在下方的短时窗口内处理瞬时网络故障。
+    if event_at and event_at > remind_at and current > event_at:
+        return "事项时间已过"
+    if current > remind_at + timedelta(minutes=REMINDER_MAX_LATE_MINUTES):
+        return f"已超过允许补发时限（{REMINDER_MAX_LATE_MINUTES}分钟）"
+    return ""
 
 
 def delete_reminder(reminder_id: int) -> None:
@@ -2016,8 +2068,8 @@ def mark_reminder_failed(
     reminder_id: int,
     error: str,
     now: datetime | None = None,
-) -> None:
-    """记录推送失败并安排退避重试；提醒不会因通道临时故障而丢失。"""
+) -> int:
+    """记录推送失败并安排退避重试，返回累计失败次数。"""
     retry_delays = (1, 5, 15, 30, 60)
     with get_conn() as conn:
         row = conn.execute(
@@ -2025,7 +2077,7 @@ def mark_reminder_failed(
             (reminder_id,),
         ).fetchone()
         if not row:
-            return
+            return 0
         retry_count = int(row["retry_count"] or 0) + 1
         delay_minutes = retry_delays[min(retry_count - 1, len(retry_delays) - 1)]
         next_retry_at = (now or beijing_now()) + timedelta(minutes=delay_minutes)
@@ -2042,13 +2094,15 @@ def mark_reminder_failed(
                 reminder_id,
             ),
         )
+        return retry_count
 
 
 def cleanup_legacy_reminders() -> int:
     """
     删除旧格式记录（event_at 为空）。
 
-    已过触发时间但尚未确认送达的新格式提醒必须保留，由调度器继续重试。
+    新格式提醒由调度器按统一的补发窗口和最大重试次数判定，过期时先写入
+    投递审计再删除，不能在这里静默清理。
     返回删除的行数。
     """
     with get_conn() as conn:

@@ -631,6 +631,90 @@ class ReminderDatabaseTests(unittest.TestCase):
         self.assertEqual([row["id"] for row in due], [reminder_id])
         self.assertEqual(due[0]["personal_weixin_id"], "wx-test")
 
+    def test_stale_reminder_bypasses_future_backoff_for_expiry_cleanup(self):
+        reminder_id = db.add_reminder(
+            2,
+            "昨天的提醒",
+            "2026-09-15 09:00",
+            event_at="2026-09-15 09:00",
+        )
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE reminders SET next_retry_at = ? WHERE id = ?",
+                ("2026-09-16 10:00:00", reminder_id),
+            )
+
+        due = db.get_due_reminders(now=datetime(2026, 9, 16, 9, 0))
+
+        self.assertEqual([row["id"] for row in due], [reminder_id])
+        self.assertIn(
+            "补发时限",
+            db.reminder_expiry_reason(
+                due[0], now=datetime(2026, 9, 16, 9, 0)
+            ),
+        )
+
+    def test_recent_due_reminder_remains_deliverable(self):
+        reminder = {
+            "remind_at": "2026-09-16 09:00",
+            "event_at": "2026-09-16 09:00",
+            "retry_count": 1,
+        }
+        self.assertEqual(
+            db.reminder_expiry_reason(
+                reminder, now=datetime(2026, 9, 16, 9, 20)
+            ),
+            "",
+        )
+
+    def test_old_due_reminder_expires_instead_of_being_replayed(self):
+        reminder = {
+            "remind_at": "2026-09-15 09:00",
+            "event_at": "2026-09-15 09:00",
+            "retry_count": 0,
+        }
+        self.assertIn(
+            "补发时限",
+            db.reminder_expiry_reason(
+                reminder, now=datetime(2026, 9, 16, 9, 0)
+            ),
+        )
+
+    def test_advance_reminder_expires_after_event_time(self):
+        reminder = {
+            "remind_at": "2026-09-16 13:30",
+            "event_at": "2026-09-16 14:00",
+            "retry_count": 1,
+        }
+        self.assertIn(
+            "事项时间已过",
+            db.reminder_expiry_reason(
+                reminder, now=datetime(2026, 9, 16, 14, 1)
+            ),
+        )
+
+    def test_reminder_stops_after_maximum_retries(self):
+        reminder = {
+            "remind_at": "2026-09-16 09:00",
+            "event_at": "2026-09-16 10:00",
+            "retry_count": db.REMINDER_MAX_RETRIES,
+        }
+        self.assertIn(
+            "最大重试次数",
+            db.reminder_expiry_reason(
+                reminder, now=datetime(2026, 9, 16, 9, 5)
+            ),
+        )
+
+    def test_failed_delivery_returns_accumulated_retry_count(self):
+        reminder_id = db.add_reminder(2, "测试提醒", "2026-09-16 09:00")
+        count = db.mark_reminder_failed(
+            reminder_id,
+            "微信桥接离线",
+            now=datetime(2026, 9, 16, 9, 0),
+        )
+        self.assertEqual(count, 1)
+
     def test_delivery_result_survives_reminder_deletion(self):
         reminder_id = db.add_reminder(
             2, "测试审计", "2026-08-04 08:00", event_at="2026-08-04 09:00"

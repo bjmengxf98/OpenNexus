@@ -3033,6 +3033,7 @@ class Assistant:
         _context_recovery_attempts = 0
         _task_create_success = False
         _task_create_verified = False
+        _weixin_send_attempted = False
         _task_create_error = ""
         _task_create_target: tuple[str, str] | None = None
         _task_create_marker = ""
@@ -3529,96 +3530,96 @@ class Assistant:
                                 webhook_url, args["text"], wecom_uid
                             )
                     elif name == "send_weixin_message":
-                        import httpx as _httpx
+                        from core.wechat_delivery import deliver_personal_weixin as _deliver_weixin
                         from auth.db import get_user_by_username as _db_get_user_by_uname
                         from auth.db import get_user_by_display_name as _db_get_user_by_dname
                         from auth.db import get_personal_weixin_id as _db_get_pwid
                         from auth.db import get_user_by_id as _db_get_user_by_id
                         to_uname = args.get("to_username", "")
-                        target_user = _db_get_user_by_uname(to_uname)
-                        if not target_user:
-                            target_user = _db_get_user_by_dname(to_uname)
-                        if not target_user:
-                            result = {"error": f"用户 {to_uname} 不存在"}
+                        if _weixin_send_attempted:
+                            result = {
+                                "error": (
+                                    "本轮已经尝试发送微信。为避免重复消息，系统不会自动重发；"
+                                    "请稍后明确要求重试。"
+                                )
+                            }
                         else:
-                            pwid = _db_get_pwid(dict(target_user)["id"])
-                            if not pwid:
-                                pwid = dict(target_user).get("weixin_id", "")
-                            if not pwid:
-                                result = {"error": f"用户 {to_uname} 未设置个人微信ID，请让对方在设置页填写"}
+                            target_user = _db_get_user_by_uname(to_uname)
+                            if not target_user:
+                                target_user = _db_get_user_by_dname(to_uname)
+                            if not target_user:
+                                result = {"error": f"用户 {to_uname} 不存在"}
                             else:
-                                # 拼发件人真实姓名前缀
-                                sender_user = _db_get_user_by_id(uid) if uid else None
-                                if sender_user:
-                                    sender_name = dict(sender_user).get("display_name") or dict(sender_user).get("username") or username
+                                pwid = _db_get_pwid(dict(target_user)["id"])
+                                if not pwid:
+                                    pwid = dict(target_user).get("weixin_id", "")
+                                if not pwid:
+                                    result = {
+                                        "error": (
+                                            f"用户 {to_uname} 未设置个人微信ID，"
+                                            "请让对方在设置页填写"
+                                        )
+                                    }
                                 else:
-                                    sender_name = username
-                                text_with_sender = f"【来自 {sender_name}】{args['text']}"
-                                local_token = _db_get_system_config("weixin_bot_token", "")
-                                try:
-                                    import app as _app
-                                    # 不能在目标映射缺失时轮询其他用户的桥接；多账号环境下
-                                    # 会把消息交给错误/已过期的 bot。先用内存映射，再通过
-                                    # /health 核对桥接实际加载的个人微信 userId。
-                                    candidate_ports = []
-                                    mapped_port = _app._wechat_port_map.get(pwid)
-                                    if mapped_port:
-                                        candidate_ports.append(mapped_port)
-                                    candidate_ports.extend(_app._wechat_port_map.values())
-                                    candidate_ports.extend(range(3001, 3011))
-                                    candidate_ports = list(dict.fromkeys(candidate_ports))
-
-                                    import asyncio as _asyncio
-                                    async with _httpx.AsyncClient(timeout=90, trust_env=False) as _client:
-                                        exact_ports = []
-                                        for _port in candidate_ports:
-                                            try:
-                                                _health = await _client.get(
-                                                    f"http://127.0.0.1:{_port}/health",
-                                                    timeout=1.0,
-                                                )
-                                                _health_data = _health.json() if _health.status_code == 200 else {}
-                                                if (_health_data.get("ok") is True
-                                                        and _health_data.get("userId") == pwid):
-                                                    exact_ports.append(_port)
-                                            except Exception:
-                                                continue
-
-                                        if not exact_ports:
-                                            result = {"error": f"用户 {to_uname} 的微信桥接未运行或账号不匹配"}
+                                    sender_user = _db_get_user_by_id(uid) if uid else None
+                                    if sender_user:
+                                        sender_name = (
+                                            dict(sender_user).get("display_name")
+                                            or dict(sender_user).get("username")
+                                            or username
+                                        )
+                                    else:
+                                        sender_name = username
+                                    text_with_sender = f"【来自 {sender_name}】{args['text']}"
+                                    local_token = _db_get_system_config(
+                                        "weixin_bot_token", ""
+                                    )
+                                    _weixin_send_attempted = True
+                                    try:
+                                        import app as _app
+                                        delivery = await _deliver_weixin(
+                                            pwid,
+                                            text_with_sender,
+                                            local_token,
+                                            _app._wechat_port_map,
+                                            attempts=1,
+                                            expected_instance_id=(
+                                                _app._WECHAT_SETTINGS.instance_id
+                                            ),
+                                            queue_if_inactive=True,
+                                        )
+                                        if delivery.get("ok") is True:
+                                            display = (
+                                                dict(target_user).get("display_name")
+                                                or to_uname
+                                            )
+                                            result = {
+                                                "ok": True,
+                                                "message": (
+                                                    f"已成功发送微信消息给 {display}"
+                                                ),
+                                            }
+                                        elif delivery.get("queued") is True:
+                                            result = {
+                                                "error": (
+                                                    "个人微信主动消息尚未激活，本条消息"
+                                                    "已短期暂存但尚未发送。请让接收人"
+                                                    "在微信中先向助手发送一条消息，"
+                                                    "系统会自动补发。"
+                                                ),
+                                                "queued": True,
+                                            }
                                         else:
-                                            result = {"error": "微信桥接未返回发送结果"}
-                                        for _port in exact_ports:
-                                            for _retry in range(3):
-                                                try:
-                                                    _resp = await _client.post(
-                                                        f"http://127.0.0.1:{_port}/local/send",
-                                                        json={"to": pwid, "text": text_with_sender, "token": local_token},
-                                                    )
-                                                    try:
-                                                        _resp_data = _resp.json()
-                                                    except Exception:
-                                                        _resp_data = {}
-                                                    if _resp.status_code == 200 and _resp_data.get("ok") is True:
-                                                        display = dict(target_user).get("display_name") or to_uname
-                                                        result = {"ok": True, "message": f"已成功发送微信消息给 {display}"}
-                                                    else:
-                                                        _detail = (_resp_data.get("error") or _resp.text or "桥接返回空错误").strip()
-                                                        result = {"error": f"发送失败（端口 {_port}，HTTP {_resp.status_code}）：{_detail}"}
-                                                    print(
-                                                        f"[WEIXIN TOOL] target={to_uname!r} weixin={pwid!r} "
-                                                        f"port={_port} status={_resp.status_code} ok={result.get('ok', False)}"
-                                                    )
-                                                    break
-                                                except Exception as _re:
-                                                    if _retry < 2:
-                                                        await _asyncio.sleep(1)
-                                                    else:
-                                                        result = {"error": f"连接微信桥接失败: {_re}"}
-                                            if result.get("ok"):
-                                                break
-                                except Exception as _e:
-                                    result = {"error": f"连接微信桥接失败: {_e}"}
+                                            result = {
+                                                "error": (
+                                                    "微信发送失败："
+                                                    f"{delivery.get('error') or '当前实例未连接微信'}"
+                                                )
+                                            }
+                                    except Exception as exc:
+                                        result = {
+                                            "error": f"连接微信桥接失败：{exc}"
+                                        }
                     elif name == "add_reminder":
                         if not uid:
                             result = {"error": "无法获取用户ID，提醒设置失败"}

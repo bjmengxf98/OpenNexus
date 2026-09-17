@@ -78,11 +78,17 @@ OpenNexus distinguishes the event time from the notification time.
 - A meeting time without a reminder time normally gets a reasonable advance reminder.
 - Travel-related events consider route, transport, preparation, and buffer time; missing departure details should trigger a clarification.
 
-After creation, verify both times. You can list, adjust, or cancel reminders in natural language. Delivery failures remain pending for retry and must not be reported as successful.
+After creation, verify both times. You can list, adjust, or cancel reminders in natural language. Delivery failures use short backoff retries and must not be reported as successful. A reminder expires without delivery when it is more than 30 minutes late, past its separate event time, or has failed five times, so a restarted or reconnected WeChat bridge cannot replay historical reminders.
 
 ## 7. Notifications and Personal WeChat
 
 Personal-WeChat binding is available under **Settings → Personal WeChat**. One OpenNexus account should bind one personal-WeChat account. This bridge is experimental and may be affected by platform rules or token expiry.
+
+A successful QR scan means that the bridge is logged in, not that proactive delivery is ready. The personal-WeChat bridge obtains conversation context from an inbound WeChat message, so send any message to the assistant once after scanning. Settings reports connection and proactive-message activation separately instead of treating login as delivery readiness.
+
+When inactive, an explicitly requested interactive send or Settings test can be held for up to 30 minutes and is flushed after the first inbound WeChat message. Scheduled reminders never enter this bridge queue; they keep their own lateness and retry expiry rules so stale reminders are not replayed.
+
+A personal-WeChat account should have only one active OpenNexus owner at a time. Server Stable, local Stable, V2, and other deployments keep separate credentials, port ranges, and instance identities; they never borrow another deployment's bridge. Scanning the same account in another deployment invalidates the previous connection. The previous deployment stops without automatically taking the account back and must be scanned again before reuse. After upgrading to deployment-scoped storage, scan once in each deployment that should own a connection. A failed interactive send is not automatically repeated in the same assistant turn.
 
 WeCom and WPS messaging can be configured independently. Always confirm recipients before sending external messages.
 
@@ -123,8 +129,9 @@ Administrators can manage users, roles, feedback, the shared knowledge base, spr
 - **WPS disconnected or expired:** reconnect WPS and confirm the OAuth callback URL.
 - **Wrong file:** check the top file selector and the default file setting.
 - **AI says complete but data did not change:** verify the tool result and refresh WPS; a textual claim is not proof of a successful write.
-- **Reminder not received:** check reminder status, channel binding, bridge process, and retry logs.
-- **Personal WeChat failed:** verify that the bound account matches the running bridge process and rebind if the session expired.
+- **Reminder not received:** check reminder status, channel binding, bridge process, and retry logs. Short outages are retried, but stale or repeatedly failed reminders expire instead of being replayed after reconnection.
+- **Personal WeChat failed:** verify that the bound account matches the running bridge process and that this deployment was scanned independently. If the same account was scanned in another OpenNexus deployment, the old connection is intentionally invalidated and must be scanned again here.
+- **Connected but proactive messages are inactive:** send any message from the phone to the assistant once. OpenNexus persists the latest conversation context across restarts and does not time it out merely because no inbound WeChat message arrives. The 30-minute limit applies only to an interactive message waiting to be flushed, not to an established conversation. Stored context is cleared only when the whole WeChat login session is explicitly expired or taken over by another deployment; ambiguous throttling or transient upstream state does not erase it, and an unconfirmed API response is never reported as delivered.
 - **Image/PDF not recognized:** configure a supported vision model and ensure the upload type is correct.
 - **Dashboard is stale:** use Refresh Data and inspect WPS authorization/cache logs.
 - **MCP needs authentication:** use the complete one-time token with the `Bearer` prefix.

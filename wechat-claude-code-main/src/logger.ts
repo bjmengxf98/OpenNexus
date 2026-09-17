@@ -1,8 +1,8 @@
 import { mkdirSync, appendFileSync, readdirSync, unlinkSync, statSync, truncateSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { homedir } from "node:os";
+import { DATA_DIR } from "./constants.js";
 
-const LOG_DIR = join(homedir(), ".wechat-claude-code", "logs");
+const LOG_DIR = join(DATA_DIR, "logs");
 const MAX_LOG_FILES = 3;                  // 只保留最近3天
 const MAX_LOG_BYTES = 50 * 1024 * 1024;  // 单文件最大50MB
 

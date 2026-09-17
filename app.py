@@ -32,6 +32,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response as StarletteResponse
 from core import upload_queue as _uq
 from core.wechat_supervisor import WechatRestartSupervisor
+from core.wechat_instance import resolve_wechat_instance_settings
 
 
 def _short_text_llm_kwargs(llm_row: dict) -> dict:
@@ -129,12 +130,18 @@ from auth.wps_oauth import (
 )
 from core.mcp_server import mcp_server, mcp_http_app
 from core.reminder_text import format_reminder_push_text
-from core.wechat_delivery import deliver_personal_weixin, probe_personal_weixin_bridge
+from core.wechat_delivery import (
+    deliver_personal_weixin,
+    inspect_personal_weixin_bridge,
+    probe_personal_weixin_bridge,
+)
 from core.tool_governance import normalize_requested_scopes, scope_options
 
 # ── PWA 图标生成 ───────────────────────────────────────────
 
 _APP_DIR = Path(__file__).parent  # app.py 所在目录，无论从哪里启动都正确
+_WECHAT_SETTINGS = resolve_wechat_instance_settings(_APP_DIR)
+_WECHAT_SETTINGS.data_root.mkdir(parents=True, exist_ok=True)
 
 def _generate_pwa_icons():
     """首次启动时生成 PWA 图标，需要 Pillow"""
@@ -222,12 +229,12 @@ _wechat_proc: subprocess.Popen | None = None
 _wechat_procs: list = []  # 多账号进程列表
 _wechat_port_map: dict = {}  # weixin_id -> port
 _wechat_proc_map: dict = {}  # weixin_id -> proc
+_wechat_revoked_ids: set[str] = set()  # token失效/被其他实例接管后禁止重启
 
 
 def _launch_wechat_bridge(node_main: Path, wechat_dir: Path, account_id: str,
                           port: int, show_log: bool = False):
     """启动可选微信桥接，并保留有限大小的诊断日志。"""
-    data_dir = str(Path.home() / ".wechat-claude-code" / "instances" / account_id)
     log_path = None
     log_handle = None
     if not show_log:
@@ -252,7 +259,10 @@ def _launch_wechat_bridge(node_main: Path, wechat_dir: Path, account_id: str,
             cwd=str(wechat_dir),
             stdout=None if show_log else log_handle,
             stderr=None if show_log else subprocess.STDOUT,
-            env={**os.environ, "WCC_DATA_DIR": data_dir},
+            env=_WECHAT_SETTINGS.child_env(
+                os.environ,
+                api_token=db.get_system_config("weixin_bot_token", ""),
+            ),
         )
     finally:
         if log_handle is not None:
@@ -306,6 +316,7 @@ async def _lifespan(app_):
     _mcp_lifecycle = mcp_server.session_manager.run()
     await _mcp_lifecycle.__aenter__()
     global _wechat_proc, _wechat_procs, _wechat_port_map, _wechat_proc_map
+    global _wechat_revoked_ids
     show_log = os.environ.get("WECHAT_SHOW_LOG", "0") == "1"
     _wechat_restart_supervisor = WechatRestartSupervisor(
         base_delay=30, max_delay=600, max_failures=5, stable_seconds=300,
@@ -316,7 +327,7 @@ async def _lifespan(app_):
         if node_main.exists():
             try:
                 import json as _json
-                accounts_dir = Path.home() / ".wechat-claude-code" / "accounts"
+                accounts_dir = _WECHAT_SETTINGS.accounts_dir
                 account_files = list(accounts_dir.glob("*.json")) if accounts_dir.exists() else []
 
                 # 按 userId 去重，同一个 userId 只保留最新文件，删掉旧的
@@ -365,41 +376,49 @@ async def _lifespan(app_):
                 deduped = valid_deduped
 
                 if deduped:
-                    # 先杀掉占用 3001+ 端口的残留 node 进程
+                    # 每个部署只在自己的端口范围内启动桥接。遇到占用时跳过，
+                    # 绝不能杀死或借用另一个 OpenNexus 实例的进程。
                     import socket as _sock
-                    for _p in range(3001, 3001 + len(deduped)):
-                        try:
-                            _s = _sock.create_connection(("127.0.0.1", _p), timeout=0.3)
-                            _s.close()
-                            # 端口被占，找到对应 pid 并杀掉
-                            import psutil as _psutil
-                            for _proc_info in _psutil.process_iter(['pid', 'name']):
-                                try:
-                                    for _conn in _proc_info.connections():
-                                        if _conn.laddr.port == _p:
-                                            _proc_info.terminate()
-                                            break
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
-                    port = 3001
+                    available_ports = iter(_WECHAT_SETTINGS.ports)
                     for uid_wx, af in deduped:
+                        port = None
+                        for candidate in available_ports:
+                            with _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM) as probe:
+                                try:
+                                    probe.bind(("127.0.0.1", candidate))
+                                    port = candidate
+                                    break
+                                except OSError:
+                                    continue
+                        if port is None:
+                            print(
+                                f"[WeChat] 本实例端口范围已用尽，账号 {af.stem} "
+                                "保持断开，请检查 OPENNEXUS_WECHAT_PORT_BASE"
+                            )
+                            continue
                         account_id = af.stem
                         proc, bridge_log = _launch_wechat_bridge(
                             node_main, wechat_dir, account_id, port, show_log,
                         )
                         _wechat_procs.append(proc)
                         if uid_wx:
+                            _wechat_revoked_ids.discard(uid_wx)
                             _wechat_port_map[uid_wx] = port
                             _wechat_proc_map[uid_wx] = proc
                             _wechat_restart_supervisor.record_started(uid_wx, proc.pid)
                         _log_hint = f", log={bridge_log}" if bridge_log else ""
-                        print(f"[WeChat] 已启动账号 {account_id} (pid={proc.pid}, port={port}{_log_hint})")
-                        port += 1
-                    _wechat_proc = _wechat_procs[0]
+                        print(
+                            f"[WeChat] 已启动本实例账号 {account_id} "
+                            f"(instance={_WECHAT_SETTINGS.instance_id}, "
+                            f"pid={proc.pid}, port={port}{_log_hint})"
+                        )
+                    if _wechat_procs:
+                        _wechat_proc = _wechat_procs[0]
                 else:
-                    print("[WeChat] 未找到账号文件，请在设置页扫码绑定")
+                    print(
+                        "[WeChat] 当前部署未绑定个人微信，请在设置页扫码绑定 "
+                        f"(instance={_WECHAT_SETTINGS.instance_id})"
+                    )
             except Exception as e:
                 print(f"[WeChat] 启动失败: {e}")
         else:
@@ -421,6 +440,15 @@ async def _lifespan(app_):
                     exit_code = proc.poll()
                     if exit_code is None:
                         continue
+                    if uid_wx in _wechat_revoked_ids:
+                        _wechat_proc_map.pop(uid_wx, None)
+                        _wechat_port_map.pop(uid_wx, None)
+                        if proc in _wechat_procs:
+                            _wechat_procs.remove(proc)
+                        print(
+                            f"[WeChat] 账号已失效或被其他实例接管，不再自动重启: {uid_wx}"
+                        )
+                        continue
                     decision = _wechat_restart_supervisor.observe_exit(
                         uid_wx, proc.pid, exit_code,
                     )
@@ -439,7 +467,7 @@ async def _lifespan(app_):
                     if decision.action != "restart":
                         continue
                     try:
-                        accounts_dir = Path.home() / ".wechat-claude-code" / "accounts"
+                        accounts_dir = _WECHAT_SETTINGS.accounts_dir
                         account_files = list(accounts_dir.glob("*.json")) if accounts_dir.exists() else []
                         matched_file = None
                         for af in account_files:
@@ -454,7 +482,7 @@ async def _lifespan(app_):
                         if matched_file is None or not node_main.exists():
                             raise FileNotFoundError("账号文件或微信桥接程序不存在")
                         account_id = matched_file.stem
-                        port = _wechat_port_map.get(uid_wx, 3001)
+                        port = _wechat_port_map.get(uid_wx, _WECHAT_SETTINGS.port_base)
                         new_proc, bridge_log = _launch_wechat_bridge(
                             node_main,
                             _APP_DIR / "wechat-claude-code-main",
@@ -500,6 +528,8 @@ async def _lifespan(app_):
             delete_reminder as _del_reminder,
             mark_reminder_failed as _mark_failed,
             log_reminder_delivery as _log_delivery,
+            reminder_expiry_reason as _expiry_reason,
+            REMINDER_MAX_RETRIES as _max_retries,
         )
         first_scan = True
         while True:
@@ -521,6 +551,20 @@ async def _lifespan(app_):
                     display = row.get("display_name") or ""
 
                     event_at = row.get("event_at", "")
+                    expired_reason = _expiry_reason(row)
+                    if expired_reason:
+                        _log_delivery(
+                            rid, row["user_id"], remind_at, event_at,
+                            "wechat" if weixin_id else "wps",
+                            weixin_id or display, "expired", expired_reason,
+                        )
+                        _del_reminder(rid)
+                        print(
+                            f"[REMINDER] rid={rid} expired without delivery: "
+                            f"{expired_reason}"
+                        )
+                        continue
+
                     push_text = format_reminder_push_text(content, event_at, remind_at)
                     pushed = False
                     delivery_channel = ""
@@ -536,6 +580,8 @@ async def _lifespan(app_):
                             push_text,
                             local_token,
                             _wechat_port_map,
+                            attempts=1,
+                            expected_instance_id=_WECHAT_SETTINGS.instance_id,
                         )
                         if _delivery.get("ok") is True:
                             pushed = True
@@ -578,13 +624,32 @@ async def _lifespan(app_):
                         _del_reminder(rid)
                     else:
                         error_text = "; ".join(push_errors) or "no active delivery channel"
-                        _mark_failed(rid, error_text)
-                        _log_delivery(
-                            rid, row["user_id"], remind_at, event_at,
-                            "wechat" if weixin_id else "wps",
-                            weixin_id or display, "failed", error_text,
-                        )
-                        print(f"[REMINDER] rid={rid} delivery failed, retained for retry: {error_text}")
+                        retry_count = _mark_failed(rid, error_text)
+                        if retry_count >= _max_retries:
+                            terminal_detail = (
+                                f"{error_text}; 已达到最大重试次数"
+                                f"（{_max_retries}次）"
+                            )
+                            _log_delivery(
+                                rid, row["user_id"], remind_at, event_at,
+                                "wechat" if weixin_id else "wps",
+                                weixin_id or display, "expired", terminal_detail,
+                            )
+                            _del_reminder(rid)
+                            print(
+                                f"[REMINDER] rid={rid} stopped retrying: "
+                                f"{terminal_detail}"
+                            )
+                        else:
+                            _log_delivery(
+                                rid, row["user_id"], remind_at, event_at,
+                                "wechat" if weixin_id else "wps",
+                                weixin_id or display, "failed", error_text,
+                            )
+                            print(
+                                f"[REMINDER] rid={rid} delivery failed, "
+                                f"retained for retry: {error_text}"
+                            )
             except Exception as _ex:
                 print(f"[REMINDER] scheduler error: {_ex}")
 
@@ -2067,21 +2132,25 @@ async def _send_webhook_notifications(file_id: str, action: str, records: list, 
         uid = user.get("id")
         email = user.get("email", "")
 
-        # 个人微信通知
+        # 个人微信通知：只允许本部署持有的桥接，禁止借用其他实例。
         personal_wx = db.get_personal_weixin_id(uid) if uid else ""
         if personal_wx:
             try:
-                async with _httpx.AsyncClient(timeout=10) as _c:
-                    local_token = db.get_system_config("weixin_bot_token", "")
-                    port_candidates = list(_wechat_port_map.values()) if _wechat_port_map else [3001]
-                    for port in port_candidates:
-                        resp = await _c.post(
-                            f"http://127.0.0.1:{port}/local/send",
-                            json={"to": personal_wx, "text": notify_text, "token": local_token},
-                        )
-                        if resp.status_code == 200:
-                            print(f"[WEBHOOK NOTIFY] weixin ok -> {username}")
-                            break
+                delivery = await deliver_personal_weixin(
+                    personal_wx,
+                    notify_text,
+                    db.get_system_config("weixin_bot_token", ""),
+                    _wechat_port_map,
+                    attempts=1,
+                    expected_instance_id=_WECHAT_SETTINGS.instance_id,
+                )
+                if delivery.get("ok") is True:
+                    print(f"[WEBHOOK NOTIFY] weixin ok -> {username}")
+                else:
+                    print(
+                        f"[WEBHOOK NOTIFY] weixin failed -> {username}: "
+                        f"{delivery.get('error') or '当前实例未连接'}"
+                    )
             except Exception as e:
                 print(f"[WEBHOOK NOTIFY] weixin failed -> {username}: {e}")
 
@@ -2710,7 +2779,7 @@ async def weixin_qrcode(request: Request):
     """返回微信扫码二维码图片"""
     if not request.session.get("uid"):
         return JSONResponse({"error": "未登录"}, status_code=401)
-    qr_path = Path.home() / ".wechat-claude-code" / "qrcode.png"
+    qr_path = _WECHAT_SETTINGS.qr_path
     if qr_path.exists():
         from fastapi.responses import FileResponse
         return FileResponse(str(qr_path), media_type="image/png")
@@ -2733,7 +2802,7 @@ async def weixin_start_setup(request: Request):
             _wechat_setup_proc.terminate()
         except Exception:
             pass
-    qr_path = Path.home() / ".wechat-claude-code" / "qrcode.png"
+    qr_path = _WECHAT_SETTINGS.qr_path
     if qr_path.exists():
         qr_path.unlink()
     _wechat_qr_url = ""
@@ -2752,6 +2821,10 @@ async def weixin_start_setup(request: Request):
             encoding="utf-8",
             bufsize=1,
             errors="replace",
+            env=_WECHAT_SETTINGS.child_env(
+                os.environ,
+                api_token=db.get_system_config("weixin_bot_token", ""),
+            ),
         )
     except FileNotFoundError:
         _wechat_setup_proc = None
@@ -2817,19 +2890,24 @@ async def _activate_wechat_binding(uid: int, new_account_id: str, new_weixin_id:
             except OSError:
                 return False
 
-    new_port = 3001
-    while new_port <= 3099 and not _port_is_free(new_port):
-        new_port += 1
-    if new_port > 3099:
-        return False, "微信桥接端口已用尽，请重启服务后重试"
-
-    data_dir = str(Path.home() / ".wechat-claude-code" / "instances" / new_account_id)
+    new_port = next(
+        (port for port in _WECHAT_SETTINGS.ports if _port_is_free(port)),
+        None,
+    )
+    if new_port is None:
+        return False, (
+            "当前部署的微信桥接端口范围已用尽；"
+            "请检查 OPENNEXUS_WECHAT_PORT_BASE 后重试"
+        )
     proc = subprocess.Popen(
         ["node", str(node_main), "--account", new_account_id, "--port", str(new_port)],
         cwd=str(wechat_dir),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        env={**os.environ, "WCC_DATA_DIR": data_dir},
+        env=_WECHAT_SETTINGS.child_env(
+            os.environ,
+            api_token=db.get_system_config("weixin_bot_token", ""),
+        ),
     )
 
     bridge_ready = False
@@ -2846,7 +2924,8 @@ async def _activate_wechat_binding(uid: int, new_account_id: str, new_weixin_id:
                 health_data = health.json() if health.status_code == 200 else {}
                 if (health_data.get("ok") is True
                         and health_data.get("accountId") == new_account_id
-                        and health_data.get("userId") == new_weixin_id):
+                        and health_data.get("userId") == new_weixin_id
+                        and health_data.get("instanceId") == _WECHAT_SETTINGS.instance_id):
                     bridge_ready = True
                     break
                 bridge_error = (
@@ -2880,6 +2959,7 @@ async def _activate_wechat_binding(uid: int, new_account_id: str, new_weixin_id:
         _wechat_proc_map.pop(stale_id, None)
         _wechat_port_map.pop(stale_id, None)
 
+    _wechat_revoked_ids.discard(new_weixin_id)
     _wechat_procs.append(proc)
     _wechat_proc = proc
     _wechat_port_map[new_weixin_id] = new_port
@@ -2889,7 +2969,7 @@ async def _activate_wechat_binding(uid: int, new_account_id: str, new_weixin_id:
 
     # 只清理当前用户旧微信或同一微信的历史 bot 凭据。其他用户的
     # 账号文件必须保留。这样每个系统用户最终只有一个活动微信桥接。
-    accounts_dir = Path.home() / ".wechat-claude-code" / "accounts"
+    accounts_dir = _WECHAT_SETTINGS.accounts_dir
     if accounts_dir.exists():
         import json as _json
         for account_file in accounts_dir.glob("*.json"):
@@ -2904,7 +2984,10 @@ async def _activate_wechat_binding(uid: int, new_account_id: str, new_weixin_id:
             except Exception as cleanup_error:
                 print(f"[WeChat] stale credential cleanup skipped: {account_file.name}: {cleanup_error}")
     print(f"[WeChat] binding activated user={uid} account={new_account_id} weixin={new_weixin_id} port={new_port}")
-    return True, "绑定成功，微信桥接已连接并通过自检"
+    return True, (
+        "绑定成功，微信桥接已连接。请先在微信中向助手发送一条消息，"
+        "完成主动通知激活。"
+    )
 
 
 @fastapi_app.get("/api/weixin/setup_status")
@@ -2914,7 +2997,7 @@ async def weixin_setup_status(request: Request):
     uid = request.session.get("uid")
     if not uid:
         return JSONResponse({"error": "未登录"}, status_code=401)
-    qr_path = Path.home() / ".wechat-claude-code" / "qrcode.png"
+    qr_path = _WECHAT_SETTINGS.qr_path
     if _wechat_setup_proc:
         ret = _wechat_setup_proc.poll()
         if ret is None:
@@ -2965,17 +3048,31 @@ async def weixin_delivery_status(request: Request):
             "ok": True, "bound": False, "connected": False,
             "message": "尚未绑定个人微信",
         })
-    port, error = await probe_personal_weixin_bridge(
-        personal_weixin_id, _wechat_port_map,
+    bridge = await inspect_personal_weixin_bridge(
+        personal_weixin_id,
+        _wechat_port_map,
+        expected_instance_id=_WECHAT_SETTINGS.instance_id,
     )
-    connected = port is not None
+    connected = bool(bridge.get("connected"))
+    activated = bool(bridge.get("activated"))
+    if connected and activated:
+        status_message = "微信桥接在线，主动消息通道已激活"
+    elif connected:
+        status_message = (
+            "微信桥接在线，但主动消息尚未激活；"
+            "请先在微信中向助手发送一条消息"
+        )
+    else:
+        status_message = str(bridge.get("error") or "微信桥接不可用")
     return JSONResponse({
         "ok": True,
         "bound": True,
         "connected": connected,
+        "activated": activated,
         "personal_weixin_id": _masked_weixin_id(personal_weixin_id),
-        "port": port,
-        "message": "微信桥接在线，可以接收提醒" if connected else error,
+        "port": bridge.get("port"),
+        "pending_count": bridge.get("pending_count", 0),
+        "message": status_message,
     })
 
 
@@ -2994,13 +3091,24 @@ async def weixin_delivery_test(request: Request):
         "✅ OpenNexus 微信提醒测试成功。今后的定时提醒会通过此通道发送。",
         local_token,
         _wechat_port_map,
+        attempts=1,
+        expected_instance_id=_WECHAT_SETTINGS.instance_id,
+        queue_if_inactive=True,
     )
+    if result.get("queued") is True:
+        return JSONResponse({
+            "queued": True,
+            "message": result.get("error"),
+        }, status_code=202)
     if result.get("ok") is not True:
         return JSONResponse(
             {"error": f"测试消息发送失败：{result.get('error') or '未知错误'}"},
             status_code=503,
         )
-    return JSONResponse({"ok": True, "message": "测试消息已发送，请检查微信"})
+    return JSONResponse({
+        "ok": True,
+        "message": "测试消息已确认进入微信投递队列，请检查手机微信",
+    })
 
 
 
@@ -3034,33 +3142,21 @@ async def weixin_notify(request: Request):
     if not to_weixin_id:
         return JSONResponse({"error": "无法找到目标用户的个人微信ID，请先在设置页填写"}, status_code=400)
 
-    # 调用 Node.js 本地发送接口
-    import httpx
-    local_token = db.get_system_config("weixin_bot_token", "")
-    # 按 weixin_id 找对应端口，找不到则轮询所有端口
-    port_candidates = []
-    if to_weixin_id in _wechat_port_map:
-        port_candidates = [_wechat_port_map[to_weixin_id]]
-    elif _wechat_port_map:
-        port_candidates = list(_wechat_port_map.values())
-    else:
-        port_candidates = list(range(3001, 3001 + len(_wechat_procs))) if _wechat_procs else [3001]
-    print(f"[weixin_notify] to_weixin_id={to_weixin_id!r} port_candidates={port_candidates} port_map={_wechat_port_map}")
-
-    last_err = "无可用微信桥接进程"
-    async with httpx.AsyncClient(timeout=10) as client:
-        for port in port_candidates:
-            try:
-                resp = await client.post(
-                    f"http://127.0.0.1:{port}/local/send",
-                    json={"to": to_weixin_id, "text": text, "token": local_token},
-                )
-                if resp.status_code == 200:
-                    return JSONResponse({"ok": True})
-                last_err = f"port {port}: {resp.text}"
-            except Exception as e:
-                last_err = f"port {port}: {e}"
-    return JSONResponse({"error": f"发送失败: {last_err}"}, status_code=500)
+    # 只调用当前部署自有的微信桥接，不扫描或借用其他系统端口。
+    delivery = await deliver_personal_weixin(
+        to_weixin_id,
+        text,
+        db.get_system_config("weixin_bot_token", ""),
+        _wechat_port_map,
+        attempts=1,
+        expected_instance_id=_WECHAT_SETTINGS.instance_id,
+    )
+    if delivery.get("ok") is True:
+        return JSONResponse({"ok": True})
+    return JSONResponse(
+        {"error": f"发送失败: {delivery.get('error') or '当前实例未连接微信'}"},
+        status_code=500,
+    )
 
 
 @fastapi_app.post("/api/weixin/session_expired")
@@ -3068,32 +3164,54 @@ async def weixin_session_expired(request: Request):
     """node 进程 token 过期时回调，通知对应用户重新扫码"""
     try:
         body = await request.json()
+        internal_token = db.get_system_config("weixin_bot_token", "")
+        received_token = str(body.get("token") or "")
+        if internal_token and not secrets.compare_digest(
+            received_token, internal_token
+        ):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+
         weixin_id = body.get("userId", "")
         account_id = body.get("accountId", "")
         if not weixin_id:
             return JSONResponse({"ok": True})
-        # 从 port_map 里移除过期的映射
-        if weixin_id in _wechat_port_map:
-            del _wechat_port_map[weixin_id]
-        if weixin_id in _wechat_proc_map:
-            del _wechat_proc_map[weixin_id]
-        # 找到对应的系统用户，给他发一条微信消息提醒
-        import httpx as _httpx
-        uid_expired = db.get_uid_by_weixin_id(weixin_id) if hasattr(db, "get_uid_by_weixin_id") else None
-        if uid_expired:
-            # 用另一个还活着的 bot 发通知（轮询所有端口）
-            local_token = db.get_system_config("weixin_bot_token", "")
-            for port in _wechat_port_map.values():
-                try:
-                    async with _httpx.AsyncClient(timeout=5) as client:
-                        await client.post(
-                            f"http://127.0.0.1:{port}/local/send",
-                            json={"to": weixin_id, "text": "⚠️ 你的微信连接已过期，请登录系统设置页重新扫码绑定。", "token": local_token},
-                        )
-                    break
-                except Exception:
-                    pass
-        print(f"[WeChat] token 过期: {account_id} userId={weixin_id}")
+        callback_instance = str(body.get("instanceId") or "")
+        if callback_instance != _WECHAT_SETTINGS.instance_id:
+            return JSONResponse(
+                {"error": "bridge instance mismatch"},
+                status_code=409,
+            )
+
+        # 新扫码接管或 token 失效均为终止状态：删除本实例凭证，
+        # 阻止监视线程和下次应用启动自动夺回连接。
+        _wechat_revoked_ids.add(weixin_id)
+        _wechat_port_map.pop(weixin_id, None)
+        expired_proc = _wechat_proc_map.pop(weixin_id, None)
+        if expired_proc in _wechat_procs:
+            _wechat_procs.remove(expired_proc)
+
+        safe_account_id = (
+            account_id
+            if account_id and all(
+                char.isalnum() or char in "._@-" for char in account_id
+            )
+            else ""
+        )
+        try:
+            if safe_account_id:
+                account_file = (
+                    _WECHAT_SETTINGS.accounts_dir / f"{safe_account_id}.json"
+                )
+                if account_file.is_file():
+                    account_file.unlink()
+        except OSError as cleanup_error:
+            print(f"[WeChat] 失效凭证清理失败: {cleanup_error}")
+
+        print(
+            f"[WeChat] 当前实例连接已失效或被其他实例接管: "
+            f"instance={_WECHAT_SETTINGS.instance_id} "
+            f"account={account_id} userId={weixin_id}；需重新扫码"
+        )
         return JSONResponse({"ok": True})
     except Exception as e:
         return JSONResponse({"ok": True})
@@ -3220,6 +3338,7 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
     port = args.port
+    os.environ.setdefault("OPENNEXUS_INTERNAL_URL", f"http://127.0.0.1:{port}")
 
     # 启动前清理端口
     kill_port(port)

@@ -6,7 +6,6 @@ WPS 授权、微信绑定、记忆、提醒和驾驶舱数据。
 """
 from __future__ import annotations
 
-import asyncio
 import base64
 import copy
 import inspect
@@ -17,7 +16,6 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
@@ -28,6 +26,7 @@ from auth import db
 from auth.wps_oauth import auto_refresh_token_for_user, is_token_expired
 from agent import assistant as assistant_module
 from core.context_memory import sanitize_memory_content
+from core.wechat_delivery import deliver_personal_weixin
 from core.tool_governance import (
     APPROVAL_ARGUMENT,
     new_tool_context,
@@ -93,46 +92,31 @@ async def _send_weixin(identity: dict, args: dict) -> dict:
     local_token = db.get_system_config("weixin_bot_token", "")
     try:
         import app as app_module
-        candidate_ports = []
-        mapped = app_module._wechat_port_map.get(weixin_id)
-        if mapped:
-            candidate_ports.append(mapped)
-        candidate_ports.extend(app_module._wechat_port_map.values())
-        candidate_ports.extend(range(3001, 3011))
-        candidate_ports = list(dict.fromkeys(candidate_ports))
-        async with httpx.AsyncClient(timeout=90, trust_env=False) as client:
-            exact_ports = []
-            for port in candidate_ports:
-                try:
-                    response = await client.get(f"http://127.0.0.1:{port}/health", timeout=1.0)
-                    data = response.json() if response.status_code == 200 else {}
-                    if data.get("ok") is True and data.get("userId") == weixin_id:
-                        exact_ports.append(port)
-                except Exception:
-                    continue
-            if not exact_ports:
-                return {"error": f"用户 {target_name} 的微信桥接未运行或绑定账号不一致"}
-            last_error = "微信桥接未返回发送结果"
-            for port in exact_ports:
-                for retry in range(3):
-                    try:
-                        response = await client.post(
-                            f"http://127.0.0.1:{port}/local/send",
-                            json={"to": weixin_id, "text": text, "token": local_token},
-                        )
-                        try:
-                            data = response.json()
-                        except Exception:
-                            data = {}
-                        if response.status_code == 200 and data.get("ok") is True:
-                            return {"ok": True, "message": f"已成功发送微信消息给 {target.get('display_name') or target_name}"}
-                        last_error = data.get("error") or response.text or "桥接返回空错误"
-                        break
-                    except Exception as exc:
-                        last_error = str(exc)
-                        if retry < 2:
-                            await asyncio.sleep(1)
-            return {"error": f"微信发送失败：{last_error}"}
+        delivery = await deliver_personal_weixin(
+            weixin_id,
+            text,
+            local_token,
+            app_module._wechat_port_map,
+            attempts=1,
+            expected_instance_id=app_module._WECHAT_SETTINGS.instance_id,
+            queue_if_inactive=True,
+        )
+        if delivery.get("ok") is True:
+            return {
+                "ok": True,
+                "message": f"已成功发送微信消息给 {target.get('display_name') or target_name}",
+            }
+        if delivery.get("queued") is True:
+            return {
+                "error": (
+                    "个人微信主动消息尚未激活，本条消息已短期暂存但尚未发送。"
+                    "请让接收人在微信中先向助手发送一条消息，系统会自动补发。"
+                ),
+                "queued": True,
+            }
+        return {
+            "error": f"微信发送失败：{delivery.get('error') or '当前实例未连接微信'}"
+        }
     except Exception as exc:
         return {"error": f"连接微信桥接失败：{exc}"}
 

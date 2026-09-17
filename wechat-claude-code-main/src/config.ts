@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { homedir } from "node:os";
+import { DATA_DIR } from "./constants.js";
 
 export interface Config {
   workingDirectory: string;
@@ -12,7 +12,7 @@ export interface Config {
   localSendPort?: number;  // 本地发送接口端口，默认 3001
 }
 
-const CONFIG_DIR = join(homedir(), ".wechat-claude-code");
+const CONFIG_DIR = DATA_DIR;
 const CONFIG_PATH = join(CONFIG_DIR, "config.env");
 
 const DEFAULT_CONFIG: Config = {
@@ -67,13 +67,17 @@ function parseConfigFile(content: string): Config {
 }
 
 export function loadConfig(): Config {
+  let config: Config;
   try {
     const content = readFileSync(CONFIG_PATH, "utf-8");
-    return parseConfigFile(content);
+    config = parseConfigFile(content);
   } catch {
     // File does not exist yet — return defaults
-    return { ...DEFAULT_CONFIG };
+    config = { ...DEFAULT_CONFIG };
   }
+  if (process.env.WCC_API_URL) config.apiUrl = process.env.WCC_API_URL;
+  if (process.env.WCC_API_TOKEN !== undefined) config.apiToken = process.env.WCC_API_TOKEN;
+  return config;
 }
 
 export function saveConfig(config: Config): void {
