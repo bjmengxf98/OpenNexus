@@ -120,6 +120,22 @@ def test_admin_page_requires_admin(monkeypatch):
     assert response.headers["location"] == "/"
 
 
+def test_admin_user_filter_rejects_login_autofill_and_supports_email():
+    admin_html = (
+        Path(__file__).parent / "static" / "admin_new.html"
+    ).read_text(encoding="utf-8")
+
+    assert 'name="admin-user-filter"' in admin_html
+    assert 'type="search"' in admin_html
+    assert 'autocomplete="off"' in admin_html
+    assert 'data-lpignore="true"' in admin_html
+    assert "readonly placeholder=\"输入用户名、邮箱、姓名、单位或部门\"" in admin_html
+    assert "u.username,u.email,u.display_name" in admin_html
+    assert "clearUnexpectedUserSearch" in admin_html
+    assert "清除筛选" in admin_html
+    assert "刷新数据" in admin_html
+
+
 def test_mcp_approval_api_is_user_scoped(monkeypatch):
     from api import settings_new_routes
 

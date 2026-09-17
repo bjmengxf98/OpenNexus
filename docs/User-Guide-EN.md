@@ -126,6 +126,8 @@ MCP is a one-way business interface from the client to OpenNexus. Revoke a token
 
 Administrators can manage users, roles, feedback, the shared knowledge base, spreadsheet change logs, WeCom, and WPS application settings. Secret fields must not be returned in plaintext by the administration API.
 
+The labeled user filter searches username, email, display name, organization, and department. Leave it empty to show all users, use **Clear filter** to restore the full list, and use **Refresh data** to reload from the server. Saved login credentials are not reused as an administration filter.
+
 ## 13. Common Problems
 
 - **WPS disconnected or expired:** reconnect WPS and confirm the OAuth callback URL.
