@@ -11,6 +11,7 @@ All notable public changes to OpenNexus are recorded here.
 
 ### Changed
 
+- Normal business replies now hide WPS internal record IDs and technical letter codes while retaining them for tool execution and verification; explicit technical ID requests remain supported.
 - The administration user filter now resists browser credential autofill, searches email addresses explicitly, and provides clear-filter and unambiguous refresh-data actions so returning to the Users tab cannot hide all accounts behind an accidental login-email filter.
 - Browser uploads now remain bound to their conversation across clarification turns instead of being deleted after the first assistant reply; confirmed WPS attachment uploads and explicit conversation clearing/deletion clean the managed file, while internal server paths stay hidden from the chat UI.
 - Personal-WeChat outbound delivery now persists the latest per-account conversation context without an inactivity timeout, distinguishes connected from activated, refuses false success without a confirmed message ID, and can hold only explicitly interactive messages for up to 30 minutes until the user sends the first WeChat message; scheduled reminders are never placed in this bridge queue, and ambiguous upstream throttling no longer erases a valid saved context.

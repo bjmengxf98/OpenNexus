@@ -7,7 +7,9 @@ import pytest
 
 from agent import wps_client
 from agent.assistant import (
-    Assistant, _record_query_strategy_hint, prepare_deepseek_tool_messages,
+    Assistant, SYSTEM_PROMPT_TEMPLATE, _collect_wps_record_ids,
+    _record_query_strategy_hint, _sanitize_user_visible_wps_ids,
+    prepare_deepseek_tool_messages,
 )
 from agent.tool_planner import (
     TaskPlanState,
@@ -96,6 +98,73 @@ def test_filtered_record_query_does_not_get_redundant_strategy_hint():
         "filter": {"姓名": "王聪"},
     }
     assert _record_query_strategy_hint("王聪是哪个部门？", args, 1, False) == ""
+
+
+def test_user_visible_reply_hides_only_verified_wps_record_ids():
+    receipts = [
+        {
+            "name": "list_records",
+            "args": {"file_id": "file-secret", "sheet_id": 31},
+            "result": {
+                "records": [
+                    {"id": "BJL", "fields": {"工作": "设计文件修编"}},
+                    {"id": "BEv", "fields": {"工作": "合肥事项"}},
+                    {"id": "vT", "fields": {"任务": "深度要求修改"}},
+                    {"id": "-i", "fields": {"任务": "勘察专项整治"}},
+                ]
+            },
+        },
+        {
+            "name": "analyze_records",
+            "args": {"file_id": "file-secret", "sheet_id": 31},
+            "result": {
+                "columns": ["record_id", "工作内容"],
+                "rows": [["BJM", "参加碰头会"]],
+            },
+        },
+    ]
+    reply = (
+        "1. 设计文件修编 —— `BJL`\n"
+        "2. 合肥事项（记录 `BEv`）\n"
+        "3. 参加碰头会 —— `BJM`\n"
+        "建议关联【深度要求修改】`vT` 或【勘察专项整治】`-i`。\n"
+        "资料格式为 PDF，并使用 BIM 和 AI 工具。"
+    )
+
+    cleaned = _sanitize_user_visible_wps_ids(reply, receipts, "说下今天的工作情况")
+
+    assert all(record_id not in cleaned for record_id in {"BJL", "BEv", "BJM", "vT", "-i"})
+    assert "设计文件修编" in cleaned
+    assert "深度要求修改" in cleaned
+    assert "PDF" in cleaned
+    assert "BIM" in cleaned
+    assert "AI" in cleaned
+
+
+def test_record_id_filter_ignores_file_sheet_and_unrelated_ids():
+    receipts = [{
+        "name": "list_records",
+        "args": {"file_id": "ccKJ1RyoDuNW", "sheet_id": 31},
+        "result": {"records": [{"id": "BJG", "fields": {"account_id": "A123"}}]},
+    }]
+
+    assert _collect_wps_record_ids(receipts) == {"BJG"}
+
+
+def test_explicit_record_id_request_keeps_technical_identifiers():
+    receipts = [{
+        "name": "update_records",
+        "args": {"records": [{"id": "BEv", "状态": "完成"}]},
+        "result": {"ok": True, "updated_ids": ["BEv"]},
+    }]
+    reply = "该业务记录的记录 ID 是 `BEv`。"
+
+    assert _sanitize_user_visible_wps_ids(reply, receipts, "请告诉我它的记录ID") == reply
+
+
+def test_system_prompt_prohibits_internal_record_ids_in_normal_replies():
+    assert "内部记录 ID 只用于工具调用和写后核验" in SYSTEM_PROMPT_TEMPLATE
+    assert "禁止出现在普通用户可见回复中" in SYSTEM_PROMPT_TEMPLATE
 
 
 def test_discovery_falls_back_to_all_tools_when_no_match():

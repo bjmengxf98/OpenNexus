@@ -532,6 +532,7 @@ content 参数是一个 JSON 对象（不是字符串），包含 sections 数�
 9. **用户已确认后立即执行，不得再次询问确认**。用户说"执行""是""好""确认""去做"等即视为确认，直接调用工具完成操作
 10. 用户说「没看到」「没有变化」时，**先调 list_records 核查**：若记录已存在（操作成功但 WPS 视图未显示），告知用户可能原因（视图有筛选条件、需手动刷新 WPS 界面、需切换到「全部」视图）；**只有** list_records 确认记录不存在时，才重新执行创建/更新操作，避免重复建立垃圾记录
 11. **禁止凭空回答工作内容**：用户说「说下部门工作」「最近工作情况」「工作进展」「有哪些任务」等涉及工作内容的问题，**必须先调 get_schema 了解表结构，再调 list_records 查询真实数据**，基于查询结果回答，禁止编造或凭印象描述；**汇报时必须逐条列出具体记录**：任务/项目名称、当前状态、负责人、截止日期等关键字段，禁止只给模糊的概括性描述（如"有几个项目在推进中"）——必须说出具体是哪几个、状态是什么、谁负责
+12. **【强制】内部记录 ID 只用于工具调用和写后核验，禁止出现在普通用户可见回复中**：例如 `BJL`、`BEv`、`-i` 这类 WPS 记录 ID 不能作为任务、项目或人员的展示名称，也不能附在业务名称后充当引用。必须显示真实业务名称、人员姓名或自然语言描述；关联记录尚未解析时写“关联记录名称未解析”，不得暴露原始 ID。只有用户明确要求查看“记录 ID / 内部编号 / 技术代号”时才可以展示。
 
 ## 传统电子表格操作
 用户说「填数据到表格」「Excel计算」「读表格」「操作Excel」等时，使用传统表格工具（sheets_*）。
@@ -2513,6 +2514,127 @@ def _safe_tool_error(value) -> str:
     return text[:500]
 
 
+_WPS_RECORD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _is_wps_record_id(value) -> bool:
+    """Return True only for compact opaque WPS record identifiers."""
+    if not isinstance(value, str):
+        return False
+    candidate = value.strip()
+    return bool(
+        candidate
+        and _WPS_RECORD_ID_RE.fullmatch(candidate)
+        and re.search(r"[A-Za-z]", candidate)
+    )
+
+
+def _collect_wps_record_ids(receipts: list | None) -> set[str]:
+    """Collect record IDs from known WPS record-tool receipt positions only."""
+    record_ids: set[str] = set()
+
+    def add(value) -> None:
+        if _is_wps_record_id(value):
+            record_ids.add(value.strip())
+
+    def add_record_objects(value) -> None:
+        if not isinstance(value, list):
+            return
+        for item in value:
+            if isinstance(item, dict):
+                add(item.get("id") or item.get("record_id"))
+
+    def add_many(value) -> None:
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                add(item)
+
+    for receipt in receipts or []:
+        if not isinstance(receipt, dict):
+            continue
+        name = str(receipt.get("name") or "")
+        args = receipt.get("args") if isinstance(receipt.get("args"), dict) else {}
+        result = receipt.get("result") if isinstance(receipt.get("result"), dict) else {}
+
+        if name in {"list_records", "create_records"}:
+            add_record_objects(result.get("records"))
+            data = result.get("data")
+            if isinstance(data, dict):
+                add_record_objects(data.get("records"))
+        elif name == "analyze_records":
+            columns = result.get("columns")
+            rows = result.get("rows")
+            if isinstance(columns, list) and isinstance(rows, list):
+                try:
+                    record_index = columns.index("record_id")
+                except ValueError:
+                    record_index = -1
+                if record_index >= 0:
+                    for row in rows:
+                        if isinstance(row, (list, tuple)) and len(row) > record_index:
+                            add(row[record_index])
+        elif name == "update_records":
+            add_record_objects(args.get("records"))
+            add_many(result.get("updated_ids"))
+        elif name == "delete_records":
+            add_many(args.get("record_ids"))
+            add_many(result.get("deleted_ids"))
+        elif name == "upload_and_attach":
+            add(args.get("record_id"))
+            add(result.get("record_id"))
+
+    return record_ids
+
+
+def _user_explicitly_requests_record_ids(user_text: str) -> bool:
+    text = str(user_text or "")
+    return bool(re.search(
+        r"(?:record[ _-]?id)|(?:(?:记录|内部|WPS|wps).{0,8}(?:ID|id|编号|代码|代号))|字母代号",
+        text,
+    ))
+
+
+def _sanitize_user_visible_wps_ids(
+    reply: str,
+    receipts: list | None,
+    user_text: str = "",
+) -> str:
+    """Hide verified internal record IDs while preserving ordinary acronyms."""
+    text = str(reply or "")
+    if not text or _user_explicitly_requests_record_ids(user_text):
+        return text
+    record_ids = _collect_wps_record_ids(receipts)
+    if not record_ids:
+        return text
+
+    for record_id in sorted(record_ids, key=len, reverse=True):
+        escaped = re.escape(record_id)
+        # Remove an ID together with the common technical label around it.
+        text = re.sub(
+            rf"(?:记录\s*)?(?:ID|id|编号|代号)?\s*[:：]?\s*`{escaped}`",
+            "",
+            text,
+        )
+        text = re.sub(
+            rf"[（(]\s*(?:记录\s*)?(?:ID|id|编号|代号)?\s*[:：]?\s*{escaped}\s*[）)]",
+            "",
+            text,
+        )
+        text = re.sub(
+            rf"(?:记录|内部编号|记录编号|记录ID|记录 ID)\s*[:：]?\s*{escaped}(?=\s|[，。；、,.;！？!?）)\]]|$)",
+            "",
+            text,
+        )
+        # Routine model answers usually format record references as code spans.
+        text = re.sub(rf"`{escaped}`", "", text)
+
+    text = re.sub(r"[（(]\s*[／/、,，;；|\s]+[）)]", "", text)
+    text = re.sub(r"[ \t]+([，。；、,.;！？!?）])", r"\1", text)
+    text = re.sub(r"(?:[ \t]*(?:——|—|-)[ \t]*)+(?=\n|$)", "", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip()
+
+
 class Assistant:
     def __init__(self, api_key: str, provider: str = "deepseek",
                  base_url: str = None, model: str = None,
@@ -3371,6 +3493,11 @@ class Assistant:
                     reply = _reminder_receipt_message
                 else:
                     reply = msg.content or ""
+                reply = _sanitize_user_visible_wps_ids(
+                    reply,
+                    self.last_tool_receipts,
+                    _last_user_content,
+                )
                 # 后台自动学习：不阻塞响应，fire-and-forget
                 import asyncio as _asyncio
                 _asyncio.create_task(

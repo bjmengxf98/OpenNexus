@@ -39,6 +39,8 @@ The top bar provides the current WPS file selector, connection status, dashboard
 
 OpenNexus can query, summarize, create, update, and delete records; manage sheets and fields; and work with supported WPS structures. It reads the schema before complex operations and translates record links into business names when possible.
 
+Normal queries, summaries, and operation receipts display business names rather than WPS internal record IDs or opaque letter codes. The assistant still keeps those identifiers internally for links, writes, and verification, and shows them only when the user explicitly requests technical IDs.
+
 Examples:
 
 - `Summarize P0 and P1 tasks due this week.`
