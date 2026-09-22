@@ -13,9 +13,12 @@ from agent.assistant import (
 )
 from agent.tool_planner import (
     TaskPlanState,
+    bounded_record_view,
+    compact_seen_record_windows,
     discover_tool_names,
     initial_tool_names,
-    is_complex_task,
+    needs_evidence_review,
+    record_field_fragment,
     trim_history_to_budget,
 )
 
@@ -50,6 +53,32 @@ def test_deepseek_tool_history_keeps_current_reasoning_without_persisting_old_ch
     )
 
 
+def test_deepseek_tool_history_does_not_turn_old_answers_into_templates():
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "很久以前的问题"},
+        {"role": "assistant", "content": "一、固定模板\n二、固定结论"},
+        {"role": "user", "content": "上一轮问题"},
+        {"role": "assistant", "content": "上一轮答复"},
+        {"role": "user", "content": "继续核查"},
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "当前任务思考",
+            "tool_calls": [{"id": "call-1"}],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "工具结果"},
+    ]
+
+    prepared = prepare_deepseek_tool_messages(messages)
+
+    assert "上一轮问题" in prepared[1]["content"]
+    assert "上一轮答复" in prepared[1]["content"]
+    assert "很久以前的问题" not in prepared[1]["content"]
+    assert "固定模板" not in prepared[1]["content"]
+    assert "不是回答格式模板" in prepared[1]["content"]
+
+
 def _tool(name, description=""):
     return {
         "type": "function",
@@ -63,11 +92,414 @@ def _tool(name, description=""):
 
 def test_initial_routing_keeps_full_data_tools_but_not_unrelated_channels():
     selected = initial_tool_names("请分析并总结今年全部工作记录")
-    assert is_complex_task("请分析并总结今年全部工作记录")
     assert {"get_schema", "list_records"} <= selected
     assert "analyze_records" in selected
     assert "send_weixin_message" not in selected
     assert "generate_document" not in selected
+
+
+def test_evidence_review_is_driven_by_tool_evidence_not_business_keywords():
+    assert not needs_evidence_review([
+        {"name": "list_records", "result": {"records": []}},
+    ])
+    assert needs_evidence_review([
+        {"name": "get_schema", "result": {"sheets": [{"id": 1}]}},
+        {"name": "list_records", "result": {"records": [{"id": "r1"}]}},
+    ])
+    assert needs_evidence_review([
+        {"name": "search_knowledge", "result": {"items": ["a"]}},
+        {"name": "search_knowledge", "result": {"items": ["b"]}},
+    ])
+    assert not needs_evidence_review([
+        {"name": "get_schema", "result": {"sheets": []}},
+        {"name": "list_records", "result": {"error": "denied"}},
+    ])
+    assert not needs_evidence_review([
+        {"name": "list_records", "result": {"records": []}},
+        {"name": "create_records", "result": {"records": [{"id": "r1"}]}},
+        {"name": "list_records", "result": {"records": [{"id": "r1"}]}},
+    ])
+
+
+class _ImmediateReplyCompletions:
+    def __init__(self):
+        self.calls = []
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+            content="直接回答",
+            tool_calls=None,
+            reasoning_content=None,
+        ))])
+
+
+def test_planning_capability_is_visible_without_keyword_classifier():
+    completions = _ImmediateReplyCompletions()
+    assistant = Assistant.__new__(Assistant)
+    assistant.provider = "mock"
+    assistant.model = "mock-model"
+    assistant.client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    assistant.supports_tools = True
+    assistant.supports_vision = False
+    assistant.reasoning_mode = "off"
+    assistant.reasoning_effort = "auto"
+    assistant.context_window = 0
+    assistant.max_output_tokens = 1024
+    assistant.smart_tool_routing = True
+    assistant._auto_learn = AsyncMock()
+
+    reply = asyncio.run(assistant.chat(
+        [{"role": "user", "content": "说下昨天季金文的工作情况"}],
+        access_token="",
+    ))
+
+    assert reply == "直接回答"
+    first_tool_names = {
+        item["function"]["name"] for item in completions.calls[0]["tools"]
+    }
+    assert "update_task_plan" in first_tool_names
+
+
+class _EvidenceReviewCompletions:
+    def __init__(self):
+        self.calls = []
+
+    @staticmethod
+    def _tool_call(call_id, name, arguments):
+        return SimpleNamespace(
+            id=call_id,
+            function=SimpleNamespace(
+                name=name,
+                arguments=json.dumps(arguments, ensure_ascii=False),
+            ),
+        )
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        index = len(self.calls) - 1
+        if index == 0:
+            tool_calls = [self._tool_call("schema", "get_schema", {
+                "file_id": "file",
+            })]
+            content = None
+        elif index == 1:
+            tool_calls = [self._tool_call("rows", "list_records", {
+                "file_id": "file", "sheet_id": 31,
+            })]
+            content = None
+        elif index == 2:
+            tool_calls = None
+            content = "依据已读取记录作答"
+        elif index == 3:
+            tool_calls = [self._tool_call("review", "update_task_plan", {
+                "goal": "根据当前请求和表结构判断证据是否充分",
+                "status": "completed",
+                "steps": [{"content": "核对现有读取结果", "status": "completed"}],
+                "completion_criteria": ["现有证据可以回答当前问题"],
+                "findings": ["已取得表结构和记录数据"],
+                "data_scope": {"source": "current table"},
+            })]
+            content = None
+        else:
+            tool_calls = None
+            content = "自检完成后的最终答案"
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+            content=content,
+            tool_calls=tool_calls,
+            reasoning_content=None,
+        ))])
+
+
+def test_read_evidence_can_answer_without_mandatory_plan(monkeypatch):
+    from agent import assistant as assistant_module
+
+    async def fake_get_schema(_token, _args):
+        return {"sheets": [{"id": 31, "sheet_id": 31, "name": "业务数据"}]}
+
+    async def fake_list_records(_token, _args):
+        return {"records": [{"id": "r1", "fields": {"事项": "已完成"}}],
+                "has_more": False}
+
+    monkeypatch.setitem(assistant_module.TOOL_MAP, "get_schema", fake_get_schema)
+    monkeypatch.setitem(assistant_module.TOOL_MAP, "list_records", fake_list_records)
+
+    completions = _EvidenceReviewCompletions()
+    assistant = Assistant.__new__(Assistant)
+    assistant.provider = "mock"
+    assistant.model = "mock-model"
+    assistant.client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    assistant.supports_tools = True
+    assistant.supports_vision = False
+    assistant.reasoning_mode = "off"
+    assistant.reasoning_effort = "auto"
+    assistant.context_window = 0
+    assistant.max_output_tokens = 1024
+    assistant.smart_tool_routing = True
+    assistant._auto_learn = AsyncMock()
+
+    reply = asyncio.run(assistant.chat(
+        [{"role": "user", "content": "请查询并说明当前表格数据"}],
+        access_token="token",
+        default_file={"file_id": "file", "file_name": "业务数据", "sheet_id": 31},
+    ))
+
+    assert reply == "依据已读取记录作答"
+    assert len(completions.calls) == 3
+    assert "本轮证据范围提醒" in completions.calls[2]["messages"][0]["content"]
+
+
+class _IgnoredEvidenceReviewCompletions(_EvidenceReviewCompletions):
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        index = len(self.calls) - 1
+        if index == 0:
+            tool_calls = [self._tool_call("schema", "get_schema", {"file_id": "file"})]
+            content = None
+        elif index == 1:
+            tool_calls = [self._tool_call("rows", "list_records", {
+                "file_id": "file", "sheet_id": 31,
+            })]
+            content = None
+        else:
+            tool_calls = None
+            content = "依据已读取数据作答"
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+            content=content,
+            tool_calls=tool_calls,
+            reasoning_content=None,
+        ))])
+
+
+def test_read_evidence_does_not_fail_when_model_answers_without_plan(monkeypatch):
+    from agent import assistant as assistant_module
+
+    async def fake_get_schema(_token, _args):
+        return {"sheets": [{"id": 31, "sheet_id": 31, "name": "业务数据"}]}
+
+    async def fake_list_records(_token, _args):
+        return {"records": [{"id": "r1", "fields": {"事项": "局部数据"}}],
+                "has_more": False}
+
+    monkeypatch.setitem(assistant_module.TOOL_MAP, "get_schema", fake_get_schema)
+    monkeypatch.setitem(assistant_module.TOOL_MAP, "list_records", fake_list_records)
+
+    completions = _IgnoredEvidenceReviewCompletions()
+    assistant = Assistant.__new__(Assistant)
+    assistant.provider = "mock"
+    assistant.model = "mock-model"
+    assistant.client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    assistant.supports_tools = True
+    assistant.supports_vision = False
+    assistant.reasoning_mode = "off"
+    assistant.reasoning_effort = "auto"
+    assistant.context_window = 0
+    assistant.max_output_tokens = 1024
+    assistant.smart_tool_routing = True
+    assistant._auto_learn = AsyncMock()
+
+    reply = asyncio.run(assistant.chat(
+        [{"role": "user", "content": "请查询并说明当前表格数据"}],
+        access_token="token",
+        default_file={"file_id": "file", "file_name": "业务数据", "sheet_id": 31},
+    ))
+
+    assert reply == "依据已读取数据作答"
+    assert len(completions.calls) == 3
+
+
+def test_discovery_schema_and_analysis_can_finish_without_plan(monkeypatch):
+    from agent import assistant as assistant_module
+
+    class AnalysisCompletions(_EvidenceReviewCompletions):
+        async def create(self, **kwargs):
+            self.calls.append(kwargs)
+            index = len(self.calls) - 1
+            if index == 0:
+                call = self._tool_call("discover", "discover_tools", {
+                    "query": "查询表格记录并分析",
+                })
+            elif index == 1:
+                call = self._tool_call("schema", "get_schema", {"file_id": "file"})
+            elif index == 2:
+                call = self._tool_call("analysis", "analyze_records", {
+                    "file_id": "file", "sheet_id": 31,
+                })
+            else:
+                call = None
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                content=None if call else "昨天完成了两项工作。",
+                tool_calls=[call] if call else None,
+                reasoning_content=None,
+            ))])
+
+    async def fake_get_schema(_token, _args):
+        return {"sheets": [{"id": 31, "sheet_id": 31, "name": "任务每日进展"}]}
+
+    async def fake_analyze_records(_token, _args):
+        return {"matched_records": 2, "is_complete": True,
+                "rows": [{"fields": {"工作": "已完成"}}]}
+
+    monkeypatch.setitem(assistant_module.TOOL_MAP, "get_schema", fake_get_schema)
+    monkeypatch.setitem(assistant_module.TOOL_MAP, "analyze_records", fake_analyze_records)
+    completions = AnalysisCompletions()
+    assistant = Assistant.__new__(Assistant)
+    assistant.provider = "mock"
+    assistant.model = "mock-model"
+    assistant.client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    assistant.supports_tools = True
+    assistant.supports_vision = False
+    assistant.reasoning_mode = "off"
+    assistant.reasoning_effort = "auto"
+    assistant.context_window = 0
+    assistant.max_output_tokens = 1024
+    assistant.smart_tool_routing = True
+    assistant._auto_learn = AsyncMock()
+
+    reply = asyncio.run(assistant.chat(
+        [{"role": "user", "content": "说下昨天季金文的工作情况"}],
+        access_token="token",
+        default_file={"file_id": "file", "file_name": "部门事务", "sheet_id": 31},
+    ))
+
+    assert reply == "昨天完成了两项工作。"
+    assert len(completions.calls) == 4
+    assert "本轮证据范围提醒" in completions.calls[3]["messages"][0]["content"]
+
+
+def test_evidence_scope_note_does_not_block_further_reads(monkeypatch):
+    from agent import assistant as assistant_module
+
+    class ExtraReadCompletions(_EvidenceReviewCompletions):
+        async def create(self, **kwargs):
+            self.calls.append(kwargs)
+            index = len(self.calls) - 1
+            if index == 0:
+                call = self._tool_call("schema", "get_schema", {"file_id": "file"})
+            elif index in {1, 2}:
+                call = self._tool_call(f"rows-{index}", "list_records", {
+                    "file_id": "file", "sheet_id": 31,
+                })
+            elif index == 3:
+                call = self._tool_call("review", "update_task_plan", {
+                    "goal": "核对当前问题所需证据",
+                    "status": "completed",
+                    "steps": [{"content": "核对记录", "status": "completed"}],
+                    "completion_criteria": ["当前范围已核实"],
+                    "findings": ["目标记录已读取"],
+                })
+            else:
+                call = None
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                content=None if call else "核实完成",
+                tool_calls=[call] if call else None,
+                reasoning_content=None,
+            ))])
+
+    reads = []
+
+    async def fake_get_schema(_token, _args):
+        return {"sheets": [{"id": 31, "sheet_id": 31, "name": "业务数据"}]}
+
+    async def fake_list_records(_token, args):
+        reads.append(args)
+        return {"records": [{"id": "r1", "fields": {"事项": "已完成"}}],
+                "has_more": False}
+
+    monkeypatch.setitem(assistant_module.TOOL_MAP, "get_schema", fake_get_schema)
+    monkeypatch.setitem(assistant_module.TOOL_MAP, "list_records", fake_list_records)
+    completions = ExtraReadCompletions()
+    assistant = Assistant.__new__(Assistant)
+    assistant.provider = "mock"
+    assistant.model = "mock-model"
+    assistant.client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    assistant.supports_tools = True
+    assistant.supports_vision = False
+    assistant.reasoning_mode = "off"
+    assistant.reasoning_effort = "auto"
+    assistant.context_window = 0
+    assistant.max_output_tokens = 1024
+    assistant.smart_tool_routing = True
+    assistant._auto_learn = AsyncMock()
+
+    reply = asyncio.run(assistant.chat(
+        [{"role": "user", "content": "请查询当前表格数据"}],
+        access_token="token",
+        default_file={"file_id": "file", "file_name": "业务数据", "sheet_id": 31},
+    ))
+
+    assert reply == "核实完成"
+    assert len(reads) == 2
+    assert "本轮证据范围提醒" in completions.calls[2]["messages"][0]["content"]
+    continued = next(item for item in completions.calls[3]["messages"]
+                     if item.get("tool_call_id") == "rows-2")
+    assert "records" in json.loads(continued["content"])
+
+
+def test_early_read_review_does_not_block_requested_write(monkeypatch):
+    from agent import assistant as assistant_module
+
+    class WriteAfterReadCompletions(_EvidenceReviewCompletions):
+        async def create(self, **kwargs):
+            self.calls.append(kwargs)
+            index = len(self.calls) - 1
+            if index == 0:
+                call = self._tool_call("schema", "get_schema", {"file_id": "file"})
+            elif index == 1:
+                call = self._tool_call("rows", "list_records", {
+                    "file_id": "file", "sheet_id": 31,
+                })
+            elif index == 2:
+                call = self._tool_call("write", "create_records", {
+                    "file_id": "file", "sheet_id": 31,
+                    "records": [{"fields": {"事项": "新增事项"}}],
+                })
+            else:
+                call = None
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                content=None if call else "写入结果已核对",
+                tool_calls=[call] if call else None,
+                reasoning_content=None,
+            ))])
+
+    async def fake_get_schema(_token, _args):
+        return {"sheets": [{"id": 31, "sheet_id": 31, "name": "业务数据"}]}
+
+    async def fake_list_records(_token, _args):
+        return {"records": [], "has_more": False}
+
+    writes = []
+
+    async def fake_create_records(_token, args):
+        writes.append(args)
+        return {"ok": True, "records": [{"id": "r2"}]}
+
+    monkeypatch.setitem(assistant_module.TOOL_MAP, "get_schema", fake_get_schema)
+    monkeypatch.setitem(assistant_module.TOOL_MAP, "list_records", fake_list_records)
+    monkeypatch.setitem(assistant_module.TOOL_MAP, "create_records", fake_create_records)
+    monkeypatch.setattr("auth.db.add_change_log", lambda *_args, **_kwargs: None)
+    completions = WriteAfterReadCompletions()
+    assistant = Assistant.__new__(Assistant)
+    assistant.provider = "mock"
+    assistant.model = "mock-model"
+    assistant.client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    assistant.supports_tools = True
+    assistant.supports_vision = False
+    assistant.reasoning_mode = "off"
+    assistant.reasoning_effort = "auto"
+    assistant.context_window = 0
+    assistant.max_output_tokens = 1024
+    assistant.smart_tool_routing = True
+    assistant._auto_learn = AsyncMock()
+
+    reply = asyncio.run(assistant.chat(
+        [{"role": "user", "content": "请处理一条业务记录"}],
+        access_token="token",
+        default_file={"file_id": "file", "file_name": "业务数据", "sheet_id": 31},
+    ))
+
+    assert reply == "写入结果已核对"
+    assert len(writes) == 1
 
 
 def test_reminder_query_routes_to_real_list_tool():
@@ -561,9 +993,392 @@ def test_all_tools_mode_really_sends_every_tool_while_smart_mode_routes():
     smart_count = _tool_count_for_mode(True)
     all_count = _tool_count_for_mode(False)
 
-    assert smart_count == 5
-    assert all_count == len(TOOLS) == 52
+    assert smart_count == 6
+    assert all_count == len(TOOLS) == 54
     assert all_count > smart_count
+
+
+def test_cached_analysis_filters_full_receipt_without_wps():
+    from agent.record_analyzer import analyze_cached_records
+
+    records = [
+        {"id": f"row-{index}", "fields": {
+            "日期": "2026/09/10" if index < 59 else "2026/08/10",
+            "填报人": f"人员{index % 5}",
+            "工作": f"完成事项{index}",
+            "无关附件": {"name": "附件" * 200},
+        }}
+        for index in range(1000)
+    ]
+    source = {
+        "records": records, "has_more": False, "is_complete": True,
+    }
+    args = {
+        "fields": ["日期", "填报人", "工作"],
+        "local_filters": [{
+            "field": "日期", "operator": "between",
+            "values": ["2026/09/07", "2026/09/13"],
+        }],
+        "group_by": ["填报人"],
+        "include_rows": True,
+    }
+    result = analyze_cached_records(source, args)
+    assert result["source_records"] == 1000
+    assert result["matched_records"] == 59
+    assert result["source_is_complete"] is True
+    assert result["is_complete"] is True
+    assert result["returned_rows"] == 59
+    assert result["next_row_offset"] is None
+    assert len(result["group_statistics"]) == 5
+    assert "无关附件" not in result["columns"]
+    assert result["cache_ttl_seconds"] == 0
+    assert len(json.dumps(result, ensure_ascii=False)) < (
+        len(json.dumps(source, ensure_ascii=False)) // 5
+    )
+
+    incomplete = analyze_cached_records(
+        {**source, "has_more": True, "is_complete": False},
+        args,
+    )
+    assert incomplete["matched_records"] == 59
+    assert incomplete["source_is_complete"] is False
+    assert incomplete["is_complete"] is False
+
+    invalid = analyze_cached_records(source, {
+        **args, "local_filters": [
+            {"field": "不存在的字段", "operator": "eq", "value": "x"},
+        ],
+    })
+    assert "error" in invalid
+    assert "日期" in invalid["available_fields"]
+
+
+def test_cached_analysis_detail_folds_after_model_sees_it():
+    analysis = {
+        "matched_records": 59,
+        "source_is_complete": True,
+        "next_row_offset": None,
+        "rows": [["row-1", "2026/09/10", "事项"] for _ in range(59)],
+        "_cached_analysis": {
+            "receipt_index": 0,
+            "arguments": {
+                "fields": ["日期", "工作"],
+                "local_filters": [{
+                    "field": "日期", "operator": "eq", "value": "2026/09/10",
+                }],
+            },
+        },
+    }
+    messages = [
+        {"role": "tool", "content": json.dumps(analysis, ensure_ascii=False)},
+        {"role": "tool", "content": '{"ok":true}'},
+    ]
+    folded, count = compact_seen_record_windows(
+        messages, preserve_recent_tool_messages=1,
+    )
+    assert count == 1
+    old = json.loads(folded[0]["content"])
+    assert old["_cached_analysis"]["receipt_index"] == 0
+    assert old["matched_records"] == 59
+    assert "rows" not in old
+    assert folded[1] == messages[1]
+
+
+def test_record_window_keeps_full_source_and_can_recover_every_row():
+    records = [
+        {"id": f"row-{index}", "fields": {"内容": "资料" * 100, "日期": "2026/09/22"}}
+        for index in range(85)
+    ]
+    source = {
+        "records": records, "total": len(records), "fetched": len(records),
+        "has_more": False, "is_complete": True,
+    }
+    first, windowed = bounded_record_view(source, 4, max_chars=4_000)
+    assert windowed is True
+    assert first["is_complete"] is False
+    assert first["source_is_complete"] is True
+    assert first["_record_window"]["receipt_index"] == 4
+    assert first["_record_window"]["has_more_in_fetched_results"] is True
+    assert len(json.dumps(first, ensure_ascii=False)) <= 4_000
+    assert len(source["records"]) == 85
+
+    visible_ids = []
+    offset = 0
+    while offset is not None:
+        view, _ = bounded_record_view(
+            source, 4, offset=offset, max_chars=4_000, force=True,
+        )
+        visible_ids.extend(row["id"] for row in view["records"])
+        offset = view["_record_window"]["next_offset"]
+    assert visible_ids == [row["id"] for row in records]
+
+
+def test_record_window_can_project_a_very_wide_row():
+    source = {
+        "records": [{
+            "id": "wide-row",
+            "fields": {"正文": "很长" * 5000, "日期": "2026/09/22"},
+        }],
+        "has_more": False,
+    }
+    initial, _ = bounded_record_view(source, 0, max_chars=4_000, force=True)
+    assert initial["records"] == []
+    assert initial["_record_window"]["requires_field_selection"] is True
+    assert set(initial["available_fields"]) == {"正文", "日期"}
+    projected, _ = bounded_record_view(
+        source, 0, fields=["日期"], max_chars=4_000, force=True,
+    )
+    assert projected["records"][0]["fields"] == {"日期": "2026/09/22"}
+    assert projected["_record_window"]["next_offset"] is None
+    fragments = []
+    char_offset = 0
+    while char_offset is not None:
+        chunk = record_field_fragment(
+            source, 0, record_offset=0, field="正文",
+            char_offset=char_offset, max_chars=2_000,
+        )
+        fragments.append(chunk["content"])
+        char_offset = chunk["_record_field"]["next_char_offset"]
+    assert "".join(fragments) == source["records"][0]["fields"]["正文"]
+
+
+def test_old_record_windows_fold_but_keep_recovery_handle():
+    source = {
+        "records": [{"id": str(i), "fields": {"内容": "数据" * 200}} for i in range(30)],
+        "has_more": False,
+    }
+    first, _ = bounded_record_view(source, 2, max_chars=4_000)
+    next_window, _ = bounded_record_view(
+        source, 2, offset=first["_record_window"]["next_offset"],
+        max_chars=4_000, force=True,
+    )
+    messages = [
+        {"role": "tool", "content": json.dumps(first, ensure_ascii=False)},
+        {"role": "tool", "content": json.dumps(next_window, ensure_ascii=False)},
+    ]
+    folded, count = compact_seen_record_windows(
+        messages, preserve_recent_tool_messages=1,
+    )
+    assert count == 1
+    old = json.loads(folded[0]["content"])
+    assert old["_compacted"] is True
+    assert old["_record_window"]["receipt_index"] == 2
+    assert old["_record_window"]["offset"] == 0
+    assert "records" not in old
+    assert folded[1] == messages[1]
+    assert "records" in json.loads(messages[0]["content"])
+
+
+def test_assistant_can_read_window_without_refetching_wps(monkeypatch):
+    from agent import assistant as assistant_module
+
+    class WindowCompletions:
+        def __init__(self):
+            self.calls = []
+
+        async def create(self, **kwargs):
+            self.calls.append(kwargs)
+            round_number = len(self.calls)
+            if round_number == 1:
+                tool_calls = [SimpleNamespace(
+                    id="list-rows",
+                    function=SimpleNamespace(
+                        name="list_records",
+                        arguments=json.dumps({"file_id": "file", "sheet_id": 31}),
+                    ),
+                )]
+                content = None
+            elif round_number == 2:
+                tool_result = next(
+                    item for item in kwargs["messages"]
+                    if item.get("tool_call_id") == "list-rows"
+                )
+                view = json.loads(tool_result["content"])
+                assert view["_record_window"]["has_more_in_fetched_results"]
+                assert view["is_complete"] is False
+                assert any(
+                    item["function"]["name"] == "read_record_window"
+                    for item in kwargs["tools"]
+                )
+                tool_calls = [SimpleNamespace(
+                    id="read-more",
+                    function=SimpleNamespace(
+                        name="read_record_window",
+                        arguments=json.dumps({
+                            "receipt_index": view["_record_window"]["receipt_index"],
+                            "offset": view["_record_window"]["next_offset"],
+                            "fields": ["日期"],
+                        }),
+                    ),
+                )]
+                content = None
+            else:
+                tool_result = next(
+                    item for item in kwargs["messages"]
+                    if item.get("tool_call_id") == "read-more"
+                )
+                view = json.loads(tool_result["content"])
+                assert view["records"]
+                assert all(
+                    set(row["fields"]) == {"日期"} for row in view["records"]
+                )
+                tool_calls = None
+                content = "已核查记录窗口。"
+            message = SimpleNamespace(
+                content=content, tool_calls=tool_calls, reasoning_content=None,
+            )
+            return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+    reads = []
+
+    async def fake_list_records(*args, **kwargs):
+        reads.append((args, kwargs))
+        return {
+            "records": [
+                {"id": f"row-{index}", "fields": {
+                    "内容": "工作记录" * 100, "日期": "2026/09/22",
+                }} for index in range(85)
+            ],
+            "total": 85, "fetched": 85, "has_more": False, "is_complete": True,
+        }
+
+    monkeypatch.setattr(assistant_module, "list_records", fake_list_records)
+    completions = WindowCompletions()
+    assistant = Assistant.__new__(Assistant)
+    assistant.provider = "mock"
+    assistant.model = "mock-model"
+    assistant.client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    assistant.supports_tools = True
+    assistant.supports_vision = False
+    assistant.reasoning_mode = "off"
+    assistant.reasoning_effort = "auto"
+    assistant.context_window = 0
+    assistant.max_output_tokens = 1024
+    assistant.smart_tool_routing = True
+    assistant._auto_learn = AsyncMock()
+
+    reply = asyncio.run(assistant.chat(
+        [{"role": "user", "content": "查询部门工作记录"}],
+        access_token="token",
+        default_file={"file_id": "file", "file_name": "部门事务", "sheet_id": 31},
+    ))
+    assert reply == "已核查记录窗口。"
+    assert len(completions.calls) == 3
+    assert len(reads) == 1
+    assert len(assistant.last_tool_receipts[0]["result"]["records"]) == 85
+
+
+def test_assistant_analyzes_cached_rows_instead_of_scanning_windows(monkeypatch):
+    from agent import assistant as assistant_module
+
+    class CachedCompletions:
+        def __init__(self):
+            self.calls = []
+
+        async def create(self, **kwargs):
+            self.calls.append(kwargs)
+            turn = len(self.calls)
+            if turn == 1:
+                name = "list_records"
+                arguments = {"file_id": "file", "sheet_id": 31}
+                tool_id = "list-source"
+            elif turn == 2:
+                view = json.loads(next(
+                    item["content"] for item in kwargs["messages"]
+                    if item.get("tool_call_id") == "list-source"
+                ))
+                assert view["_record_window"]["has_more_in_fetched_results"]
+                assert any(
+                    item["function"]["name"] == "analyze_cached_records"
+                    for item in kwargs["tools"]
+                )
+                name = "analyze_cached_records"
+                arguments = {
+                    "receipt_index": view["_record_window"]["receipt_index"],
+                    "fields": ["日期", "工作"],
+                    "local_filters": [{
+                        "field": "日期", "operator": "between",
+                        "values": ["2026/09/07", "2026/09/13"],
+                    }],
+                    "include_rows": True,
+                }
+                tool_id = "cached-analysis"
+            elif turn == 3:
+                analysis = json.loads(next(
+                    item["content"] for item in kwargs["messages"]
+                    if item.get("tool_call_id") == "cached-analysis"
+                ))
+                assert analysis["source_records"] == 1000
+                assert analysis["matched_records"] == 59
+                assert analysis["returned_rows"] == 59
+                assert analysis["is_complete"] is True
+                name = "update_task_plan"
+                arguments = {
+                    "goal": "核对已读数据是否足以回答",
+                    "status": "completed",
+                    "steps": [{"content": "验证来源和筛选结果", "status": "completed"}],
+                    "completion_criteria": ["来源完整且全部目标行已读取"],
+                    "findings": ["源数据 1000 条，目标行 59 条且已完整读取"],
+                    "data_scope": {"source": "本轮已读工作表"},
+                }
+                tool_id = "plan-complete"
+            else:
+                name = None
+                arguments = None
+                tool_id = None
+
+            tool_calls = [SimpleNamespace(
+                id=tool_id,
+                function=SimpleNamespace(
+                    name=name, arguments=json.dumps(arguments, ensure_ascii=False),
+                ),
+            )] if name else None
+            message = SimpleNamespace(
+                content=None if name else "已基于完整目标记录回答。",
+                tool_calls=tool_calls, reasoning_content=None,
+            )
+            return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+    wps_reads = []
+
+    async def fake_list_records(*args, **kwargs):
+        wps_reads.append((args, kwargs))
+        return {
+            "records": [
+                {"id": f"row-{index}", "fields": {
+                    "日期": "2026/09/10" if index < 59 else "2026/08/10",
+                    "工作": f"已完成事项{index}" + "记录" * 80,
+                }}
+                for index in range(1000)
+            ],
+            "total": 1000, "fetched": 1000,
+            "has_more": False, "is_complete": True,
+        }
+
+    monkeypatch.setattr(assistant_module, "list_records", fake_list_records)
+    completions = CachedCompletions()
+    assistant = Assistant.__new__(Assistant)
+    assistant.provider = "mock"
+    assistant.model = "mock-model"
+    assistant.client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    assistant.supports_tools = True
+    assistant.supports_vision = False
+    assistant.reasoning_mode = "off"
+    assistant.reasoning_effort = "auto"
+    assistant.context_window = 0
+    assistant.max_output_tokens = 1024
+    assistant.smart_tool_routing = True
+    assistant._auto_learn = AsyncMock()
+
+    reply = asyncio.run(assistant.chat(
+        [{"role": "user", "content": "汇总指定日期范围的部门工作"}],
+        access_token="token",
+        default_file={"file_id": "file", "file_name": "部门事务", "sheet_id": 31},
+    ))
+    assert reply == "已基于完整目标记录回答。"
+    assert len(completions.calls) == 4
+    assert len(wps_reads) == 1
+    assert len(assistant.last_tool_receipts[0]["result"]["records"]) == 1000
 
 
 class _TaskCreateGuardCompletions:

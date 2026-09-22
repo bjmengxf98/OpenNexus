@@ -111,7 +111,7 @@ _CACHE: OrderedDict[str, tuple[float, list[dict[str, Any]], dict[str, Any]]] = O
 @dataclass
 class FetchReceipt:
     records: list[dict[str, Any]]
-    pages_fetched: int
+    pages_fetched: int | None
     source_is_complete: bool
     continuation_error: str = ""
 
@@ -466,10 +466,7 @@ def _row_window(
     return rows, (index if index < len(records) else None)
 
 
-async def analyze_records(
-    access_token: str,
-    arguments: dict[str, Any],
-) -> dict[str, Any]:
+def _analysis_fields(arguments: dict[str, Any]) -> list[str] | None:
     requested_fields = [
         str(item) for item in (arguments.get("fields") or [])
         if str(item).strip()
@@ -490,14 +487,26 @@ async def analyze_records(
     fields = list(dict.fromkeys(
         requested_fields + support_fields + group_by + numeric_fields
     )) or None
-    receipt = await _fetch_all_records(
-        access_token,
-        str(arguments["file_id"]),
-        int(arguments["sheet_id"]),
-        fields=fields,
-        server_filter=arguments.get("filter"),
-        view_id=arguments.get("view_id"),
-    )
+    return fields
+
+
+def analyze_record_snapshot(
+    receipt: FetchReceipt,
+    arguments: dict[str, Any],
+    *,
+    fields: list[str] | None = None,
+    cache_ttl_seconds: int = _CACHE_TTL_SECONDS,
+) -> dict[str, Any]:
+    """Analyze an already authorized record snapshot without a WPS request."""
+    fields = fields or _analysis_fields(arguments)
+    group_by = [
+        str(item) for item in (arguments.get("group_by") or [])
+        if str(item).strip()
+    ]
+    numeric_fields = [
+        str(item) for item in (arguments.get("numeric_fields") or [])
+        if str(item).strip()
+    ]
     filtered = _apply_local_filters(
         receipt.records,
         arguments.get("local_filters"),
@@ -535,7 +544,7 @@ async def analyze_records(
         "next_row_offset": next_offset,
         "has_more": next_offset is not None,
         "is_complete": receipt.source_is_complete and (not include_rows or next_offset is None),
-        "cache_ttl_seconds": _CACHE_TTL_SECONDS,
+        "cache_ttl_seconds": cache_ttl_seconds,
         "_note": (
             "统计基于全部匹配记录；紧凑记录尚有后续批次，请使用 next_row_offset 继续。"
             if next_offset is not None
@@ -548,3 +557,96 @@ async def analyze_records(
             f"原因：{receipt.continuation_error or '未知分页错误'}"
         )
     return result
+
+
+def analyze_cached_records(
+    source: dict[str, Any],
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    """Analyze the fetched portion of one same-turn list_records receipt."""
+    records = source.get("records")
+    if not isinstance(records, list) or source.get("error"):
+        return {"error": "该记录结果不可分析"}
+    filters = arguments.get("local_filters") or []
+    if not isinstance(filters, list) or any(not isinstance(item, dict) for item in filters):
+        return {"error": "local_filters 必须是条件对象数组"}
+    valid_operators = {
+        "eq", "ne", "contains", "not_contains", "in",
+        "gt", "gte", "lt", "lte", "between", "empty", "not_empty",
+    }
+    if any(
+        not str(item.get("field") or "").strip()
+        or str(item.get("operator") or "").lower() not in valid_operators
+        for item in filters
+    ):
+        return {"error": "筛选条件必须包含有效的 field 和 operator"}
+    known_fields = {
+        name
+        for record in records if isinstance(record, dict)
+        for name in (record.get("fields") or {})
+    }
+    unknown = sorted({
+        str(item["field"])
+        for item in filters
+        if str(item["field"]) not in known_fields
+        and str(item["operator"]).lower() not in {"empty", "not_empty"}
+    }) if records else []
+    if unknown:
+        return {
+            "error": f"所请求字段不在已读记录中：{', '.join(unknown[:10])}",
+            "available_fields": sorted(known_fields)[:50],
+        }
+    complete = bool(source.get("is_complete", not source.get("has_more", False)))
+    continuation_error = ""
+    if not complete:
+        if source.get("has_more"):
+            token = source.get("next_page_token")
+            continuation_error = (
+                f"本轮已读结果仍有 WPS 下一页，next_page_token={token!r}"
+                if token else "源数据仍有 WPS 下一页，但当前回执缺少游标"
+            )
+        else:
+            continuation_error = str(
+                source.get("continuation_error") or "本轮源数据不完整"
+            )
+    receipt = FetchReceipt(
+        records=records,
+        pages_fetched=(
+            int(source["pages_fetched"])
+            if source.get("pages_fetched") is not None else None
+        ),
+        source_is_complete=complete,
+        continuation_error=continuation_error,
+    )
+    result = analyze_record_snapshot(
+        receipt, arguments, cache_ttl_seconds=0,
+    )
+    if not result["matched_records"] and records and filters:
+        result["filter_field_samples"] = {
+            field: list(dict.fromkeys(
+                shown
+                for record in records
+                if (shown := _display_value(
+                    (record.get("fields") or {}).get(field), max_chars=80,
+                ))
+            ))[:3]
+            for field in dict.fromkeys(str(item["field"]) for item in filters)
+        }
+        result["_note"] += " 已读记录中无匹配；请核对筛选值格式与字段示例。"
+    return result
+
+
+async def analyze_records(
+    access_token: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    fields = _analysis_fields(arguments)
+    receipt = await _fetch_all_records(
+        access_token,
+        str(arguments["file_id"]),
+        int(arguments["sheet_id"]),
+        fields=fields,
+        server_filter=arguments.get("filter"),
+        view_id=arguments.get("view_id"),
+    )
+    return analyze_record_snapshot(receipt, arguments, fields=fields)

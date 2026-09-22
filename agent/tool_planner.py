@@ -156,9 +156,14 @@ TOOL_DEPENDENCIES: dict[str, tuple[str, ...]] = {
 }
 
 
-_COMPLEX_TASK_KEYWORDS = (
-    "总结", "汇总", "分析", "全年", "今年", "所有", "全部", "完整",
-    "逐项", "批量", "跨表", "梳理", "制定", "规划", "对比", "综合",
+_EVIDENCE_TOOL_PREFIXES = (
+    "get_", "list_", "search_", "analyze_", "sheets_get_", "sheets_find_",
+)
+
+_SIDE_EFFECT_TOOL_PREFIXES = (
+    "create_", "update_", "delete_", "upload_", "send_", "add_", "cancel_",
+    "copy_", "generate_", "bind_", "unbind_", "enable_", "disable_",
+    "sheets_create_", "sheets_update_", "sheets_delete_", "sheets_copy_",
 )
 
 
@@ -271,9 +276,34 @@ def tool_names(tools: Iterable[dict[str, Any]]) -> set[str]:
     return {name for tool in tools if (name := tool_name(tool))}
 
 
-def is_complex_task(user_text: str) -> bool:
-    text = (user_text or "").strip().lower()
-    return len(text) >= 80 or any(keyword in text for keyword in _COMPLEX_TASK_KEYWORDS)
+def needs_evidence_review(receipts: Iterable[dict[str, Any]]) -> bool:
+    """Return whether a tool-backed answer deserves a sufficiency checkpoint.
+
+    This reasons from generic read-tool evidence instead of user wording or a
+    catalog of business task types. Two successful reads, with at least one
+    non-schema result, mean the model has started an evidence-gathering workflow
+    and should explicitly decide whether the user's actual goal is met.
+    """
+    receipt_list = list(receipts)
+    if any(
+        str(receipt.get("name") or "").startswith(_SIDE_EFFECT_TOOL_PREFIXES)
+        for receipt in receipt_list
+    ):
+        return False
+
+    evidence_names: list[str] = []
+    for receipt in receipt_list:
+        name = str(receipt.get("name") or "")
+        if not name.startswith(_EVIDENCE_TOOL_PREFIXES):
+            continue
+        result = receipt.get("result")
+        if isinstance(result, dict) and result.get("error"):
+            continue
+        evidence_names.append(name)
+    return (
+        len(evidence_names) >= 2
+        and any(name != "get_schema" for name in evidence_names)
+    )
 
 
 def _expand_dependencies(names: Iterable[str]) -> set[str]:
@@ -538,6 +568,197 @@ def estimate_messages_tokens(messages: list[dict[str, Any]]) -> int:
     return estimate_text_tokens(messages) + 6 * len(messages)
 
 
+def bounded_record_view(
+    result: dict[str, Any],
+    receipt_index: int,
+    *,
+    offset: int = 0,
+    limit: int = 100,
+    fields: list[str] | None = None,
+    max_chars: int = 20_000,
+    force: bool = False,
+) -> tuple[dict[str, Any], bool]:
+    """Expose a bounded, recoverable window of a full list_records receipt."""
+    records = result.get("records")
+    if not isinstance(records, list):
+        return result, False
+    max_chars = max(4_000, min(int(max_chars), 60_000))
+    if not force and len(json.dumps(result, ensure_ascii=False, default=str)) <= max_chars:
+        return result, False
+
+    offset = max(0, min(int(offset), len(records)))
+    limit = max(1, min(int(limit), 200))
+    selected_fields = [str(item) for item in (fields or []) if str(item).strip()]
+    source_has_more = bool(result.get("has_more", False))
+    source_complete = bool(result.get("is_complete", not source_has_more))
+    view = {key: value for key, value in result.items()
+            if key not in {"records", "empty_row_ids", "_note"}}
+    if "empty_row_ids" in result:
+        view["empty_row_ids"] = list(result["empty_row_ids"][:20])
+        view["empty_row_ids_truncated"] = len(result["empty_row_ids"]) > 20
+    view["source_is_complete"] = source_complete
+    view["records"] = []
+    available_fields = list(dict.fromkeys(
+        key for record in records[offset:offset + min(limit, 10)]
+        if isinstance(record, dict)
+        for key in (record.get("fields") or {})
+    ))
+
+    def row_at(index: int) -> Any:
+        record = records[index]
+        if not selected_fields or not isinstance(record, dict):
+            return record
+        projected = dict(record)
+        raw_fields = record.get("fields")
+        if isinstance(raw_fields, dict):
+            projected["fields"] = {
+                key: raw_fields[key] for key in selected_fields if key in raw_fields
+            }
+        return projected
+
+    index = offset
+    while index < min(len(records), offset + limit):
+        row = row_at(index)
+        candidate = view["records"] + [row]
+        probe = dict(view, records=candidate)
+        if len(json.dumps(probe, ensure_ascii=False, default=str)) > max_chars - 1000:
+            break
+        view["records"].append(row)
+        index += 1
+
+    local_more = index < len(records)
+    view["is_complete"] = source_complete and offset == 0 and not local_more
+    view["_record_window"] = {
+        "receipt_index": receipt_index,
+        "offset": offset,
+        "visible_records": len(view["records"]),
+        "fetched_records": len(records),
+        "next_offset": index if local_more else None,
+        "has_more_in_fetched_results": local_more,
+        "source_has_more": source_has_more,
+        "source_next_page_token": result.get("next_page_token"),
+        "requires_field_selection": local_more and index == offset,
+    }
+    if local_more:
+        view["_note"] = (
+            "当前只展示已读取结果中的一部分，不能把这些可见记录称为全部。"
+            f"需要更多明细时调用 read_record_window(receipt_index={receipt_index}, "
+            f"offset={index})；如只需匹配条件的记录或统计，优先调用 "
+            f"analyze_cached_records(receipt_index={receipt_index}) 按字段筛选，"
+            "无需逐窗翻阅原始记录或再次请求 WPS。"
+        )
+    elif source_has_more:
+        view["_note"] = "当前窗口已读完，但 WPS 源数据仍有下一页；按 source_next_page_token 继续查询。"
+    else:
+        view["_note"] = "当前窗口已读完；请结合此前窗口判断所需数据是否已经覆盖。"
+    if index == offset and local_more:
+        view["available_fields"] = available_fields
+        view["_note"] += (
+            " 单条记录超过窗口预算，请指定所需 fields 后重试；"
+            "若单个字段仍过长，可指定 record_offset、field 和 char_offset 分段读取。"
+        )
+    return view, True
+
+
+def record_field_fragment(
+    result: dict[str, Any],
+    receipt_index: int,
+    *,
+    record_offset: int,
+    field: str,
+    char_offset: int = 0,
+    max_chars: int = 12_000,
+) -> dict[str, Any]:
+    """Read one authorized field in bounded text chunks without refetching WPS."""
+    records = result.get("records")
+    if not isinstance(records, list) or not 0 <= record_offset < len(records):
+        raise ValueError("record_offset 不属于当前记录结果")
+    record = records[record_offset]
+    row_fields = record.get("fields") if isinstance(record, dict) else None
+    if not isinstance(row_fields, dict) or field not in row_fields:
+        raise ValueError("field 不属于该记录")
+    value = row_fields[field]
+    content_format = "text" if isinstance(value, str) else "json"
+    text = value if content_format == "text" else json.dumps(
+        value, ensure_ascii=False, default=str,
+    )
+    char_offset = max(0, min(int(char_offset), len(text)))
+    max_chars = max(1000, min(int(max_chars), 16_000))
+    next_offset = min(len(text), char_offset + max_chars)
+    return {
+        "record_id": record.get("id"),
+        "content_format": content_format,
+        "content": text[char_offset:next_offset],
+        "_record_field": {
+            "receipt_index": receipt_index,
+            "record_offset": record_offset,
+            "field": field,
+            "char_offset": char_offset,
+            "total_chars": len(text),
+            "next_char_offset": next_offset if next_offset < len(text) else None,
+            "is_complete": next_offset >= len(text),
+        },
+    }
+
+
+def compact_seen_record_windows(
+    messages: list[dict[str, Any]],
+    *,
+    preserve_recent_tool_messages: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Fold older recoverable record windows after a model has seen them."""
+    result = [dict(message) for message in messages]
+    tool_indexes = [i for i, item in enumerate(result) if item.get("role") == "tool"]
+    recent = max(0, preserve_recent_tool_messages)
+    protected = set(tool_indexes[-recent:]) if recent else set()
+    compacted = 0
+    for index in tool_indexes:
+        if index in protected:
+            continue
+        try:
+            data = json.loads(str(result[index].get("content") or ""))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict) or data.get("_compacted"):
+            continue
+        if "_record_window" in data:
+            window = data["_record_window"]
+            folded = {
+                "_compacted": True,
+                "_record_window": window,
+                "_instruction": (
+                    "该窗口已在上一轮展示并从上下文折叠；需要明细时调用 "
+                    f"read_record_window(receipt_index={window['receipt_index']}, "
+                    f"offset={window['offset']})。"
+                ),
+            }
+        elif "_record_field" in data:
+            field = data["_record_field"]
+            folded = {
+                "_compacted": True,
+                "_record_field": field,
+                "_instruction": "该字段片段已展示并折叠；可按 _record_field 参数重新读取。",
+            }
+        elif "_cached_analysis" in data:
+            analysis = data["_cached_analysis"]
+            folded = {
+                "_compacted": True,
+                "_cached_analysis": analysis,
+                "matched_records": data.get("matched_records"),
+                "source_is_complete": data.get("source_is_complete"),
+                "next_row_offset": data.get("next_row_offset"),
+                "_instruction": (
+                    "该分析结果已展示并折叠；需要原明细时可按 "
+                    "_cached_analysis.arguments 重新调用 analyze_cached_records。"
+                ),
+            }
+        else:
+            continue
+        result[index]["content"] = json.dumps(folded, ensure_ascii=False)
+        compacted += 1
+    return result, compacted
+
+
 def _compact_tool_receipt(content: Any) -> str:
     try:
         data = json.loads(content) if isinstance(content, str) else content
@@ -550,6 +771,7 @@ def _compact_tool_receipt(content: Any) -> str:
         "next_page_token", "is_complete", "source_records", "matched_records",
         "pages_fetched", "source_is_complete", "returned_rows",
         "next_row_offset", "continuation_error", "_note", "_completeness",
+        "_record_window", "_record_field", "_cached_analysis",
     )
     receipt = {
         key: data[key] for key in keep_keys
@@ -557,7 +779,8 @@ def _compact_tool_receipt(content: Any) -> str:
     }
     receipt["_compacted"] = True
     receipt["_instruction"] = (
-        "原始明细已在阶段性 findings 保存后压缩；如仍需明细，请按原范围重新查询。"
+        "旧明细已从当前模型上下文压缩；如仍需明细，请按原范围重新查询，"
+        "有 _record_window 时可调用 read_record_window。"
     )
     return json.dumps(receipt, ensure_ascii=False, separators=(",", ":"), default=str)
 

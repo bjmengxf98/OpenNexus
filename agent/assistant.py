@@ -24,7 +24,9 @@ from agent.wps_client import (
     sheets_get_range, sheets_update_range, sheets_delete_range,
     sheets_find_range, sheets_create_file,
 )
-from agent.record_analyzer import ANALYZE_RECORDS_TOOL, analyze_records
+from agent.record_analyzer import (
+    ANALYZE_RECORDS_TOOL, analyze_cached_records, analyze_records,
+)
 
 from auth.db import (search_knowledge as _db_search_knowledge,
                      search_knowledge_rag as _db_search_knowledge_rag,
@@ -57,6 +59,9 @@ from agent.tool_planner import (
     UPDATE_PLAN_TOOL_NAME,
     TaskPlanState,
     RunMetrics,
+    bounded_record_view,
+    compact_seen_record_windows,
+    record_field_fragment,
     compact_messages_for_retry,
     compact_tool_messages,
     estimate_tools_tokens,
@@ -64,7 +69,7 @@ from agent.tool_planner import (
     discovery_result,
     discover_tool_names,
     initial_tool_names,
-    is_complex_task,
+    needs_evidence_review,
     trim_history_to_budget,
     visible_tools,
 )
@@ -275,15 +280,20 @@ def prepare_deepseek_tool_messages(messages: list[dict]) -> list[dict]:
     prior = messages[1:current_user_index]
     if not any(item.get("role") == "assistant" for item in prior):
         return messages
+    # Keep just the latest visible exchange to resolve references such as
+    # “继续” or “就这样”. Older assistant prose must not become an accidental
+    # answer-template library for the current request.
+    recent_prior = prior[-2:]
     transcript = []
-    for item in prior:
+    for item in recent_prior:
         if item.get("role") not in {"user", "assistant"}:
             continue
         label = "用户" if item.get("role") == "user" else "助手"
         transcript.append(f"{label}：{str(item.get('content') or '').strip()}")
     current = dict(messages[current_user_index])
     current["content"] = (
-        "[此前可见对话，仅供理解本轮上下文]\n" + "\n".join(transcript)
+        "[最近一轮可见对话，仅用于理解指代；不是事实来源，也不是回答格式模板]\n"
+        + "\n".join(transcript)
         + "\n\n[当前用户请求]\n" + str(current.get("content") or "")
     )
     return [messages[0], current, *messages[current_user_index + 1:]]
@@ -531,7 +541,7 @@ content 参数是一个 JSON 对象（不是字符串），包含 sections 数�
 8. 删除操作前**必须先调 list_records 查询获得真实记录列表**，从返回数据中确认 id，禁止凭猜测或历史记忆推断 id；"删除空行/空记录"类操作必须先 list_records 找出字段全为空的记录再删，不可假设哪条是空行；删除后必须立即调用 list_records 验证记录已消失，若仍存在则重新查询再删
 9. **用户已确认后立即执行，不得再次询问确认**。用户说"执行""是""好""确认""去做"等即视为确认，直接调用工具完成操作
 10. 用户说「没看到」「没有变化」时，**先调 list_records 核查**：若记录已存在（操作成功但 WPS 视图未显示），告知用户可能原因（视图有筛选条件、需手动刷新 WPS 界面、需切换到「全部」视图）；**只有** list_records 确认记录不存在时，才重新执行创建/更新操作，避免重复建立垃圾记录
-11. **禁止凭空回答工作内容**：用户说「说下部门工作」「最近工作情况」「工作进展」「有哪些任务」等涉及工作内容的问题，**必须先调 get_schema 了解表结构，再调 list_records 查询真实数据**，基于查询结果回答，禁止编造或凭印象描述；**汇报时必须逐条列出具体记录**：任务/项目名称、当前状态、负责人、截止日期等关键字段，禁止只给模糊的概括性描述（如"有几个项目在推进中"）——必须说出具体是哪几个、状态是什么、谁负责
+11. **禁止凭空回答业务数据**：凡是回答依赖表格事实，必须先读取真实结构和数据，引用内容只能来自本轮工具证据。回答粒度、关联范围和表达结构由当前用户目标与实际字段动态决定：简单事实直接回答，综合请求再补充与目标相关的上下文和依据；不得预设每类问题必须展示哪些字段、读取几张表、跨多长时间或套用固定标题模板，也不得只给没有事实支撑的空泛概括。
 12. **【强制】内部记录 ID 只用于工具调用和写后核验，禁止出现在普通用户可见回复中**：例如 `BJL`、`BEv`、`-i` 这类 WPS 记录 ID 不能作为任务、项目或人员的展示名称，也不能附在业务名称后充当引用。必须显示真实业务名称、人员姓名或自然语言描述；关联记录尚未解析时写“关联记录名称未解析”，不得暴露原始 ID。只有用户明确要求查看“记录 ID / 内部编号 / 技术代号”时才可以展示。
 
 ## 传统电子表格操作
@@ -1853,6 +1863,77 @@ TOOLS = [
     },
 ]
 TOOLS.append(ANALYZE_RECORDS_TOOL)
+TOOLS.append({
+    "type": "function",
+    "function": {
+        "name": "read_record_window",
+        "description": (
+            "读取本轮已取得但因内容过大而分窗展示的 list_records 结果。"
+            "使用结果中的 receipt_index 和 next_offset 继续查看；可选择 fields 缩小字段。"
+            "若单个字段超过窗口预算，指定 record_offset、field、char_offset 分段读取。"
+            "仅访问本轮当前用户已经读取的结果，不重新访问 WPS。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "receipt_index": {"type": "integer", "description": "原 list_records 结果中的 receipt_index"},
+                "offset": {"type": "integer", "description": "从 _record_window.next_offset 继续，默认 0"},
+                "limit": {"type": "integer", "description": "最多返回记录数，默认 100，最大 200"},
+                "fields": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "仅展示需要的字段；单条记录太大时必须指定",
+                },
+                "record_offset": {
+                    "type": "integer",
+                    "description": "需要读取超长字段时，该记录在原始结果中的零基位置",
+                },
+                "field": {
+                    "type": "string",
+                    "description": "需要分段读取的单个字段名；与 record_offset 一起使用",
+                },
+                "char_offset": {
+                    "type": "integer",
+                    "description": "超长字段内的字符偏移，按 next_char_offset 继续",
+                },
+            },
+            "required": ["receipt_index"],
+        },
+    },
+})
+TOOLS.append({
+    "type": "function",
+    "function": {
+        "name": "analyze_cached_records",
+        "description": (
+            "直接分析本轮 list_records 已读到的完整内存回执，不再次请求 WPS。"
+            "可按实际字段 local_filters 筛选、分组统计；需要阅读匹配记录时设 "
+            "include_rows=true 并明确 fields，按 next_row_offset 续读紧凑行。"
+            "只统计已读到的源记录；source_is_complete=false 时不得声称全表完整。"
+            "若源数据有后续页，可继续按 WPS 游标读取或用 analyze_records 完整翻页。"
+            "比逐窗查看未筛选原始 JSON 更适合提取目标数据，且不预设业务表结构。"
+        ),
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "receipt_index": {
+                    "type": "integer",
+                    "description": "本轮 list_records 结果的 receipt_index",
+                },
+                **{
+                    key: value
+                    for key, value in ANALYZE_RECORDS_TOOL["function"]["parameters"]["properties"].items()
+                    if key not in {"file_id", "sheet_id", "filter", "view_id"}
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "紧凑行字符预算，默认 40000，最大 60000",
+                },
+            },
+            "required": ["receipt_index"],
+        },
+    },
+})
 
 TOOL_MAP = {
     "get_schema":    lambda at, a: get_schema(at, a["file_id"]),
@@ -2152,11 +2233,13 @@ async def _upload_and_attach(access_token: str, file_id: str, sheet_id: int,
     return {"ok": False, "error": f"文件上传成功但写入记录失败，API 返回 code={code}", "detail": result}
 
 
-def _compress_tool_result(name: str, result: dict) -> str:
+def _compress_tool_result(
+    name: str, result: dict, *, receipt_index: int | None = None,
+) -> tuple[str, bool]:
     """
     处理工具返回结果。
-    list_records 已在 wps_client 层自动翻页拉取全量数据，
-    此处只计算空行 ID 方便 AI 优先复用空行，不再截断记录数量。
+    list_records 在 wps_client 层读取原始记录；超出模型回传预算时，
+    只把有明确分页标记的窗口发给模型，完整结果仍保留在本轮回执中。
     """
     if name == "list_records":
         records = result.get("records", [])
@@ -2197,10 +2280,14 @@ def _compress_tool_result(name: str, result: dict) -> str:
             result["_note"] = f"已完整返回 {fetched} 条记录（共 {total} 条）。"
         if empty_row_ids:
             result["_note"] += (
-                f" 空行ID列表：{empty_row_ids}，新建记录前请优先用 update_records 填入空行。"
+                f" 空行共 {len(empty_row_ids)} 条，首条 ID：{empty_row_ids[0]}；"
+                "新建记录前请优先用 update_records 填入空行。"
             )
+        if receipt_index is not None:
+            view, windowed = bounded_record_view(result, receipt_index)
+            return json.dumps(view, ensure_ascii=False), windowed
 
-    return json.dumps(result, ensure_ascii=False)
+    return json.dumps(result, ensure_ascii=False), False
 
 
 _GUIDE_DAILY = """[填报知识导航 - 每日进展]
@@ -2862,14 +2949,17 @@ class Assistant:
         system_prompt = build_system_prompt(username, role, default_file, all_files, memory, now=_now)
         if self.supports_tools and self.smart_tool_routing:
             system_prompt += (
-                "\n\n## Goal-driven tool execution\n"
-                "- For multi-step, analytical, cross-table, or full-data tasks, call update_task_plan first.\n"
-                "- If a needed capability is not currently visible, call discover_tools; never infer that it is unavailable.\n"
-                "- Continue until the stated completion criteria are verified. There is no fixed tool-call round limit.\n"
-                "- For large-table analysis, get the schema, then prefer analyze_records with only necessary fields.\n"
-                "- After each large record batch, save verified conclusions in update_task_plan.findings before continuing.\n"
-                "- A partial page is not complete: follow next_page_token while has_more is true when full data is required.\n"
-                "- If progress stalls, revise the plan or discover another tool. Report blocked only when a concrete obstacle remains."
+                "\n\n## 自适应目标驱动执行\n"
+                "- 每个请求都根据用户当前目标、实际表结构和已取得证据现场判断所需深度，"
+                "不得按关键词套用固定业务流程或固定回答模板。\n"
+                "- 当任务需要外部证据、多个步骤、范围判断或业务研判时，使用 update_task_plan；"
+                "完成条件必须由当前请求和发现的数据动态产生，可以在取得新证据后修订。\n"
+                "- 工具不足时调用 discover_tools，不得因当前未展示某项工具就断言没有该能力。\n"
+                "- 最终回答前对照用户目标检查证据是否充分：有与目标相关的缺口就继续查询，"
+                "已经充分就停止，不为显得全面而读取无关数据。\n"
+                "- 大表先看结构，再优先用 analyze_records 只读取必要字段；需要全量时必须处理完整分页。\n"
+                "- 大批数据的已验证结论写入 update_task_plan.findings 后再压缩上下文。\n"
+                "- 任务以完成条件而非工具次数结束；只有存在具体阻碍时才能报告 blocked。"
             )
 
         # 部分 OpenAI 兼容接口（尤其部分千问网关）要求 system 只能出现在
@@ -3112,8 +3202,15 @@ class Assistant:
             )
             if enabled
         }
-        _complex_task = is_complex_task(_last_user_content)
         _plan_state = TaskPlanState()
+        _evidence_review_noted = False
+        _evidence_review_instruction = (
+            "## 本轮证据范围提醒\n"
+            "请对照用户目标判断已读取的数据是否足够。若足够，直接基于本轮工具事实回答，"
+            "不必为了形式上的计划再调用工具；若有直接相关的缺口，再精准补查。"
+            "局部窗口或未完成分页不得声称是全量数据。"
+            "复杂任务可以自选 update_task_plan，但它不是普通查询作答的前置条件。"
+        )
         _all_business_tool_names = {
             tool["function"]["name"] for tool in TOOLS
         }
@@ -3137,7 +3234,9 @@ class Assistant:
                 TOOLS,
                 _active_tool_names,
                 include_discovery=True,
-                include_plan=_complex_task or bool(_plan_state.goal),
+                # Planning is a general reasoning capability, not a feature that
+                # may be hidden by a keyword classifier.
+                include_plan=True,
             )
 
         _budget_tools = _tools_for_turn()
@@ -3586,6 +3685,62 @@ class Assistant:
                             steps=_plan_state.steps,
                             findings_count=len(_plan_state.findings),
                         )
+                    elif name == "read_record_window":
+                        try:
+                            receipt_index = int(args.get("receipt_index"))
+                            offset = int(args.get("offset") or 0)
+                            limit = int(args.get("limit") or 100)
+                            fields = args.get("fields")
+                            if fields is not None and not isinstance(fields, list):
+                                raise ValueError("fields 必须是字段名数组")
+                            if not 0 <= receipt_index < len(self.last_tool_receipts):
+                                raise ValueError("receipt_index 不属于本轮工具结果")
+                            source_receipt = self.last_tool_receipts[receipt_index]
+                            if source_receipt.get("name") != "list_records":
+                                raise ValueError("只能读取本轮 list_records 结果")
+                            source = source_receipt.get("result")
+                            if (not isinstance(source, dict)
+                                    or not isinstance(source.get("records"), list)
+                                    or source.get("error")):
+                                raise ValueError("该记录结果不可读取")
+                            if args.get("field") is not None:
+                                result = record_field_fragment(
+                                    source, receipt_index,
+                                    record_offset=int(args.get("record_offset")),
+                                    field=str(args["field"]),
+                                    char_offset=int(args.get("char_offset") or 0),
+                                )
+                            else:
+                                result, _ = bounded_record_view(
+                                    source, receipt_index, offset=offset, limit=limit,
+                                    fields=[str(item) for item in fields] if fields is not None else None,
+                                    force=True,
+                                )
+                        except (ValueError, TypeError) as exc:
+                            result = {"error": str(exc)}
+                    elif name == "analyze_cached_records":
+                        try:
+                            receipt_index = int(args.get("receipt_index"))
+                            if not 0 <= receipt_index < len(self.last_tool_receipts):
+                                raise ValueError("receipt_index 不属于本轮工具结果")
+                            source_receipt = self.last_tool_receipts[receipt_index]
+                            if source_receipt.get("name") != "list_records":
+                                raise ValueError("只能分析本轮 list_records 结果")
+                            source = source_receipt.get("result")
+                            if not isinstance(source, dict):
+                                raise ValueError("该记录结果不可分析")
+                            analysis_args = dict(args)
+                            analysis_args["max_chars"] = min(
+                                60_000, int(args.get("max_chars") or 40_000),
+                            )
+                            result = analyze_cached_records(source, analysis_args)
+                            if isinstance(result, dict) and not result.get("error"):
+                                result["_cached_analysis"] = {
+                                    "receipt_index": receipt_index,
+                                    "arguments": analysis_args,
+                                }
+                        except (ValueError, TypeError) as exc:
+                            result = {"error": str(exc)}
                     elif name == "save_memory":
                         if uid:
                             new_content, rejected = sanitize_memory_content(args.get("content", ""))
@@ -3945,13 +4100,29 @@ class Assistant:
                     print(f"[TOOL RESULT] {name} => {str(result)[:200]}")
                 except UnicodeEncodeError:
                     sys.stdout.write(f"[TOOL RESULT] {name} => {str(result)[:200]}\n")
+                receipt_index = len(self.last_tool_receipts)
                 _turn_receipts.append({"name": name, "args": args, "result": result})
                 self.last_tool_receipts.append({"name": name, "args": args, "result": result})
+                tool_content, windowed = _compress_tool_result(
+                    name, result,
+                    receipt_index=receipt_index if name == "list_records" else None,
+                )
+                if windowed:
+                    _active_tool_names.update({
+                        "read_record_window", "analyze_cached_records",
+                    })
                 full_messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
-                    "content": _compress_tool_result(name, result),
+                    "content": tool_content,
                 })
+            full_messages, folded_windows = compact_seen_record_windows(
+                full_messages,
+                preserve_recent_tool_messages=max(1, len(msg.tool_calls)),
+            )
+            if folded_windows:
+                _metrics.context_compactions += folded_windows
+                self.last_run_metrics = _metrics.snapshot()
             if _compact_after_plan:
                 full_messages, compacted = compact_tool_messages(
                     full_messages,
@@ -3968,6 +4139,14 @@ class Assistant:
                         compacted_results=compacted,
                         metrics=self.last_run_metrics,
                     )
+            if (
+                self.smart_tool_routing
+                and not _plan_state.goal
+                and not _evidence_review_noted
+                and needs_evidence_review(self.last_tool_receipts)
+            ):
+                _evidence_review_noted = True
+                _append_system_instruction(_evidence_review_instruction)
             _tool_fingerprint = hashlib.sha256(
                 json.dumps(
                     _turn_receipts,
