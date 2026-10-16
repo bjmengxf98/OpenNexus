@@ -90,6 +90,134 @@ def _tool(name, description=""):
     }
 
 
+def test_signed_get_includes_query_parameters_in_kso_request_uri(monkeypatch):
+    captured = {}
+
+    def fake_signed_headers(_token, method, request_uri, body):
+        captured["method"] = method
+        captured["request_uri"] = request_uri
+        captured["body"] = body
+        return {"X-Test-Signature": "ok"}
+
+    class FakeResponse:
+        is_success = True
+        text = ""
+
+        @staticmethod
+        def json():
+            return {"data": {"items": []}}
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, url, headers):
+            captured["url"] = url
+            captured["headers"] = headers
+            return FakeResponse()
+
+    monkeypatch.setattr(wps_client, "_signed_headers", fake_signed_headers)
+    monkeypatch.setattr(
+        wps_client.httpx, "AsyncClient", lambda **_kwargs: FakeClient(),
+    )
+
+    result = asyncio.run(wps_client._get(
+        "token",
+        "/v7/drives/drive/files/0/children",
+        params={"page_size": 50},
+        signed=True,
+    ))
+
+    expected_uri = "/v7/drives/drive/files/0/children?page_size=50"
+    assert result == {"data": {"items": []}}
+    assert captured["request_uri"] == expected_uri
+    assert captured["url"] == f"{wps_client.OPENAPI_HOST}{expected_uri}"
+    assert captured["method"] == "GET"
+    assert captured["body"] == ""
+
+
+def test_document_upload_uses_current_users_drive_not_source_file_owner(monkeypatch):
+    queried_drives = []
+
+    async def fake_get_current_wps_user_id(_token):
+        return "current-user"
+
+    async def fake_get_file_meta(_token, file_id, **_kwargs):
+        if file_id == "shared-file":
+            return {
+                "drive_id": "shared-drive",
+                "parent_id": "0",
+                "drive": {"allotee_type": "user", "allotee_id": "other-user"},
+                "permission": {"list": True, "upload": False},
+            }
+        return {
+            "drive_id": "current-user-drive",
+            "parent_id": "0",
+            "drive": {"allotee_type": "user", "allotee_id": "current-user"},
+            "permission": {"list": True, "upload": True},
+        }
+
+    async def fake_get_drive_children(_token, drive_id, parent_id, page_size=10):
+        queried_drives.append((drive_id, parent_id, page_size))
+        return {
+            "items": [
+                {"id": "ai-folder", "name": "AI附件", "type": "folder"},
+            ]
+        }
+
+    create_folder = AsyncMock()
+    monkeypatch.setattr(
+        wps_client, "get_current_wps_user_id", fake_get_current_wps_user_id,
+    )
+    monkeypatch.setattr(wps_client, "get_file_meta", fake_get_file_meta)
+    monkeypatch.setattr(wps_client, "get_drive_children", fake_get_drive_children)
+    monkeypatch.setattr(wps_client, "create_drive_folder", create_folder)
+    wps_client._drive_folder_cache.clear()
+
+    target = asyncio.run(wps_client._resolve_ai_attachment_folder(
+        "token",
+        "shared-file",
+        ["shared-file", "usable-file"],
+    ))
+
+    assert target == ("current-user-drive", "ai-folder")
+    assert queried_drives == [
+        ("current-user-drive", "0", 500),
+    ]
+    create_folder.assert_not_awaited()
+
+
+def test_document_upload_refuses_other_users_drive_when_no_owned_anchor(monkeypatch):
+    async def fake_get_current_wps_user_id(_token):
+        return "current-user"
+
+    async def fake_get_file_meta(_token, _file_id, **_kwargs):
+        return {
+            "drive_id": "shared-drive",
+            "parent_id": "0",
+            "drive": {"allotee_type": "user", "allotee_id": "other-user"},
+            "permission": {"list": True, "upload": True},
+        }
+
+    children = AsyncMock()
+    monkeypatch.setattr(
+        wps_client, "get_current_wps_user_id", fake_get_current_wps_user_id,
+    )
+    monkeypatch.setattr(wps_client, "get_file_meta", fake_get_file_meta)
+    monkeypatch.setattr(wps_client, "get_drive_children", children)
+    wps_client._drive_folder_cache.clear()
+
+    with pytest.raises(PermissionError, match="当前账号创建"):
+        asyncio.run(wps_client._resolve_ai_attachment_folder(
+            "token", "shared-file", ["shared-file"],
+        ))
+
+    children.assert_not_awaited()
+
+
 def test_initial_routing_keeps_full_data_tools_but_not_unrelated_channels():
     selected = initial_tool_names("请分析并总结今年全部工作记录")
     assert {"get_schema", "list_records"} <= selected
@@ -209,6 +337,146 @@ class _EvidenceReviewCompletions:
             tool_calls=tool_calls,
             reasoning_content=None,
         ))])
+
+
+@pytest.mark.parametrize("requested_anchor", ["source-table", None])
+def test_generate_document_always_uses_current_user_default_upload_anchor(
+    monkeypatch, requested_anchor,
+):
+    from agent import assistant as assistant_module
+
+    captured_args = []
+
+    async def fake_generate_document(_token, args):
+        captured_args.append(dict(args))
+        return {
+            "ok": True,
+            "file_name": "测试报告.docx",
+            "cloud_file_id": "cloud-file",
+        }
+
+    class DocumentCompletions(_EvidenceReviewCompletions):
+        async def create(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                arguments = {
+                    "title": "测试报告",
+                    "content": {
+                        "sections": [
+                            {"type": "title", "text": "测试报告"},
+                            {"type": "paragraph", "text": "正文"},
+                        ]
+                    },
+                    "doc_type": "report",
+                }
+                if requested_anchor is not None:
+                    arguments["dbsheet_file_id"] = requested_anchor
+                tool_calls = [self._tool_call(
+                    "document", "generate_document", arguments,
+                )]
+                content = None
+            else:
+                tool_calls = None
+                content = "文档已生成并上传。"
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                content=content,
+                tool_calls=tool_calls,
+                reasoning_content=None,
+            ))])
+
+    monkeypatch.setitem(
+        assistant_module.TOOL_MAP, "generate_document", fake_generate_document,
+    )
+
+    completions = DocumentCompletions()
+    assistant = Assistant.__new__(Assistant)
+    assistant.provider = "mock"
+    assistant.model = "mock-model"
+    assistant.client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    assistant.supports_tools = True
+    assistant.supports_vision = False
+    assistant.reasoning_mode = "off"
+    assistant.reasoning_effort = "auto"
+    assistant.context_window = 0
+    assistant.max_output_tokens = 1024
+    assistant.smart_tool_routing = True
+    assistant._auto_learn = AsyncMock()
+
+    reply = asyncio.run(assistant.chat(
+        [{"role": "user", "content": "生成一份测试报告"}],
+        access_token="token",
+        default_file={
+            "file_id": "user-default", "file_name": "部门事务", "sheet_id": 31,
+        },
+        all_files=[
+            {"file_id": "user-default", "file_name": "部门事务", "is_default": 1},
+            {"file_id": "source-table", "file_name": "技术质量月报", "is_default": 0},
+        ],
+    ))
+
+    assert reply == "文档已生成并上传。"
+    assert captured_args[0]["dbsheet_file_id"] == "user-default"
+    assert captured_args[0]["_upload_anchor_file_ids"] == [
+        "user-default", "source-table",
+    ]
+    assert assistant.last_tool_receipts[0]["args"]["dbsheet_file_id"] == "user-default"
+    assert "_upload_anchor_file_ids" not in assistant.last_tool_receipts[0]["args"]
+
+
+def test_generate_document_rejects_model_anchor_without_user_wps_file(monkeypatch):
+    from agent import assistant as assistant_module
+
+    fake_generate_document = AsyncMock(return_value={"ok": True})
+
+    class DocumentCompletions(_EvidenceReviewCompletions):
+        async def create(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                tool_calls = [self._tool_call("document", "generate_document", {
+                    "title": "测试报告",
+                    "content": {
+                        "sections": [{"type": "paragraph", "text": "正文"}],
+                    },
+                    "dbsheet_file_id": "model-supplied-external-file",
+                })]
+                content = None
+            else:
+                tool_calls = None
+                content = "当前用户尚未配置 WPS 文件，无法上传。"
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                content=content,
+                tool_calls=tool_calls,
+                reasoning_content=None,
+            ))])
+
+    monkeypatch.setitem(
+        assistant_module.TOOL_MAP, "generate_document", fake_generate_document,
+    )
+
+    completions = DocumentCompletions()
+    assistant = Assistant.__new__(Assistant)
+    assistant.provider = "mock"
+    assistant.model = "mock-model"
+    assistant.client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    assistant.supports_tools = True
+    assistant.supports_vision = False
+    assistant.reasoning_mode = "off"
+    assistant.reasoning_effort = "auto"
+    assistant.context_window = 0
+    assistant.max_output_tokens = 1024
+    assistant.smart_tool_routing = True
+    assistant._auto_learn = AsyncMock()
+
+    reply = asyncio.run(assistant.chat(
+        [{"role": "user", "content": "生成一份测试报告"}],
+        access_token="token",
+        default_file=None,
+        all_files=[],
+    ))
+
+    assert reply == "当前用户尚未配置 WPS 文件，无法上传。"
+    fake_generate_document.assert_not_awaited()
+    assert "当前用户尚未配置" in assistant.last_tool_receipts[0]["result"]["error"]
 
 
 def test_read_evidence_can_answer_without_mandatory_plan(monkeypatch):

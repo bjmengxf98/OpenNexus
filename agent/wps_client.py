@@ -50,6 +50,18 @@ def _signed_headers(access_token: str, method: str, path: str, body_str: str) ->
     return headers
 
 
+def _request_uri_with_query(path: str, params: dict | None = None) -> str:
+    """构造与实际 HTTP 请求完全一致的 RequestURI，供 KSO-1 签名使用。
+
+    WPS KSO-1 明确要求 RequestURI 包含 query 参数。签名遗漏查询串时，
+    不带参数的接口仍可成功，但 children 等分页 GET 会返回 403。
+    """
+    if not params:
+        return path
+    query = str(httpx.QueryParams(params))
+    return f"{path}?{query}" if query else path
+
+
 # ── HTTP 基础方法 ───────────────────────────────────────────
 
 async def _post(access_token: str, path: str, body: dict, signed: bool = False,
@@ -76,13 +88,15 @@ async def _post(access_token: str, path: str, body: dict, signed: bool = False,
 async def _get(access_token: str, path: str, params: dict = None, signed: bool = False) -> dict:
     import logging
     logger = logging.getLogger(__name__)
-    url = f"{OPENAPI_HOST}{path}"
-    headers = (_signed_headers(access_token, "GET", path, "")
+    request_uri = _request_uri_with_query(path, params)
+    url = f"{OPENAPI_HOST}{request_uri}"
+    headers = (_signed_headers(access_token, "GET", request_uri, "")
                if signed else _base_headers(access_token))
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(url, headers=headers, params=params)
+        # 查询串已经固化进 URL，避免 httpx 再编码后与签名 URI 不一致。
+        resp = await client.get(url, headers=headers)
         if not resp.is_success:
-            logger.error(f"[WPS API ERROR] GET {resp.status_code} {path}")
+            logger.error(f"[WPS API ERROR] GET {resp.status_code} {request_uri}")
             logger.error(f"[WPS API ERROR] response: {resp.text}")
             resp.raise_for_status()
         return resp.json()
@@ -639,10 +653,39 @@ async def upload_attachment(access_token: str, file_id: str,
 
 # ── 网盘上传（kso.file.readwrite，需要用户 token + KSO-1 签名）──
 
-async def get_file_meta(access_token: str, file_id: str) -> dict:
+async def get_file_meta(access_token: str, file_id: str,
+                        with_drive: bool = False,
+                        with_permission: bool = False) -> dict:
     """获取文件元数据，含 drive_id / parent_id"""
-    result = await _get(access_token, f"/v7/files/{file_id}/meta", signed=True)
+    params = {}
+    if with_drive:
+        params["with_drive"] = True
+    if with_permission:
+        params["with_permission"] = True
+    result = await _get(
+        access_token,
+        f"/v7/files/{file_id}/meta",
+        params=params or None,
+        signed=True,
+    )
     return result.get("data", result)
+
+
+_current_wps_user_cache: dict[str, str] = {}
+
+
+async def get_current_wps_user_id(access_token: str) -> str:
+    """返回 token 对应的 WPS 用户 ID，用于隔离各用户的个人网盘。"""
+    token_key = hashlib.sha256(access_token.encode("utf-8")).hexdigest()
+    cached = _current_wps_user_cache.get(token_key)
+    if cached:
+        return cached
+    result = await _get(access_token, "/v7/users/current_id", signed=True)
+    user_id = str((result.get("data") or {}).get("user_id") or "").strip()
+    if not user_id:
+        raise ValueError("无法确认当前 WPS 用户身份，不能安全选择文档上传空间")
+    _current_wps_user_cache[token_key] = user_id
+    return user_id
 
 
 async def get_drive_children(access_token: str, drive_id: str, parent_id: str,
@@ -686,8 +729,139 @@ async def create_dbsheet(access_token: str, name: str, ref_file_id: str) -> dict
 
 
 # 缓存已创建/找到的 AI附件 文件夹 ID，避免每次上传都创建新文件夹
-# key: drive_id, value: folder_id
+# key: (wps_user_id, drive_id), value: folder_id，避免多用户共享进程串用目标。
 _drive_folder_cache: dict = {}
+
+
+def _ordered_file_ids(primary_file_id: str, candidate_file_ids=None) -> list[str]:
+    """合并上传定位锚点并去重，禁止空值进入 WPS API。"""
+    ordered = []
+    for value in [primary_file_id, *(candidate_file_ids or [])]:
+        file_id = str(value or "").strip()
+        if file_id and file_id not in ordered:
+            ordered.append(file_id)
+    return ordered
+
+
+async def _resolve_ai_attachment_folder(access_token: str,
+                                        primary_file_id: str,
+                                        candidate_file_ids=None) -> tuple[str, str]:
+    """从当前用户已配置的文件空间中定位可写的「AI附件」。
+
+    被分享单个文件并不等于拥有其所在 drive 根目录的列举/上传权限。
+    因此不能把当前数据来源表或默认表当作唯一存储锚点：先遍历候选
+    drive 寻找已存在的「AI附件」，受限 drive 自动跳过；全部都没有时，
+    再在第一个允许列根目录的 drive 中尝试创建。
+    """
+    file_ids = _ordered_file_ids(primary_file_id, candidate_file_ids)
+    if not file_ids:
+        raise ValueError("当前用户没有可用于定位 WPS 文件空间的已配置文件")
+
+    current_wps_user_id = await get_current_wps_user_id(access_token)
+    accessible_drives: list[str] = []
+    seen_drives: set[str] = set()
+    skipped_statuses: list[int] = []
+
+    for file_id in file_ids:
+        try:
+            meta = await get_file_meta(
+                access_token,
+                file_id,
+                with_drive=True,
+                with_permission=True,
+            )
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status in {400, 403, 404}:
+                skipped_statuses.append(status)
+                print(f"[DRIVE UPLOAD] skip configured file: meta HTTP {status}")
+                continue
+            raise
+
+        drive_id = str(meta.get("drive_id") or "").strip()
+        if not drive_id or drive_id in seen_drives:
+            continue
+        seen_drives.add(drive_id)
+
+        drive = meta.get("drive") or {}
+        allotee_type = str(drive.get("allotee_type") or "")
+        allotee_id = str(drive.get("allotee_id") or "")
+        if allotee_type != "user" or allotee_id != current_wps_user_id:
+            print(
+                "[DRIVE UPLOAD] skip non-owned drive "
+                f"type={allotee_type or '<unknown>'}"
+            )
+            continue
+
+        permission = meta.get("permission") or {}
+        if permission.get("list") is False or permission.get("upload") is False:
+            print("[DRIVE UPLOAD] skip personal drive without list/upload permission")
+            continue
+
+        cache_key = (current_wps_user_id, drive_id)
+        cached_folder_id = _drive_folder_cache.get(cache_key)
+        if cached_folder_id:
+            print(f"[DRIVE UPLOAD] using cached AI attachment folder in drive={drive_id}")
+            return drive_id, cached_folder_id
+
+        try:
+            children = await get_drive_children(
+                access_token, drive_id, "0", page_size=500,
+            )
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status in {400, 403, 404}:
+                skipped_statuses.append(status)
+                print(f"[DRIVE UPLOAD] skip drive={drive_id}: root HTTP {status}")
+                continue
+            raise
+
+        accessible_drives.append(drive_id)
+        items = children.get("items", [])
+        exact_id = None
+        fuzzy_id = None
+        for item in items:
+            item_name = str(item.get("name") or "")
+            item_type = item.get("file_type") or item.get("type") or ""
+            if item_type != "folder":
+                continue
+            if item_name == "AI附件":
+                exact_id = str(item.get("id") or "")
+                break
+            if item_name.startswith("AI附件(") and not fuzzy_id:
+                fuzzy_id = str(item.get("id") or "")
+
+        folder_id = exact_id or fuzzy_id
+        if folder_id:
+            _drive_folder_cache[cache_key] = folder_id
+            print(f"[DRIVE UPLOAD] found AI attachment folder in drive={drive_id}")
+            return drive_id, folder_id
+
+    # 先搜索所有可访问 drive，再创建，避免在前一个共享空间产生重复目录，
+    # 而忽略后一个空间里已经存在的用户「AI附件」。
+    for drive_id in accessible_drives:
+        try:
+            folder_result = await create_drive_folder(
+                access_token, drive_id, "0", "AI附件",
+            )
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status in {400, 403, 404}:
+                skipped_statuses.append(status)
+                print(f"[DRIVE UPLOAD] cannot create folder in drive={drive_id}: HTTP {status}")
+                continue
+            raise
+        folder_id = str(folder_result.get("id") or folder_result.get("file_id") or "")
+        if folder_id:
+            _drive_folder_cache[(current_wps_user_id, drive_id)] = folder_id
+            print(f"[DRIVE UPLOAD] created AI attachment folder in drive={drive_id}")
+            return drive_id, folder_id
+
+    suffix = f"（已跳过 {len(skipped_statuses)} 个无目录权限的文件空间）" if skipped_statuses else ""
+    raise PermissionError(
+        "当前账号已配置的 WPS 文件中，没有可用于定位本人个人网盘的文件；"
+        "请先添加一个由当前账号创建的 WPS 文件" + suffix
+    )
 
 
 async def _drive_upload_apply(access_token: str, drive_id: str, parent_id: str,
@@ -722,7 +896,8 @@ async def _drive_upload_commit(access_token: str, drive_id: str, parent_id: str,
 
 async def upload_to_drive(access_token: str, dbsheet_file_id: str,
                            file_name: str, file_data: bytes,
-                           content_type: str = "application/octet-stream") -> dict:
+                           content_type: str = "application/octet-stream",
+                           candidate_file_ids=None) -> dict:
     """
     将文件上传到 WPS 网盘（与多维表格同目录），返回可写入 Attachment 字段的云文档格式：
     {"name": "...", "mode": "cloud", "type": "docx", "uploadId": "网盘file_id", "size": N}
@@ -735,56 +910,11 @@ async def upload_to_drive(access_token: str, dbsheet_file_id: str,
     """
     from pathlib import Path as _Path
 
-    # Step 1: 获取多维表格所在的 drive_id 和 parent_id
-    print(f"[DRIVE UPLOAD] get_file_meta file_id={dbsheet_file_id}")
-    meta = await get_file_meta(access_token, dbsheet_file_id)
-    print(f"[DRIVE UPLOAD] meta={str(meta)[:500]}")
-    drive_id  = meta.get("drive_id")
-    parent_id = str(meta.get("parent_id") or meta.get("parentId") or "0")
-    if not drive_id:
-        raise ValueError(f"无法获取 drive_id，file meta 返回: {meta}")
-
-    # request_upload 接口不接受 parent_id="0"（根目录别名）
-    # 需要获取或创建一个真实的文件夹 ID
-    if parent_id == "0":
-        # 使用缓存的文件夹 ID
-        if drive_id in _drive_folder_cache:
-            parent_id = _drive_folder_cache[drive_id]
-            print(f"[DRIVE UPLOAD] using cached folder_id={parent_id}")
-        else:
-            # 先尝试从根目录子列表找「AI附件」文件夹
-            print(f"[DRIVE UPLOAD] parent_id=0, looking for 'AI附件' folder in root")
-            children = await get_drive_children(access_token, drive_id, "0", page_size=50)
-            items = children.get("items", [])
-            print(f"[DRIVE UPLOAD] root children count={len(items)}, names={[i.get('name') for i in items[:10]]}")
-            folder_id = None
-            exact_id  = None   # 精确匹配 "AI附件"
-            fuzzy_id  = None   # 模糊匹配 "AI附件(N)"
-            for item in items:
-                item_name = item.get("name", "")
-                item_type = item.get("file_type") or item.get("type") or ""
-                if item_type != "folder":
-                    continue
-                if item_name == "AI附件":
-                    exact_id = str(item.get("id"))
-                    break   # 精确匹配，立即停止
-                elif item_name.startswith("AI附件(") and not fuzzy_id:
-                    fuzzy_id = str(item.get("id"))
-            folder_id = exact_id or fuzzy_id
-            if folder_id:
-                chosen_name = "AI附件" if exact_id else "AI附件(N)"
-                print(f"[DRIVE UPLOAD] found existing '{chosen_name}' folder id={folder_id}")
-            if not folder_id:
-                # 创建「AI附件」文件夹
-                print(f"[DRIVE UPLOAD] creating 'AI附件' folder in root")
-                folder_result = await create_drive_folder(access_token, drive_id, "0", "AI附件")
-                folder_id = str(folder_result.get("id") or folder_result.get("file_id") or "")
-                print(f"[DRIVE UPLOAD] created folder: {folder_result}")
-            if not folder_id:
-                raise ValueError(f"无法获取或创建 AI附件 文件夹: {folder_result}")
-            _drive_folder_cache[drive_id] = folder_id
-            parent_id = folder_id
-            print(f"[DRIVE UPLOAD] using folder_id={parent_id}")
+    # Step 1: 数据来源表与文档存储空间解耦。共享单文件可能允许读表，
+    # 却不允许列出其 drive 根目录；自动在当前用户的已配置空间中回退。
+    drive_id, parent_id = await _resolve_ai_attachment_folder(
+        access_token, dbsheet_file_id, candidate_file_ids,
+    )
 
     # Step 2: 申请上传（hashes 数组格式，公网必传 sha256）
     import hashlib as _hashlib

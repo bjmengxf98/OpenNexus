@@ -409,7 +409,7 @@ content 参数是一个 JSON 对象（不是字符串），包含 sections 数�
 **参数**：
 - title：文档标题（用于文件命名）
 - content：JSON 对象（上述格式，不要序列化为字符串）
-- dbsheet_file_id：当前活跃多维表格的 file_id
+- dbsheet_file_id：兼容字段，可省略；系统会在当前用户已配置且有目录权限的 WPS 文件空间中定位「AI附件」，不得根据数据来源表决定最终上传位置
 - doc_type：official_red（红头公文）/ official（普通公文）/ report（报告）/ notice（通知）/ minutes（纪要）
 - metadata：可选
 
@@ -1776,7 +1776,7 @@ TOOLS = [
                     },
                     "dbsheet_file_id": {
                         "type": "string",
-                        "description": "WPS 多维表格 ID（可选）"
+                        "description": "兼容字段（可选）；实际上传位置由系统按当前 WPS 用户身份和本人文件空间确定，数据来源表不会改变文档存放位置"
                     },
                     "doc_type": {
                         "type": "string",
@@ -1968,7 +1968,7 @@ TOOL_MAP = {
     "generate_document": lambda at, a: _generate_document(
         at, a["title"], a["content"],
         a.get("dbsheet_file_id"), a.get("doc_type", "report"),
-        a.get("metadata")
+        a.get("metadata"), a.get("_upload_anchor_file_ids")
     ),  # 返回 coroutine，由 chat() 中的 await 处理
     # 仪表盘
     "list_dashboards":   lambda at, a: list_dashboards(at, a["file_id"]),
@@ -3025,6 +3025,18 @@ class Assistant:
         if default_file:
             _valid_file_ids.add(default_file["file_id"])
         _active_file_id = default_file["file_id"] if default_file else None
+        # 文档的数据来源与上传位置必须分离。共享单个表格不代表当前账号
+        # 能列出该表格所在 drive 的根目录，因此把用户全部已配置文件作为
+        # 候选锚点；上传层会核对 drive 所有者，跳过他人 drive，并优先
+        # 复用当前 WPS 用户个人空间中已有的「AI附件」。
+        _document_upload_anchor_ids = []
+        for _anchor in [default_file, *(all_files or [])]:
+            _anchor_id = str((_anchor or {}).get("file_id") or "")
+            if _anchor_id and _anchor_id not in _document_upload_anchor_ids:
+                _document_upload_anchor_ids.append(_anchor_id)
+        _document_upload_anchor_id = (
+            _document_upload_anchor_ids[0] if _document_upload_anchor_ids else ""
+        )
 
         # schema 缓存：get_schema 调用成功后记录 file_id → {sheet_id: sheet_name}
         # 用于后续工具调用时 sheet_id 缺失/为0 时自动补齐
@@ -3973,9 +3985,29 @@ class Assistant:
                                     result = {"ok": True, "message": f"提醒 {rid} 已取消"}
                                 else:
                                     result = {"error": f"提醒 {rid} 不存在或无权限取消"}
+                    elif name == "generate_document" and not _document_upload_anchor_id:
+                        result = {
+                            "error": (
+                                "当前用户尚未配置可用于定位本人 WPS 网盘的文件，"
+                                "请先在设置中添加一个由本人创建的 WPS 文件。"
+                            )
+                        }
                     elif not access_token and name not in _LOCAL_TOOLS:
                         result = {"error": "未连接WPS，请先点击右上角「连接WPS」完成授权"}
                     elif name in TOOL_MAP:
+                        if name == "generate_document":
+                            requested_anchor = str(args.get("dbsheet_file_id") or "")
+                            if requested_anchor != _document_upload_anchor_id:
+                                print(
+                                    "[DOCUMENT UPLOAD ANCHOR] "
+                                    f"override requested={requested_anchor or '<empty>'} "
+                                    f"with primary_user_anchor={_document_upload_anchor_id}"
+                                )
+                            args["dbsheet_file_id"] = _document_upload_anchor_id
+                            args["_upload_anchor_file_ids"] = list(
+                                _document_upload_anchor_ids
+                            )
+
                         # 传统表格工具（sheets_*）不做 file_id 白名单校验，用户直接提供 file_id
                         _is_sheets_tool = name.startswith("sheets_")
                         if not _is_sheets_tool and _active_file_id and "file_id" in args:
@@ -4101,8 +4133,10 @@ class Assistant:
                 except UnicodeEncodeError:
                     sys.stdout.write(f"[TOOL RESULT] {name} => {str(result)[:200]}\n")
                 receipt_index = len(self.last_tool_receipts)
-                _turn_receipts.append({"name": name, "args": args, "result": result})
-                self.last_tool_receipts.append({"name": name, "args": args, "result": result})
+                _receipt_args = dict(args)
+                _receipt_args.pop("_upload_anchor_file_ids", None)
+                _turn_receipts.append({"name": name, "args": _receipt_args, "result": result})
+                self.last_tool_receipts.append({"name": name, "args": _receipt_args, "result": result})
                 tool_content, windowed = _compress_tool_result(
                     name, result,
                     receipt_index=receipt_index if name == "list_records" else None,

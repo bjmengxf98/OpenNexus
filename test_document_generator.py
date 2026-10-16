@@ -102,11 +102,15 @@ def test_valid_structure_renders_and_uploads_docx_without_raw_json():
                 content=_sample_structure(),
                 dbsheet_file_id="file-id",
                 doc_type="report",
+                upload_anchor_file_ids=["file-id", "fallback-file"],
             )
         )
 
     assert result["ok"] is True
     fake_wps.upload_to_drive.assert_awaited_once()
+    assert fake_wps.upload_to_drive.await_args.kwargs["candidate_file_ids"] == [
+        "file-id", "fallback-file",
+    ]
     uploaded_bytes = fake_wps.upload_to_drive.await_args.args[3]
     document = Document(io.BytesIO(uploaded_bytes))
     rendered_text = "\n".join(paragraph.text for paragraph in document.paragraphs)
