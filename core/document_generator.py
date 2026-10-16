@@ -170,7 +170,8 @@ async def generate_and_upload_document(
     content,
     dbsheet_file_id: Optional[str] = None,
     doc_type: str = "report",
-    metadata: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None,
+    upload_anchor_file_ids: Optional[list[str]] = None,
 ) -> Dict[str, Any]:
     """
     在内存中生成 Word 文档并上传到 WPS 网盘。
@@ -182,6 +183,7 @@ async def generate_and_upload_document(
         content: 文档结构对象；兼容合法 JSON 字符串
         doc_type: 文档类型 - official/report/notice/minutes/other
         metadata: 元数据（author/date/doc_number 等）
+        upload_anchor_file_ids: 当前用户已配置的 WPS 文件定位锚点（内部参数）
 
     content JSON 格式示例：
     {
@@ -245,7 +247,8 @@ async def generate_and_upload_document(
 
         from agent.wps_client import upload_to_drive
         upload_result = await upload_to_drive(access_token, dbsheet_file_id, file_name, file_data,
-                                               content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                                               content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                               candidate_file_ids=upload_anchor_file_ids)
 
         cloud_file_id = upload_result.get("uploadId") or upload_result.get("id")
         if not cloud_file_id:
