@@ -8,7 +8,7 @@ import mimetypes
 from pathlib import Path
 from openai import AsyncOpenAI, APIConnectionError, APITimeoutError, RateLimitError
 from agent.wps_client import (
-    get_schema,
+    get_file_structure,
     list_records, create_records, update_records, delete_records,
     create_sheet, delete_sheet,
     create_fields, update_fields, delete_fields,
@@ -477,6 +477,9 @@ content 参数是一个 JSON 对象（不是字符串），包含 sections 数�
 
 ## WPS 工具使用规则
 
+**先识别实际文件类型**：配置中的 WPS 文件可能是多维表格，也可能是普通电子表格。类型不明时先调用 get_schema，它会自动识别并返回 file_type 与适用读取工具；不得仅凭备注名称或“默认表”认定是多维表格。file_type=spreadsheet 时按实际工作表使用 sheets_get_range/sheets_find_range；file_type=dbsheet 才使用 list_records/analyze_records。以下涉及记录、字段、关联、视图的接口规则仅适用于多维表格；普通电子表格遵循后文的行列区域操作规则。
+某文件读取失败，不能重复调用不适用接口或擅自用另一文件的结果代替该文件的分析；确需补充其他来源时，必须明确来源和当前缺口。
+
 ### 意图判断（重要）
 在调用工具前，**先理解用户的真实意图**，然后选择合适的工具：
 
@@ -671,12 +674,12 @@ def build_system_prompt(username: str, role: str,
     if not all_files:
         # 兼容只传 default_file 的旧调用
         if default_file:
-            file_hint = f"默认多维表格：{default_file.get('file_name') or default_file['file_id']}（file_id: {default_file['file_id']}）"
+            file_hint = f"默认 WPS 表格：{default_file.get('file_name') or default_file['file_id']}（file_id: {default_file['file_id']}；类型由 get_schema 自动识别）"
         else:
-            file_hint = "尚未配置默认多维表格，请提醒用户在设置中添加。"
+            file_hint = "尚未配置默认 WPS 表格，请提醒用户在设置中添加。"
     elif len(all_files) == 1:
         f = all_files[0]
-        file_hint = f"默认多维表格：{f.get('file_name') or f['file_id']}（file_id: {f['file_id']}）"
+        file_hint = f"默认 WPS 表格：{f.get('file_name') or f['file_id']}（file_id: {f['file_id']}；类型由 get_schema 自动识别）"
     else:
         lines = []
         for f in all_files:
@@ -688,7 +691,7 @@ def build_system_prompt(username: str, role: str,
             if default_file else "第一个"
         )
         file_hint = (
-            f"已配置 {len(all_files)} 个多维表格，**当前默认：{default_name}**（此配置来自系统，优先级高于记忆，不得与记忆冲突）\n"
+            f"已配置 {len(all_files)} 个 WPS 表格，**当前默认：{default_name}**（此配置来自系统，优先级高于记忆，不得与记忆冲突；实际类型由 get_schema 自动识别）\n"
             + "\n".join(lines)
             + "\n操作时如用户未指定表格，使用默认表格；用户说\"切换到XX表\"时可直接使用对应 file_id。"
         )
@@ -771,7 +774,11 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_schema",
-            "description": "获取多维表格结构：所有工作表名称、sheet_id、字段名称、字段类型、字段id",
+            "description": (
+                "自动识别 WPS 文件是多维表格还是普通电子表格，并读取实际工作表结构。"
+                "类型不明时先调用此工具，无需用户说明类型。返回 file_type 和 recommended_tools；"
+                "多维表格还返回字段信息，普通电子表格后续应使用 sheets_get_range/sheets_find_range。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1936,7 +1943,7 @@ TOOLS.append({
 })
 
 TOOL_MAP = {
-    "get_schema":    lambda at, a: get_schema(at, a["file_id"]),
+    "get_schema":    lambda at, a: get_file_structure(at, a["file_id"]),
     "list_records":  lambda at, a: list_records(at, a["file_id"], a["sheet_id"],
                                                 a.get("page_size", 1000),
                                                 a.get("page_token") if isinstance(a.get("page_token"), str) and not a.get("page_token", "").isdigit() else None,
@@ -2957,7 +2964,7 @@ class Assistant:
                 "- 工具不足时调用 discover_tools，不得因当前未展示某项工具就断言没有该能力。\n"
                 "- 最终回答前对照用户目标检查证据是否充分：有与目标相关的缺口就继续查询，"
                 "已经充分就停止，不为显得全面而读取无关数据。\n"
-                "- 大表先看结构，再优先用 analyze_records 只读取必要字段；需要全量时必须处理完整分页。\n"
+                "- 大表先识别类型并看结构：多维表格优先用 analyze_records 读取必要字段，普通电子表格用 sheets_get_range 按区域读取；需要全量时必须处理完整分页或区域范围。\n"
                 "- 大批数据的已验证结论写入 update_task_plan.findings 后再压缩上下文。\n"
                 "- 任务以完成条件而非工具次数结束；只有存在具体阻碍时才能报告 blocked。"
             )
@@ -3041,6 +3048,7 @@ class Assistant:
         # schema 缓存：get_schema 调用成功后记录 file_id → {sheet_id: sheet_name}
         # 用于后续工具调用时 sheet_id 缺失/为0 时自动补齐
         _schema_cache: dict[str, dict] = {}  # {file_id: {sheet_id: int, sheets: list}}
+        _file_type_cache: dict[str, str] = {}  # 仅当前用户本轮已核实的文件类型
 
         # 问候/闲聊检测 → 直接返回，不调工具，不受历史上下文影响
         _GREETING_KW = ["在吗", "你好", "hi", "hello", "在不在", "有人吗", "在线吗", "忙吗", "打扰一下"]
@@ -3232,6 +3240,9 @@ class Assistant:
             )
         else:
             _active_tool_names = set(_all_business_tool_names)
+        # 文件结构识别是通用只读能力，不依赖“Excel”等词出现在用户指令中。
+        if _valid_file_ids:
+            _active_tool_names.add("get_schema")
         if _task_create_required:
             _active_tool_names.update({
                 "get_schema", "list_records", "create_records",
@@ -4034,8 +4045,23 @@ class Assistant:
                                     args["sheet_id"] = _fallback_sid
 
                         import asyncio as _asyncio
-                        _r = TOOL_MAP[name](access_token, args)
-                        result = await _r if _asyncio.iscoroutine(_r) else _r
+                        _known_file_type = _file_type_cache.get(str(args.get("file_id") or ""))
+                        if (
+                            _known_file_type == "spreadsheet"
+                            and not _is_sheets_tool
+                            and name not in {"get_schema", "get_change_log"}
+                        ):
+                            _active_tool_names.update({"sheets_list_worksheets", "sheets_get_range", "sheets_find_range"})
+                            result = {
+                                "error": "当前文件已核实为普通电子表格，此工具仅适用于多维表格。",
+                                "code": "file_type_mismatch",
+                                "file_id": args.get("file_id"),
+                                "file_type": "spreadsheet",
+                                "recommended_tools": ["sheets_get_range", "sheets_find_range"],
+                            }
+                        else:
+                            _r = TOOL_MAP[name](access_token, args)
+                            result = await _r if _asyncio.iscoroutine(_r) else _r
 
                         if (
                             name == "list_records"
@@ -4095,11 +4121,19 @@ class Assistant:
                             except Exception:
                                 pass
 
-                        # get_schema 成功后写入缓存，供后续工具调用补齐 sheet_id
-                        if name == "get_schema" and isinstance(result, dict):
+                        # 文件类型来自同一用户本轮的成功结构回执；电子表格不能
+                        # 写入多维表格 sheet_id 兜底缓存，也不能触发多维写接口。
+                        if name in {"get_schema", "sheets_list_worksheets"} and isinstance(result, dict) and not result.get("error"):
                             _fid = args.get("file_id", "")
                             _sheets = result.get("sheets") or result.get("data", {}).get("sheets") or []
-                            if _sheets and _fid:
+                            _kind = "spreadsheet" if name == "sheets_list_worksheets" else result.get("file_type", "dbsheet")
+                            if _fid and _kind in {"spreadsheet", "dbsheet"}:
+                                _file_type_cache[_fid] = _kind
+                                if _kind == "spreadsheet":
+                                    _active_tool_names.update({"sheets_list_worksheets", "sheets_get_range", "sheets_find_range"})
+                                else:
+                                    _active_tool_names.update({"list_records", "analyze_records"})
+                            if _kind == "dbsheet" and _sheets and _fid:
                                 _first = _sheets[0]
                                 _sid = _first.get("sheet_id") or _first.get("id")
                                 if _sid:

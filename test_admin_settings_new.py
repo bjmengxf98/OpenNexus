@@ -78,6 +78,12 @@ def test_all_pages_have_no_server_ui_runtime():
 
 
 
+def test_wps_settings_support_both_table_types_without_manual_type_selection():
+    text = (Path(__file__).parent / "static" / "settings_new.html").read_text(encoding="utf-8")
+    assert "<h2>WPS 表格</h2>" in text
+    assert "支持普通电子表格和多维表格，读取时自动识别类型" in text
+
+
 def test_login_card_is_compact_and_password_uses_browser_credentials():
     auth_html = (
         Path(__file__).parent / "static" / "auth.html"

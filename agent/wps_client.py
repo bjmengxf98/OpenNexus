@@ -144,6 +144,106 @@ async def get_schema(access_token: str, file_id: str) -> dict:
     return result.get("data", result)
 
 
+def _file_kind_from_metadata(meta: dict) -> str | None:
+    """只依据 WPS 实际文件信息判断，不使用用户备注或业务名称。"""
+    kind = str(meta.get("resource_type") or meta.get("file_type") or meta.get("type") or "").lower()
+    if kind in {"dbsheet", "dbt"}:
+        return "dbsheet"
+    if kind in {"sheet", "spreadsheet", "et"}:
+        return "spreadsheet"
+    suffix = str(meta.get("name") or "").rpartition(".")[2].lower()
+    if suffix == "dbt":
+        return "dbsheet"
+    if suffix in {"xlsx", "xls", "xlsm", "xlsb", "xltx", "xltm", "et", "ett", "ods"}:
+        return "spreadsheet"
+    return None
+
+
+def _file_structure_error(exc: httpx.HTTPStatusError, file_id: str,
+                          file_type: str | None = None) -> dict:
+    try:
+        body = exc.response.json()
+    except ValueError:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    debug = body.get("debug") or {}
+    if not isinstance(debug, dict):
+        debug = {}
+    message = str(body.get("msg") or body.get("message") or exc.response.reason_phrase)
+    return {
+        "error": f"读取当前文件结构失败：{message}",
+        "file_id": file_id,
+        "file_type": file_type or "unknown",
+        "http_status": exc.response.status_code,
+        "wps_code": body.get("code"),
+        "wps_error_type": debug.get("type"),
+        "_routing_hint": (
+            "按真实错误说明当前文件未读取成功；不要仅凭 400 推断权限失效或文件损坏，"
+            "也不要用另一个文件的结果冒充当前文件的分析。"
+        ),
+    }
+
+
+async def get_file_structure(access_token: str, file_id: str) -> dict:
+    """智能体通用结构入口：在同一文件内选择多维或电子表格接口。
+
+    保留底层 get_schema 的多维表格契约，避免影响驾驶舱等既有调用方。
+    元数据权限不足时仍允许尝试原有结构读取；认证失败则立即返回。
+    只有明确的“不支持该命令/文件类型”错误才尝试另一条只读路线。
+    """
+    meta = {}
+    try:
+        meta = await get_file_meta(access_token, file_id)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code not in {400, 403, 404}:
+            return _file_structure_error(exc, file_id)
+
+    inferred_kind = _file_kind_from_metadata(meta)
+    order = ["spreadsheet", "dbsheet"] if inferred_kind == "spreadsheet" else ["dbsheet", "spreadsheet"]
+    for index, kind in enumerate(order):
+        try:
+            if kind == "spreadsheet":
+                structure = await sheets_list_worksheets(access_token, file_id)
+            else:
+                structure = await get_schema(access_token, file_id)
+        except httpx.HTTPStatusError as exc:
+            error = _file_structure_error(exc, file_id, inferred_kind)
+            unsupported = (
+                exc.response.status_code == 400
+                and (
+                    error["wps_error_type"] in {"E_COMMAND_NOT_FOUND", "E_UNSUPPORTED_FILE_TYPE"}
+                    or "command not found" in error["error"].lower()
+                )
+            )
+            if index == 0 and unsupported:
+                continue
+            return error
+
+        import logging
+        logging.getLogger(__name__).info(
+            "[WPS FILE TYPE] file=%s type=%s route=%s",
+            file_id, kind, "sheets" if kind == "spreadsheet" else "dbsheet",
+        )
+        return {
+            **structure,
+            "file_id": file_id,
+            "file_name": str(meta.get("name") or ""),
+            "file_type": kind,
+            "recommended_tools": (
+                ["sheets_get_range", "sheets_find_range"] if kind == "spreadsheet"
+                else ["list_records", "analyze_records"]
+            ),
+            "_routing_hint": (
+                "这是普通电子表格；使用工作表 sheet_id/worksheet_id 和 sheets_get_range 按区域读取。"
+                "不能调用多维表格 list_records/analyze_records。行列上限不代表实际有数据的范围，"
+                "部分区域读取不得声称全表已读。"
+                if kind == "spreadsheet"
+                else "这是多维表格；使用实际工作表和字段读取记录。"
+            ),
+        }
+
+
 # ── 记录 ───────────────────────────────────────────────────
 
 async def list_records(access_token: str, file_id: str, sheet_id: int,
