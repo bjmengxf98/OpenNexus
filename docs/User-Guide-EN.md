@@ -12,7 +12,7 @@ Open the deployed address, create an account if registration is enabled, and wai
 
 ### Connect WPS
 
-Open **Settings → WPS multidimensional spreadsheets**, configure one or more files, and complete WPS OAuth authorization. The green WPS indicator confirms a usable connection. A disconnected WPS account does not prevent general AI conversation, but spreadsheet operations will be unavailable.
+Open **Settings → WPS tables**, configure one or more ordinary spreadsheets or multidimensional files, and complete WPS OAuth authorization. No manual file-type selection is needed. The green WPS indicator confirms a usable connection. A disconnected WPS account does not prevent general AI conversation, but spreadsheet operations will be unavailable.
 
 ### Work in natural language
 
@@ -38,6 +38,8 @@ The top bar provides the current WPS file selector, connection status, dashboard
 ## 3. WPS Data Operations
 
 OpenNexus can query, summarize, create, update, and delete records; manage sheets and fields; and work with supported WPS structures. It reads the schema before complex operations and translates record links into business names when possible.
+
+For configured files, the assistant's structure tool detects the actual WPS file type: multidimensional tables use fields and records, while ordinary spreadsheets use worksheets and cell ranges. You do not need to mention Excel explicitly. An unsupported interface is not automatically a permission failure, and a failed read must not be replaced with an undisclosed analysis of a different file.
 
 Normal queries, summaries, and operation receipts display business names rather than WPS internal record IDs or opaque letter codes. The assistant still keeps those identifiers internally for links, writes, and verification, and shows them only when the user explicitly requests technical IDs.
 

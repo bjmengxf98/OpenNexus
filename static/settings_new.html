@@ -58,7 +58,7 @@
   </aside>
   <main class="main">
     <section class="section active" id="section-wps">
-      <div class="card"><h2>WPS 多维表格</h2><p class="hint">粘贴多维表格链接，系统自动解析文件 ID。配置多个表格后，主界面顶栏可一键切换。</p><div id="wpsFiles"></div><div class="row"><div class="field grow"><label>链接或文件 ID</label><input id="wpsValue" placeholder="https://kdocs.cn/l/xxx"></div><div class="field narrow"><label>备注名称</label><input id="wpsName" placeholder="如：部门事务"></div></div><button class="btn" id="addWps">添加</button></div>
+      <div class="card"><h2>WPS 表格</h2><p class="hint">支持普通电子表格和多维表格，读取时自动识别类型。粘贴链接，系统自动解析文件 ID；配置多个表格后，主界面顶栏可一键切换。</p><div id="wpsFiles"></div><div class="row"><div class="field grow"><label>链接或文件 ID</label><input id="wpsValue" placeholder="https://kdocs.cn/l/xxx"></div><div class="field narrow"><label>备注名称</label><input id="wpsName" placeholder="如：部门事务"></div></div><button class="btn" id="addWps">添加</button></div>
       <div class="card"><h2>WPS 联系人 ID</h2><p class="hint">填入 WPS 数字 account_id，用于 AI 正确写入联系人字段。</p><div class="field"><label>WPS Account ID（数字格式）</label><input id="wpsAccount" inputmode="numeric"></div><button class="btn" id="saveWpsAccount">保存</button></div>
     </section>
     <section class="section" id="section-llm"><div class="card"><h2>主模型配置</h2><p class="hint">用于日常对话、文档分析和 WPS 表格操作。模型 ID 可直接输入；也可点击“添加自定义模型”接入新的提供商或自建服务，并保留多个模型随时切换。</p><div id="mainModelForm"></div><button class="btn" data-save-model="main">保存</button></div></section>

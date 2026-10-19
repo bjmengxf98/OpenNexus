@@ -11,6 +11,7 @@ All notable public changes to OpenNexus are recorded here.
 
 ### Changed
 
+- The assistant's WPS structure tool now automatically distinguishes ordinary spreadsheets from multidimensional tables using real file metadata and bounded, same-file read-only probes. It exposes matching read tools, rejects database-only operations on a verified ordinary spreadsheet, and reports genuine errors without treating every HTTP 400 as a permission failure. Settings accept either table type without a manual type selector.
 - Generated Word documents now resolve `AI附件` from the current WPS identity rather than from the table being analyzed: configured files owned by another user are ignored, a file owned by the signed-in user anchors that user's personal drive, directory caches are isolated by WPS user, and signed GET query strings match the actual KSO-1 RequestURI. Shared source tables can therefore be read without redirecting generated documents into the source owner's drive.
 - Read-only assistant workflows now receive a one-time evidence-scope reminder after initial successful reads. They may answer directly when the evidence suffices or continue targeted queries; an internal planning tool is no longer a mandatory gate for ordinary answers. Write/send verification remains unchanged.
 - Already-read WPS record results can now be filtered, grouped, and returned as compact rows inside the same assistant turn without another WPS request; incomplete source pages stay explicitly marked, and prior analysis detail remains recoverable after prompt folding.
