@@ -105,7 +105,17 @@ ANALYZE_RECORDS_TOOL = {
 
 _CACHE_TTL_SECONDS = 180
 _CACHE_MAX_ENTRIES = 12
-_CACHE: OrderedDict[str, tuple[float, list[dict[str, Any]], dict[str, Any]]] = OrderedDict()
+_CACHE: OrderedDict[tuple[str, int, str], tuple[float, list[dict[str, Any]], dict[str, Any]]] = OrderedDict()
+_CACHE_WRITE_EPOCH = 0
+
+
+def invalidate_record_cache(file_id: str, sheet_id: int) -> None:
+    """Evict this table for all credentials and prevent stale in-flight cache puts."""
+    global _CACHE_WRITE_EPOCH
+    _CACHE_WRITE_EPOCH += 1
+    for key in list(_CACHE):
+        if key[:2] == (str(file_id), int(sheet_id)):
+            _CACHE.pop(key, None)
 
 
 @dataclass
@@ -135,7 +145,7 @@ def _cache_key(
     fields: list[str] | None,
     server_filter: dict[str, Any] | None,
     view_id: str | None,
-) -> str:
+) -> tuple[str, int, str]:
     payload = {
         "token": hashlib.sha256((access_token or "").encode("utf-8")).hexdigest()[:16],
         "file_id": file_id,
@@ -144,10 +154,11 @@ def _cache_key(
         "filter": server_filter or {},
         "view_id": view_id or "",
     }
-    return hashlib.sha256(_stable_json(payload).encode("utf-8")).hexdigest()
+    return (str(file_id), int(sheet_id),
+            hashlib.sha256(_stable_json(payload).encode("utf-8")).hexdigest())
 
 
-def _cache_get(key: str) -> FetchReceipt | None:
+def _cache_get(key: tuple[str, int, str]) -> FetchReceipt | None:
     now = time.monotonic()
     expired = [
         item_key for item_key, (created, _records, _meta) in _CACHE.items()
@@ -168,7 +179,7 @@ def _cache_get(key: str) -> FetchReceipt | None:
     )
 
 
-def _cache_put(key: str, receipt: FetchReceipt) -> None:
+def _cache_put(key: tuple[str, int, str], receipt: FetchReceipt) -> None:
     _CACHE[key] = (time.monotonic(), deepcopy(receipt.records), receipt.metadata())
     _CACHE.move_to_end(key)
     while len(_CACHE) > _CACHE_MAX_ENTRIES:
@@ -188,6 +199,8 @@ async def _fetch_all_records(
     cached = _cache_get(key)
     if cached:
         return cached
+
+    fetch_epoch = _CACHE_WRITE_EPOCH
 
     first = await list_records(
         access_token,
@@ -235,7 +248,8 @@ async def _fetch_all_records(
         source_is_complete=not has_more,
         continuation_error=continuation_error,
     )
-    _cache_put(key, receipt)
+    if fetch_epoch == _CACHE_WRITE_EPOCH:
+        _cache_put(key, receipt)
     return receipt
 
 

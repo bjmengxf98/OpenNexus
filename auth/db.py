@@ -2338,13 +2338,15 @@ def create_mcp_token(
     expires_days: int | None = None,
     scopes: list[str] | None = None,
 ) -> dict:
-    """创建 MCP Bearer token；明文只由本函数返回一次。"""
+    """创建 MCP Bearer token；缺省只读，明文只由本函数返回一次。"""
+    safe_scopes = list(dict.fromkeys(scopes if scopes is not None else ["read"]))
+    if not safe_scopes:
+        raise ValueError("请至少选择一项令牌权限")
     raw_token = "onx_mcp_" + secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
     now = beijing_now()
     expires_at = (now + timedelta(days=expires_days)).strftime("%Y-%m-%d %H:%M:%S") if expires_days else ""
     safe_name = (name or "WorkBuddy").strip()[:80]
-    safe_scopes = list(dict.fromkeys(scopes or ["all"]))
     scopes_json = json.dumps(safe_scopes, ensure_ascii=False)
     with get_conn() as conn:
         cursor = conn.execute(

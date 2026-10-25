@@ -15,9 +15,11 @@ MCP lets an external client invoke OpenNexus business capabilities. It does not 
 ## Create a Token
 
 1. Sign in to OpenNexus and open **Settings → MCP Access**.
-2. Create a purpose-specific token such as `WorkBuddy`.
+2. Set a purpose-specific client name such as `WorkBuddy`, choose an expiry, and explicitly select its permissions. New tokens default to read-only.
 3. Copy the complete token immediately; its plaintext is shown only once.
 4. Use a separate token for every user, client, and environment.
+
+Authorization happens once at token creation. In-scope tool calls execute directly without a separate OpenNexus approval. Deletion requires `delete_data`; destructive structure operations also require `manage_structure`. Out-of-scope calls are rejected. Existing full-access tokens remain full-access without per-call approval; old limited tokens do not gain deletion permission automatically. Old approval records are history only, and old approval IDs cannot replay actions. Refresh the client's tool list after upgrading. WorkBuddy's own confirmation settings are independent of the server.
 
 ## WorkBuddy Configuration
 
@@ -42,6 +44,16 @@ For local testing, use `http://127.0.0.1:8000/mcp/`. A phone or another computer
 
 The tool count may change between releases and should not be used as a fixed connectivity check.
 
+## Shared Business Execution
+
+WorkBuddy owns reasoning and presentation; it does not invoke an additional OpenNexus chat-model loop. Equivalent record mutations share execution and readback contracts, not necessarily wording or reasoning.
+
+- Generated documents locate the authenticated user's own `AI附件` from that user's configured files, independently of the source table's creator. Each user still needs at least one self-owned configured WPS file to locate their personal drive.
+- `create_records`, `update_records` and `delete_records` perform one mutation and bounded readback. Only `verified=true` confirms observed field values or absence of target IDs; absence does not prove a record previously existed. `write_submitted=true` means accepted, while `null` means unknown. Unverified outcomes require reading before deciding, not automatic mutation retries.
+- Each read phase is bounded to five pages and 20 seconds. A complete pre-create identity snapshot supports responses without created IDs; incomplete or ambiguous deltas remain unverified. This is not a transaction snapshot or cross-request idempotency key. Unsupported value representations and failed reads remain explicitly unconfirmed.
+- Use `analyze_records`, necessary fields, filters and `next_row_offset` for compact large-table continuation; check `source_is_complete`. Chat-private `read_record_window` and `analyze_cached_records` are no longer advertised over MCP. Old calls explain the replacement. Refresh the client tool list after upgrading.
+- Structural and ordinary-spreadsheet cell operations retain their existing receipts, not the new record-level verification guarantee. OpenNexus chat attachments and history are not implicitly transferred to WorkBuddy. These contract tests do not represent complete end-to-end acceptance of every instruction on both clients.
+
 ## Troubleshooting
 
 - **Authentication required:** verify `Authorization`, the `Bearer` prefix, one space, and the complete token.
@@ -51,7 +63,7 @@ The tool count may change between releases and should not be used as a fixed con
 
 ## Security
 
-- An MCP token carries the business permissions of its OpenNexus user.
+- An MCP token is limited by both its owner's business access and its explicitly granted permissions.
 - Revoke a suspected token immediately.
 - Confirm targets before deletes, bulk updates, or outbound messages.
 - MCP calls should be recorded in the audit log.

@@ -126,6 +126,10 @@ Create a token under **Settings → MCP Access**, copy it once, and configure a 
 
 MCP is a one-way business interface from the client to OpenNexus. Revoke a token immediately if it may have leaked.
 
+Token creation is the authorization step: permitted calls execute directly without per-call OpenNexus approval. New tokens default to read-only; select writing, deletion, structure management, messaging and other capabilities explicitly. Deleting records or cell ranges requires `delete_data`; destructive structure operations require both `manage_structure` and `delete_data`. Old limited tokens do not gain the new deletion permission automatically. Existing `all` tokens retain full authorization, including deletion and outbound messages, and no longer require per-call approval; replace them with narrower tokens when appropriate. Each client should have a separate token with an appropriate expiry. User isolation, expiry, revocation, risk annotations and audit logs remain enforced. Client-side confirmation policies remain independent.
+
+Old approvals are retained as read-only history and are never automatically executed. Approval decision endpoints are retired, and requests containing an old `approval_id` are rejected to prevent replay. Refresh the client's tool list after an upgrade and check earlier results before starting a fresh call.
+
 ## 12. Administration
 
 Administrators can manage users, roles, feedback, the shared knowledge base, spreadsheet change logs, WeCom, and WPS application settings. Secret fields must not be returned in plaintext by the administration API.
