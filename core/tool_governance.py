@@ -1,7 +1,7 @@
-"""MCP 工具的代码级权限、风险与审批 Hook。
+"""MCP 工具的令牌预授权、风险分级与审计 Hook。
 
-提示词只能提醒模型谨慎；本模块在真正执行业务工具之前再次校验令牌作用域，
-并把高风险调用暂停为一次性审批单。审批单与用户、令牌、工具名和参数摘要绑定。
+创建令牌时授予权限，调用时校验；权限内直接执行，不再生成逐次审批单。
+风险标签仍保留，供外部客户端决定自己的确认策略，不能代替服务端权限检查。
 """
 from __future__ import annotations
 
@@ -23,8 +23,9 @@ _SENSITIVE_KEYS = {
 
 MCP_SCOPE_DEFINITIONS = (
     {"id": "read", "label": "读取业务数据", "description": "查询 WPS、驾驶舱、知识库和审计记录"},
-    {"id": "write_records", "label": "写入业务数据", "description": "新增或更新记录、单元格和关联关系"},
-    {"id": "manage_structure", "label": "管理表格结构", "description": "工作表、字段、视图、表单和 webhook"},
+    {"id": "write_records", "label": "新增和修改业务数据", "description": "新增或更新记录、单元格和关联关系，不含删除"},
+    {"id": "delete_data", "label": "删除数据和解除关系", "description": "删除记录、单元格或解除关系；删除工作表、字段等还需结构管理权限"},
+    {"id": "manage_structure", "label": "管理表格结构", "description": "工作表、字段、视图、表单和 webhook；破坏性操作还需删除权限"},
     {"id": "send_messages", "label": "发送外部消息", "description": "邮件、WPS、企业微信和个人微信"},
     {"id": "manage_memory", "label": "管理长期记忆", "description": "写入当前用户的长期记忆"},
     {"id": "manage_reminders", "label": "管理提醒", "description": "查看、新增和取消提醒"},
@@ -39,7 +40,8 @@ _READ_TOOLS = {
     "list_children", "list_hooks", "search_knowledge", "get_change_log",
     "list_wps_contacts", "list_system_users", "sheets_list_worksheets",
     "sheets_get_range", "sheets_find_range", "get_dashboard",
-    "list_dashboard_dates", "get_mcp_audit_log",
+    "list_dashboard_dates", "get_mcp_audit_log", "analyze_records",
+    "analyze_cached_records", "read_record_window",
 }
 _WRITE_RECORD_TOOLS = {
     "create_records", "update_records", "delete_records", "bind_children",
@@ -65,8 +67,10 @@ _DESTRUCTIVE_TOOLS = {
     "disable_parent", "unbind_children", "delete_hook",
     "sheets_delete_worksheets", "sheets_delete_range",
 }
-_STRUCTURE_APPROVAL_TOOLS = set(_STRUCTURE_TOOLS)
-_ALWAYS_APPROVAL_TOOLS = _DESTRUCTIVE_TOOLS | _STRUCTURE_APPROVAL_TOOLS | _MESSAGE_TOOLS
+_KNOWN_TOOLS = (
+    _READ_TOOLS | _WRITE_RECORD_TOOLS | _STRUCTURE_TOOLS | _MESSAGE_TOOLS |
+    _REMINDER_TOOLS | _UPLOAD_TOOLS | _DOCUMENT_TOOLS | {"save_memory"}
+)
 _BATCH_ARGUMENTS = {
     "create_records": "records",
     "update_records": "records",
@@ -101,6 +105,7 @@ class ToolPolicy:
     destructive: bool
     idempotent: bool
     open_world: bool
+    required_scopes: tuple[str, ...] = ()
 
 
 @dataclass
@@ -132,9 +137,9 @@ def scope_options() -> list[dict[str, str]]:
 
 
 def normalize_requested_scopes(value: Any) -> list[str]:
-    """校验创建令牌时提交的 scopes；缺省保持旧版的 all 行为。"""
+    """校验新令牌的显式授权；省略权限时只授予读取，不影响已存旧令牌。"""
     if value is None:
-        return ["all"]
+        return ["read"]
     if isinstance(value, str):
         try:
             value = json.loads(value)
@@ -165,6 +170,8 @@ def granted_scopes(value: Any) -> set[str]:
 def _required_scope(tool_name: str) -> str:
     if tool_name in _READ_TOOLS:
         return "read"
+    if tool_name in {"delete_records", "sheets_delete_range"}:
+        return "delete_data"
     if tool_name in _WRITE_RECORD_TOOLS:
         return "write_records"
     if tool_name in _STRUCTURE_TOOLS:
@@ -179,8 +186,8 @@ def _required_scope(tool_name: str) -> str:
         return "upload_files"
     if tool_name in _DOCUMENT_TOOLS:
         return "generate_documents"
-    # 新增工具在完成显式分级前按结构变更处理，避免意外落入只读权限。
-    return "manage_structure"
+    # 新工具必须完成显式分级；全部权限也不能放行未登记能力。
+    return "unclassified"
 
 
 def policy_for_tool(tool_name: str, arguments: dict[str, Any] | None = None) -> ToolPolicy:
@@ -188,17 +195,19 @@ def policy_for_tool(tool_name: str, arguments: dict[str, Any] | None = None) -> 
     required_scope = _required_scope(tool_name)
     read_only = required_scope == "read" or tool_name == "list_reminders"
     destructive = tool_name in _DESTRUCTIVE_TOOLS
-    approval_required = tool_name in _ALWAYS_APPROVAL_TOOLS
+    required_scopes = (required_scope,)
+    if destructive and required_scope != "delete_data":
+        required_scopes += ("delete_data",)
     batch_key = _BATCH_ARGUMENTS.get(tool_name)
-    if batch_key and isinstance(arguments.get(batch_key), list) and len(arguments[batch_key]) > 1:
-        approval_required = True
+    batch_write = bool(batch_key and isinstance(arguments.get(batch_key), list)
+                       and len(arguments[batch_key]) > 1)
     if tool_name in _MESSAGE_TOOLS:
         risk = "external_message"
     elif destructive:
         risk = "destructive"
     elif tool_name in _STRUCTURE_TOOLS:
         risk = "structure_change"
-    elif approval_required:
+    elif batch_write:
         risk = "batch_write"
     elif read_only:
         risk = "read"
@@ -207,19 +216,18 @@ def policy_for_tool(tool_name: str, arguments: dict[str, Any] | None = None) -> 
     return ToolPolicy(
         required_scope=required_scope,
         risk=risk,
-        approval_required=approval_required,
+        approval_required=False,
         read_only=read_only,
         destructive=destructive,
         idempotent=read_only,
         open_world=tool_name in _MESSAGE_TOOLS,
+        required_scopes=required_scopes,
     )
 
 
 def potentially_requires_approval(tool_name: str) -> bool:
-    return tool_name in _ALWAYS_APPROVAL_TOOLS or tool_name in _BATCH_ARGUMENTS or tool_name not in (
-        _READ_TOOLS | _WRITE_RECORD_TOOLS | _STRUCTURE_TOOLS | _MESSAGE_TOOLS |
-        _REMINDER_TOOLS | _UPLOAD_TOOLS | _DOCUMENT_TOOLS | {"save_memory"}
-    )
+    """兼容旧调用方；服务端已统一改为令牌预授权，不再逐次审批。"""
+    return False
 
 
 def business_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -311,71 +319,37 @@ async def run_post_tool_hooks(context: ToolHookContext, result: dict[str, Any] |
 
 
 def _scope_hook(context: ToolHookContext) -> ToolDecision | None:
+    if context.tool_name not in _KNOWN_TOOLS:
+        return ToolDecision(
+            action="deny", message="该工具尚未完成权限分级，暂不允许调用",
+            payload={"ok": False, "code": "tool_unclassified"},
+        )
     scopes = granted_scopes(context.identity.get("scopes"))
-    required = context.policy.required_scope
-    if "all" in scopes or required in scopes:
+    required = context.policy.required_scopes or (context.policy.required_scope,)
+    missing = [scope for scope in required if scope not in scopes]
+    if "all" in scopes or not missing:
         return None
-    label = next((item["label"] for item in MCP_SCOPE_DEFINITIONS if item["id"] == required), required)
+    labels = {item["id"]: item["label"] for item in MCP_SCOPE_DEFINITIONS}
+    label = "、".join(labels.get(scope, scope) for scope in missing)
     return ToolDecision(
         action="deny",
-        message=f"当前 MCP 令牌缺少权限：{label}（{required}）",
-        payload={"ok": False, "code": "scope_denied", "required_scope": required},
+        message=f"当前 MCP 令牌缺少权限：{label}（{', '.join(missing)}）",
+        payload={"ok": False, "code": "scope_denied", "required_scope": missing[0],
+                 "required_scopes": list(required), "missing_scopes": missing},
     )
 
 
-def _approval_payload(row: dict[str, Any], *, code: str = "approval_required") -> dict[str, Any]:
-    return {
-        "ok": False,
-        "code": code,
-        "approval_required": code == "approval_required",
-        "approval_id": row.get("id", ""),
-        "risk": row.get("risk", ""),
-        "required_scope": row.get("required_scope", ""),
-        "summary": row.get("summary", ""),
-        "status": row.get("status", "pending"),
-        "expires_at": row.get("expires_at", ""),
-        "message": (
-            "该操作尚未执行。请在 OpenNexus 设置 → WorkBuddy / MCP 接入中批准，"
-            "然后使用完全相同的参数并附带 approval_id 再次调用。"
-        ),
-    }
-
-
-def _approval_hook(context: ToolHookContext) -> ToolDecision | None:
-    if not context.policy.approval_required:
-        return None
-    user_id = int(context.identity["user_id"])
-    token_id = int(context.identity.get("id") or 0)
-    digest = arguments_hash(context.arguments)
+def _retired_approval_hook(context: ToolHookContext) -> ToolDecision | None:
+    # 不把旧审批单（包括已用/过期的编号）转换成一次新的外发或删除授权。
+    # 正常新调用没有此参数，不会产生任何确认或重试流程。
     if context.approval_id:
-        consumed = db.consume_mcp_tool_approval(
-            user_id, token_id, context.approval_id, context.tool_name, digest,
-        )
-        if consumed:
-            return None
-        existing = db.get_mcp_tool_approval(user_id, context.approval_id)
-        if existing and existing.get("status") == "pending":
-            return ToolDecision(action="ask", message="操作仍在等待批准", payload=_approval_payload(existing))
-        message = "审批单无效、已拒绝、已过期或已使用；该操作未执行"
         return ToolDecision(
-            action="ask", message=message,
-            payload={
-                "ok": False, "code": "approval_invalid", "approval_required": False,
-                "approval_id": context.approval_id, "message": message,
-            },
+            action="deny",
+            message=("逐次审批已停用，旧审批编号不能重放操作。请刷新 MCP 工具列表并移除 "
+                     "approval_id；核对历史执行结果后，按当前令牌权限发起新调用。"),
+            payload={"ok": False, "code": "approval_retired"},
         )
-    row = db.create_mcp_tool_approval(
-        user_id=user_id,
-        token_id=token_id,
-        tool_name=context.tool_name,
-        arguments_hash=digest,
-        arguments=redacted_arguments(context.arguments),
-        risk=context.policy.risk,
-        required_scope=context.policy.required_scope,
-        summary=approval_summary(context.tool_name, context.arguments),
-    )
-    context.approval_id = str(row["id"])
-    return ToolDecision(action="ask", message="操作需要批准", payload=_approval_payload(row))
+    return None
 
 
 def _audit_hook(context: ToolHookContext, result: dict[str, Any] | None, error: str) -> None:
@@ -393,10 +367,11 @@ def _audit_hook(context: ToolHookContext, result: dict[str, Any] | None, error: 
         int(context.identity["user_id"]), context.identity.get("id"), context.tool_name,
         redacted_arguments(context.arguments), success, audit_error, duration_ms,
         risk=context.policy.risk, decision=decision,
-        approval_id=context.approval_id, required_scope=context.policy.required_scope,
+        approval_id=context.approval_id,
+        required_scope=",".join(context.policy.required_scopes or (context.policy.required_scope,)),
     )
 
 
 register_pre_tool_hook(_scope_hook)
-register_pre_tool_hook(_approval_hook)
+register_pre_tool_hook(_retired_approval_hook)
 register_post_tool_hook(_audit_hook)

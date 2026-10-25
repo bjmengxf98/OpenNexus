@@ -23,6 +23,15 @@ from agent.tool_planner import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolated_planner_database(monkeypatch, tmp_path):
+    # Chat also records mutation attempts. Never let a simulated WPS write add
+    # synthetic change-log rows to a developer's real local database.
+    from auth import db
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "planner.db")
+    db.init_db()
+
+
 def test_deepseek_tool_history_keeps_current_reasoning_without_persisting_old_chain():
     messages = [
         {"role": "system", "content": "system"},
@@ -1650,8 +1659,9 @@ def test_assistant_analyzes_cached_rows_instead_of_scanning_windows(monkeypatch)
 
 
 class _TaskCreateGuardCompletions:
-    def __init__(self):
+    def __init__(self, auto_final=False):
         self.calls = []
+        self.auto_final = auto_final
 
     @staticmethod
     def _call(call_id, name, arguments):
@@ -1694,7 +1704,7 @@ class _TaskCreateGuardCompletions:
                 })],
                 reasoning_content=None,
             )
-        elif index == 3:
+        elif index == 3 and not self.auto_final:
             message = SimpleNamespace(
                 content=None,
                 tool_calls=[self._call("verify", "list_records", {
@@ -1713,7 +1723,9 @@ class _TaskCreateGuardCompletions:
         return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
 
-def test_task_create_cannot_invent_403_and_must_write_then_verify(monkeypatch):
+@pytest.mark.parametrize("auto_final", [False, True])
+@pytest.mark.parametrize("drop_contact", [False, True])
+def test_task_create_cannot_invent_403_and_must_write_then_verify(monkeypatch, auto_final, drop_contact):
     from agent import assistant as assistant_module
 
     reads = []
@@ -1721,12 +1733,14 @@ def test_task_create_cannot_invent_403_and_must_write_then_verify(monkeypatch):
 
     async def fake_list_records(*_args, **kwargs):
         reads.append(kwargs)
-        if len(reads) == 1:
+        if not writes:
             return {"records": [], "has_more": False}
         return {
             "records": [{
                 "id": "new-task",
-                "fields": {"任务名称": "建立部门月报制度"},
+                "fields": {"任务名称": "建立部门月报制度", **(
+                    {} if drop_contact else {"执行人": ["李金文"]}
+                )},
             }],
             "has_more": False,
         }
@@ -1737,7 +1751,7 @@ def test_task_create_cannot_invent_403_and_must_write_then_verify(monkeypatch):
 
     monkeypatch.setattr(assistant_module, "list_records", fake_list_records)
     monkeypatch.setattr(assistant_module, "create_records", fake_create_records)
-    completions = _TaskCreateGuardCompletions()
+    completions = _TaskCreateGuardCompletions(auto_final=auto_final)
     assistant = Assistant.__new__(Assistant)
     assistant.provider = "mock"
     assistant.model = "mock-model"
@@ -1759,10 +1773,13 @@ def test_task_create_cannot_invent_403_and_must_write_then_verify(monkeypatch):
         default_file={"file_id": "file", "file_name": "部门事务", "sheet_id": 31},
     ))
 
-    assert reply == "任务已创建并回读验证成功。"
-    assert len(completions.calls) == 5
+    if drop_contact:
+        assert "未能回读确认生效" in reply
+    else:
+        assert reply == "任务已创建并回读验证成功。"
+        assert len(completions.calls) == (4 if auto_final else 5)
     assert len(writes) == 1
-    assert len(reads) == 2
+    assert len(reads) == (3 if auto_final else 4)
     assert "403" not in reply
 
 

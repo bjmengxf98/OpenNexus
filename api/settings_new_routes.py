@@ -208,17 +208,12 @@ async def settings_mcp_approval_decision(approval_id: str, request: Request):
     uid, user = _current_user(request)
     if not uid or not user:
         return _not_logged_in()
-    body = await request.json()
-    decision = str(body.get("decision") or "").strip().lower()
-    if decision not in {"approved", "rejected"}:
-        return JSONResponse({"ok": False, "error": "审批结果无效"}, status_code=400)
-    row = db.decide_mcp_tool_approval(uid, approval_id, decision)
-    if not row:
-        return JSONResponse(
-            {"ok": False, "error": "审批单不存在、已处理或已过期"},
-            status_code=409,
-        )
-    return {"ok": True, "approval": row, "approvals": db.list_mcp_tool_approvals(uid)}
+    # 只保留旧 URL 的明确退役响应；不能继续批准或执行旧待办。
+    return JSONResponse(
+        {"ok": False, "code": "approval_retired",
+         "error": "逐次审批已停用，请按创建令牌时授予的权限调用；历史审批记录不会自动执行。"},
+        status_code=410,
+    )
 
 
 @settings_new_router.get("/api/settings/provider/{kind}/{provider}")

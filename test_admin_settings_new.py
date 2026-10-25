@@ -65,7 +65,13 @@ def test_all_pages_have_no_server_ui_runtime():
     assert 'id="tokenScopes"' in settings_html
     assert 'id="approvalList"' in settings_html
     assert "selectedScopes()" in settings_html
-    assert "/api/settings/mcp/approvals/" in settings_html
+    assert "/api/settings/mcp/approvals" in settings_html
+    assert "创建令牌时一次授权，权限范围内直接执行，不再逐次审批" in settings_html
+    assert "历史审批记录（只读）" in settings_html
+    assert "s.id==='read'?' checked':''" in settings_html
+    assert "data-decision" not in settings_html
+    assert "decideApproval" not in settings_html
+    assert "approvalPoll" not in settings_html
 
     runtime_files = [project_root / "app.py"]
     for folder in ("agent", "api", "auth", "core", "scripts"):
@@ -142,7 +148,7 @@ def test_admin_user_filter_rejects_login_autofill_and_supports_email():
     assert "刷新数据" in admin_html
 
 
-def test_mcp_approval_api_is_user_scoped(monkeypatch):
+def test_old_mcp_approval_history_is_user_scoped_and_cannot_be_approved(monkeypatch):
     from api import settings_new_routes
 
     client = _client(monkeypatch)
@@ -169,14 +175,19 @@ def test_mcp_approval_api_is_user_scoped(monkeypatch):
         "/api/settings/mcp/approvals/onx_apr_test/decision",
         json={"decision": "approved"},
     )
-    assert response.status_code == 200
-    assert decisions == [(1, "onx_apr_test", "approved")]
+    assert response.status_code == 410
+    assert response.json()["code"] == "approval_retired"
+    assert decisions == []
 
     response = client.post(
         "/api/settings/mcp/approvals/onx_apr_test/decision",
         json={"decision": "invalid"},
     )
-    assert response.status_code == 400
+    assert response.status_code == 410
+    assert decisions == []
+    client.cookies.clear()
+    assert client.get("/api/settings/mcp/approvals").status_code == 401
+    assert client.post("/api/settings/mcp/approvals/onx_apr_test/decision", json={"decision": "approved"}).status_code == 401
 
 
 def test_admin_bootstrap(monkeypatch):

@@ -53,6 +53,10 @@ from agent.wecom_client import send_wecom_webhook as _wecom_send
 from auth.db import get_system_config as _db_get_system_config
 from auth.db import get_wecom_userid as _db_get_wecom_userid
 from core.document_generator import generate_and_upload_document as _generate_document
+from core.business_execution import (
+    document_upload_anchors, prepare_document_arguments, execute_record_write,
+    record_values_match,
+)
 from core.context_memory import sanitize_memory_content
 from agent.tool_planner import (
     DISCOVER_TOOL_NAME,
@@ -540,7 +544,7 @@ content 参数是一个 JSON 对象（不是字符串），包含 sections 数�
 4a. **【强制】翻译 Link 字段中的记录 ID**：当遇到「任务执行人」「负责人」等 Link 字段中的记录 ID（如 `Nc、IN、Me、NF` 等）时，必须调用 `list_records` 查询人员信息表，设置 `max_records=1000` 确保全量查询，**禁止传 `fields` 参数**（必须返回全部字段才能找到姓名），拿到结果后逐条匹配记录的 `id` 字段，找到对应姓名。禁止说"无法查询""fields数据为空""不知道这个人是谁"——必须通过全量查询人员表来翻译所有 ID；如果一次查询仍未找到，检查 sheet_id 是否正确（先调 get_schema 确认人员信息表的 sheet_id）。**严禁通过 Contact 联系人字段反推姓名**——Contact 字段存的是数字 account_id，与人员信息表记录 ID 是两套完全不同的体系，不可混用
 5. **批量操作优先**：create_fields 一次传所有字段；create_records 一次传所有记录；减少工具调用轮次
 6. create_sheet 创建工作表时直接在 fields 参数里带上所有字段
-7. 操作前简要告知将要执行的内容，操作后汇报结果；**回复中引用的数据必须来自本轮工具调用结果，禁止引用历史对话中的数据**；create_records / update_records 操作后**必须立即调用 list_records 回读刚才操作的那条记录**，以实际查询结果为准展示给用户（不得用输入参数代替），确认负责人、执行人、联系人等关键字段确实写入成功；delete_records 操作后必须 list_records 确认记录已消失；若返回结果含 _verify_hint 字段，同样必须立即调用 list_records 验证；**禁止在未回读验证前就向用户宣称"已成功分配给XXX"**
+7. 操作前简要告知将要执行的内容，操作后汇报结果；**回复中引用的数据必须来自本轮工具调用结果，禁止引用历史对话中的数据**；create_records / update_records / delete_records 会自动回读核验，只有 verified=true 才能称已确认生效，实际值见 verification.observed_records，无需重复读取。verified=false 或 write_submitted=null 表示尚未确认，先读取核对，禁止自动重复写入；不能把“已提交”说成“已完成”。旧回执没有 verified 或包含 _verify_hint 时，必须调用 list_records 核验关键字段或删除后确实不存在。**禁止在未回读验证前就向用户宣称"已成功分配给XXX"**
 8. 删除操作前**必须先调 list_records 查询获得真实记录列表**，从返回数据中确认 id，禁止凭猜测或历史记忆推断 id；"删除空行/空记录"类操作必须先 list_records 找出字段全为空的记录再删，不可假设哪条是空行；删除后必须立即调用 list_records 验证记录已消失，若仍存在则重新查询再删
 9. **用户已确认后立即执行，不得再次询问确认**。用户说"执行""是""好""确认""去做"等即视为确认，直接调用工具完成操作
 10. 用户说「没看到」「没有变化」时，**先调 list_records 核查**：若记录已存在（操作成功但 WPS 视图未显示），告知用户可能原因（视图有筛选条件、需手动刷新 WPS 界面、需切换到「全部」视图）；**只有** list_records 确认记录不存在时，才重新执行创建/更新操作，避免重复建立垃圾记录
@@ -593,7 +597,7 @@ Contact 字段必须传 `[{{"id": "数字account_id", "nickName": "姓名"}}]` �
 **操作步骤**：从用户记忆中查找对应人员的数字 account_id，构造联系人值写入。
 - 禁止用字母格式 open_id 写入 Contact 字段——格式不符，WPS会静默接受但实际不更新
 - 禁止用人员信息表记录ID写入 Contact 字段
-- **写入后必须验证**：create_records / update_records 含 Contact 字段时，操作完成后立即调用 list_records 查该记录，确认 Contact 字段不为空
+- **写入后必须验证**：create_records / update_records 含 Contact 字段时，核对自动回读的 verified 和实际联系人身份；未核验通过时先读取核对，不能用请求参数代替实际写入结果
 
 ## Attachment（附件）字段
 用户要求上传附件时，调用 upload_and_attach 工具完成上传并写入附件字段。附件字段写入格式由 Python 内部处理，AI 只需传 file_path、record_id、field_name 即可。
@@ -1950,9 +1954,9 @@ TOOL_MAP = {
                                                 a.get("fields"), a.get("filter"),
                                                 a.get("view_id"), a.get("max_records")),
     "analyze_records": lambda at, a: analyze_records(at, a),
-    "create_records": lambda at, a: create_records(at, a["file_id"], a["sheet_id"], a["records"]),
-    "update_records": lambda at, a: update_records(at, a["file_id"], a["sheet_id"], a["records"]),
-    "delete_records": lambda at, a: delete_records(at, a["file_id"], a["sheet_id"], a["record_ids"]),
+    "create_records": lambda at, a: execute_record_write("create_records", at, a, write=create_records, read=list_records),
+    "update_records": lambda at, a: execute_record_write("update_records", at, a, write=update_records, read=list_records),
+    "delete_records": lambda at, a: execute_record_write("delete_records", at, a, write=delete_records, read=list_records),
     "create_sheet":  lambda at, a: create_sheet(at, a["file_id"], a.get("name"),
                                                 a.get("fields"), a.get("views")),
     "delete_sheet":  lambda at, a: delete_sheet(at, a["file_id"], a["sheet_id"]),
@@ -2652,6 +2656,7 @@ def _collect_wps_record_ids(receipts: list | None) -> set[str]:
 
         if name in {"list_records", "create_records"}:
             add_record_objects(result.get("records"))
+            add_many(result.get("created_ids"))
             data = result.get("data")
             if isinstance(data, dict):
                 add_record_objects(data.get("records"))
@@ -2676,6 +2681,12 @@ def _collect_wps_record_ids(receipts: list | None) -> set[str]:
         elif name == "upload_and_attach":
             add(args.get("record_id"))
             add(result.get("record_id"))
+
+        if name in {"create_records", "update_records", "delete_records"}:
+            verification = result.get("verification")
+            if isinstance(verification, dict):
+                add_many(verification.get("target_ids"))
+                add_record_objects(verification.get("observed_records"))
 
     return record_ids
 
@@ -3036,11 +3047,7 @@ class Assistant:
         # 能列出该表格所在 drive 的根目录，因此把用户全部已配置文件作为
         # 候选锚点；上传层会核对 drive 所有者，跳过他人 drive，并优先
         # 复用当前 WPS 用户个人空间中已有的「AI附件」。
-        _document_upload_anchor_ids = []
-        for _anchor in [default_file, *(all_files or [])]:
-            _anchor_id = str((_anchor or {}).get("file_id") or "")
-            if _anchor_id and _anchor_id not in _document_upload_anchor_ids:
-                _document_upload_anchor_ids.append(_anchor_id)
+        _document_upload_anchor_ids = document_upload_anchors(default_file, all_files)
         _document_upload_anchor_id = (
             _document_upload_anchor_ids[0] if _document_upload_anchor_ids else ""
         )
@@ -3279,6 +3286,8 @@ class Assistant:
         _context_recovery_attempts = 0
         _task_create_success = False
         _task_create_verified = False
+        _task_create_shared_verification = None
+        _task_create_expected_records = []
         _weixin_send_attempted = False
         _task_create_error = ""
         _task_create_target: tuple[str, str] | None = None
@@ -3590,7 +3599,7 @@ class Assistant:
                             else:
                                 target = _task_create_target or ("", "")
                                 correction = (
-                                    "create_records succeeded, but the new task has not been verified. "
+                                    "create_records was submitted or its outcome is uncertain, but the new task has not been verified. "
                                     "Do not create it again. Call list_records for the same target "
                                     f"file_id={target[0]}, sheet_id={target[1]} and verify marker "
                                     f"{_task_create_marker!r} before answering."
@@ -3601,7 +3610,7 @@ class Assistant:
                             continue
                         if _task_create_success:
                             return (
-                                "任务写入请求已经成功，但系统未能回读确认。为避免重复创建，"
+                                "任务写入请求已尝试提交，但系统未能回读确认生效。为避免重复创建，"
                                 "本次没有再次写入；请刷新任务表核查该记录。"
                             )
                         return (
@@ -4014,10 +4023,7 @@ class Assistant:
                                     f"override requested={requested_anchor or '<empty>'} "
                                     f"with primary_user_anchor={_document_upload_anchor_id}"
                                 )
-                            args["dbsheet_file_id"] = _document_upload_anchor_id
-                            args["_upload_anchor_file_ids"] = list(
-                                _document_upload_anchor_ids
-                            )
+                            args = prepare_document_arguments(args, _document_upload_anchor_ids)
 
                         # 传统表格工具（sheets_*）不做 file_id 白名单校验，用户直接提供 file_id
                         _is_sheets_tool = name.startswith("sheets_")
@@ -4084,9 +4090,12 @@ class Assistant:
                                 str(args.get("sheet_id") or ""),
                             )
                             _task_create_marker = _record_write_marker(args.get("records"))
-                            if isinstance(result, dict) and not result.get("error"):
+                            if (isinstance(result, dict) and not result.get("error")
+                                    and result.get("write_submitted") is not False):
                                 _task_create_success = True
-                                _task_create_verified = False
+                                _task_create_verified = result.get("verified") is True
+                                _task_create_shared_verification = result.get("verification")
+                                _task_create_expected_records = args.get("records") or []
                                 _task_create_error = ""
                             else:
                                 _task_create_success = False
@@ -4102,11 +4111,26 @@ class Assistant:
                             and _task_create_target
                             and str(args.get("file_id") or "") == _task_create_target[0]
                             and str(args.get("sheet_id") or "") == _task_create_target[1]
-                            and _record_list_confirms_marker(result, _task_create_marker)
                         ):
-                            _task_create_verified = True
+                            if _task_create_shared_verification is not None:
+                                _target_ids = _task_create_shared_verification.get("target_ids") or []
+                                _unmatched = list(_task_create_expected_records)
+                                _seen_target_ids = set()
+                                for _record in result.get("records") or []:
+                                    if str(_record.get("id") or "") not in _target_ids:
+                                        continue
+                                    if str(_record.get("id") or "") in _seen_target_ids:
+                                        continue
+                                    _seen_target_ids.add(str(_record.get("id") or ""))
+                                    for _index, _expected in enumerate(_unmatched):
+                                        if record_values_match(_expected, _record):
+                                            _unmatched.pop(_index)
+                                            break
+                                _task_create_verified = bool(_target_ids) and not _unmatched
+                            elif _record_list_confirms_marker(result, _task_create_marker):
+                                _task_create_verified = True
 
-                        # AI 操作成功后主动写变更日志，和 webhook 保持一致
+                        # 保留实际提交/核验状态；未确认不能在日志中伪装成已生效。
                         if name in {"create_records", "update_records", "delete_records"} and not result.get("error"):
                             _action_map = {"create_records": "createRecord", "update_records": "updateSheet", "delete_records": "removeRecord"}
                             _log_data = json.dumps({
@@ -4114,6 +4138,9 @@ class Assistant:
                                 "operator": username,
                                 "records": args.get("records") or [{"id": rid} for rid in (args.get("record_ids") or [])],
                                 "source": "ai_api",
+                                "write_submitted": result.get("write_submitted"),
+                                "verified": result.get("verified"),
+                                "verification_status": (result.get("verification") or {}).get("status"),
                             }, ensure_ascii=False)
                             try:
                                 from auth.db import add_change_log as _add_log

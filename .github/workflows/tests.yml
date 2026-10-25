@@ -21,4 +21,4 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt -r requirements-dev.txt
       - name: Run tests
-        run: python -m pytest test_reminders.py test_dashboard.py test_app_new.py test_pwa.py test_admin_settings_new.py -q
+        run: python -m pytest test_reminders.py test_dashboard.py test_app_new.py test_pwa.py test_admin_settings_new.py test_mcp_business_execution.py test_mcp_preauthorization.py test_tool_governance.py test_tool_planner.py test_document_generator.py test_wps_file_structure.py -q

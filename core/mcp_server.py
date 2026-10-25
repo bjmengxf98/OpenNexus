@@ -26,12 +26,11 @@ from auth import db
 from auth.wps_oauth import auto_refresh_token_for_user, is_token_expired
 from agent import assistant as assistant_module
 from core.context_memory import sanitize_memory_content
+from core.business_execution import document_upload_anchors, prepare_document_arguments
 from core.wechat_delivery import deliver_personal_weixin
 from core.tool_governance import (
-    APPROVAL_ARGUMENT,
     new_tool_context,
     policy_for_tool,
-    potentially_requires_approval,
     run_post_tool_hooks,
     run_pre_tool_hooks,
 )
@@ -39,6 +38,8 @@ from core.tool_governance import (
 
 _identity_var: ContextVar[dict | None] = ContextVar("mcp_identity", default=None)
 _MAX_REMOTE_FILE_BYTES = 20 * 1024 * 1024
+# These tools address private, turn-local chat receipts, not remote MCP sessions.
+_CHAT_INTERNAL_TOOLS = {"read_record_window", "analyze_cached_records"}
 
 
 mcp_server = FastMCP(
@@ -46,7 +47,11 @@ mcp_server = FastMCP(
     instructions=(
         "使用当前令牌所属用户的身份操作 OpenNexus。可查询和维护 WPS 多维表格/传统表格，"
         "查询驾驶舱与知识库，生成文档，设置提醒，并通过 WPS、企业微信和个人微信发送消息。"
-        "执行删除、批量更新、外发消息等有副作用操作前，应先向用户清楚说明目标。"
+        "权限在创建令牌时授予，权限范围内直接执行，不需要回 OpenNexus 逐次审批。"
+        "删除、批量更新、外发消息等操作仍应依据用户的明确目标执行，不得自行扩大范围。"
+        "大表使用 analyze_records，按 next_row_offset 续读；不使用本系统对话内的回执编号。"
+        "记录增删改返回 verified=true 才表示已回读确认；尚未核验时先读后判断，不自动重做写入。"
+        "生成文档始终上传到当前令牌用户自己的 WPS「AI附件」，与来源表创建人无关。"
     ),
     stateless_http=True,
     json_response=True,
@@ -124,6 +129,17 @@ async def _send_weixin(identity: dict, args: dict) -> dict:
 async def _execute_special(name: str, args: dict, identity: dict) -> dict | None:
     user_id = int(identity["user_id"])
     display_name = identity.get("display_name") or identity.get("username") or "OpenNexus"
+    if name in _CHAT_INTERNAL_TOOLS:
+        return {"error": "该工具仅用于 OpenNexus 当前对话的内部回执；MCP 请使用 analyze_records，"
+                         "以 file_id/sheet_id、fields 和筛选条件分析，并按 next_row_offset 续读。"}
+    if name == "generate_document":
+        anchors = document_upload_anchors(db.get_default_wps_file(user_id), db.list_wps_files(user_id))
+        try:
+            prepared = prepare_document_arguments(args, anchors)
+        except ValueError as exc:
+            return {"error": str(exc)}
+        token = await _wps_access_token(user_id)
+        return await assistant_module.TOOL_MAP[name](token, prepared)
     if name == "save_memory":
         content, rejected = sanitize_memory_content(args.get("content") or "")
         if not content:
@@ -311,19 +327,15 @@ def _register_tool(spec: dict) -> None:
     function = spec["function"]
     name = function["name"]
     schema = copy.deepcopy(function.get("parameters") or {"type": "object", "properties": {}})
+    schema["additionalProperties"] = False
     properties = schema.setdefault("properties", {})
     required = set(schema.get("required") or [])
     policy = policy_for_tool(name)
     description = function.get("description", name)
-    if potentially_requires_approval(name):
-        properties[APPROVAL_ARGUMENT] = {
-            "type": "string",
-            "description": (
-                "高风险操作首次调用后由 OpenNexus 返回。用户在设置页批准后，"
-                "使用完全相同的业务参数并附带此 approval_id 重试。"
-            ),
-        }
-        description += "【安全控制】此工具在高风险场景会先生成审批单，批准前不会执行。"
+    description += "【授权方式】按创建令牌时授予的权限执行；OpenNexus 不要求逐次审批。"
+    if name in {"create_records", "update_records", "delete_records"}:
+        description += ("【回执】自动进行有界只读核验，verified=true 才是已确认生效。"
+                        "write_submitted=true/null 且 verified=false 时先读取核对，不自动重做写入。")
 
     async def dynamic_tool(**kwargs: Any) -> dict:
         return await execute_tool(name, {key: value for key, value in kwargs.items() if value is not None})
@@ -355,12 +367,18 @@ def _register_tool(spec: dict) -> None:
         meta={
             "opennexus/risk": policy.risk,
             "opennexus/required_scope": policy.required_scope,
-            "opennexus/approval_possible": potentially_requires_approval(name),
+            "opennexus/required_scopes": list(policy.required_scopes),
+            "opennexus/approval_possible": False,
+            "opennexus/authorization_mode": "token_scopes",
         },
     )
     tool = mcp_server._tool_manager.get_tool(name)
     if tool:
         tool.parameters = schema
+        # SDK 默认可能丢弃未知参数；旧 approval_id 不能被悄悄丢弃后变成新操作。
+        # 同时约束真实执行的参数模型，而不只修改 tools/list 中展示的 JSON Schema。
+        tool.fn_metadata.arg_model.model_config["extra"] = "forbid"
+        tool.fn_metadata.arg_model.model_rebuild(force=True)
 
 
 _EXTRA_TOOLS = [
@@ -373,7 +391,8 @@ _EXTRA_TOOLS = [
 ]
 
 for _tool_spec in [*assistant_module.TOOLS, *_EXTRA_TOOLS]:
-    _register_tool(_tool_spec)
+    if _tool_spec["function"]["name"] not in _CHAT_INTERNAL_TOOLS:
+        _register_tool(_tool_spec)
 
 
 class MCPBearerMiddleware:
