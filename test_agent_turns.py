@@ -218,7 +218,8 @@ def test_existing_chat_endpoint_keeps_sse_contract_and_persists_turn(monkeypatch
         json.loads(line.removeprefix("data: "))
         for line in response.text.splitlines() if line.startswith("data: ")
     ]
-    assert [item["type"] for item in payloads] == ["accepted", "done"]
+    assert [item["type"] for item in payloads] == ["accepted", "wps_status", "done"]
+    assert payloads[1]["status"] == "disconnected"
     assert payloads[-1]["reply"] == "兼容回复"
     assert db.get_agent_turn(turn_id, 1)["status"] == "completed"
     assert payloads[-1]["metrics"]["total_tokens"] == 321

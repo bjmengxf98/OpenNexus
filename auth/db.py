@@ -6,6 +6,7 @@ import json
 import bcrypt
 import secrets
 import hashlib
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -641,6 +642,66 @@ def get_wps_token(user_id):
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM wps_tokens WHERE user_id=?", (user_id,)).fetchone()
         return dict(row) if row else None
+
+
+def claim_wps_refresh_lease(user_id: int, owner: str, seconds: int = 30) -> bool:
+    """Serialize refresh-token rotation across workers sharing this SQLite DB."""
+    key = f"wps_refresh_lease:{int(user_id)}"
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT value FROM system_config WHERE key=?", (key,)).fetchone()
+        try:
+            lease = json.loads(row["value"]) if row else {}
+        except (ValueError, TypeError):
+            lease = {}
+        if float(lease.get("until", 0)) > time.time():
+            return False
+        conn.execute(
+            "INSERT INTO system_config(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, json.dumps({"owner": owner, "until": time.time() + seconds})),
+        )
+    return True
+
+
+def release_wps_refresh_lease(user_id: int, owner: str) -> None:
+    key = f"wps_refresh_lease:{int(user_id)}"
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT value FROM system_config WHERE key=?", (key,)).fetchone()
+        if row and json.loads(row["value"]).get("owner") == owner:
+            conn.execute("DELETE FROM system_config WHERE key=?", (key,))
+
+
+def save_refreshed_wps_token(user_id: int, previous: dict, access_token: str,
+                             refresh_token: str, expires_at: str) -> bool:
+    """Do not overwrite a concurrent disconnect, fresh authorization, or rotation."""
+    with get_conn() as conn:
+        result = conn.execute(
+            "UPDATE wps_tokens SET access_token=?, refresh_token=?, expires_at=? "
+            "WHERE user_id=? AND COALESCE(access_token,'')=? AND COALESCE(refresh_token,'')=?",
+            (access_token, refresh_token, expires_at, user_id,
+             previous.get("access_token") or "", previous.get("refresh_token") or ""),
+        )
+    return result.rowcount == 1
+
+
+def save_wps_connection_state(user_id: int, previous: dict, state: dict) -> bool:
+    """Persist sanitized state only while it still refers to the same credentials."""
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT access_token, refresh_token FROM wps_tokens WHERE user_id=?", (user_id,),
+        ).fetchone()
+        if not row or any((row[key] or "") != (previous.get(key) or "")
+                          for key in ("access_token", "refresh_token")):
+            return False
+        conn.execute(
+            "INSERT INTO system_config(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (f"wps_connection_state:{int(user_id)}", json.dumps(state)),
+        )
+    return True
 
 
 def list_users_for_ai() -> list:

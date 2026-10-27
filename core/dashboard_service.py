@@ -13,7 +13,7 @@ from openai import AsyncOpenAI
 
 from agent.wps_client import get_schema, list_records
 from auth import db
-from auth.wps_oauth import auto_refresh_token_for_user, is_token_expiring_soon
+from auth.wps_session import WpsConnectionError, ensure_access_token, authorized_user_call
 
 
 VALID_VIEWS = {"overview", "daily", "tasks", "projects"}
@@ -191,15 +191,10 @@ def _pick_sheet(sheets: list[dict], kind: str) -> dict | None:
 
 
 async def _access_token(user_id: int) -> str:
-    token = db.get_wps_token(user_id)
-    if not token or not token.get("access_token"):
-        raise DashboardError("尚未连接 WPS，请先在主页完成授权")
-    expires_at = token.get("expires_at") or "2000-01-01"
-    if is_token_expiring_soon(expires_at, minutes=5):
-        if not await auto_refresh_token_for_user(user_id):
-            raise DashboardError("WPS 授权已过期，请返回主页重新连接 WPS")
-        token = db.get_wps_token(user_id)
-    return token.get("access_token", "")
+    try:
+        return await ensure_access_token(user_id)
+    except WpsConnectionError as exc:
+        raise DashboardError(str(exc)) from None
 
 
 async def _load_records(
@@ -786,6 +781,7 @@ def _generic_cache_for_kind(user_id: int, file_id: str, kind: str) -> dict | Non
     return {**cached, "sheet_name": _sheet_name(sheet)} if cached is not None else None
 
 
+@authorized_user_call
 async def generate_dashboard(
     user_id: int,
     file_id: str,

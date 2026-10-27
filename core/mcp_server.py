@@ -23,7 +23,7 @@ from mcp.types import ToolAnnotations
 from starlette.responses import JSONResponse
 
 from auth import db
-from auth.wps_oauth import auto_refresh_token_for_user, is_token_expired
+from auth.wps_session import WpsConnectionError, ensure_access_token, request_context
 from agent import assistant as assistant_module
 from core.context_memory import sanitize_memory_content
 from core.business_execution import document_upload_anchors, prepare_document_arguments
@@ -70,16 +70,11 @@ def _identity() -> dict:
 
 
 async def _wps_access_token(user_id: int) -> str:
-    token_row = db.get_wps_token(user_id)
-    if not token_row or not token_row.get("access_token"):
-        raise ToolError("当前用户尚未连接 WPS，请先在 OpenNexus 设置页完成授权")
-    expires_at = token_row.get("expires_at") or ""
-    if expires_at:
-        await auto_refresh_token_for_user(user_id)
-        token_row = db.get_wps_token(user_id) or token_row
-        if token_row.get("expires_at") and is_token_expired(token_row["expires_at"]):
-            raise ToolError("WPS 授权已过期，请在 OpenNexus 中重新连接 WPS")
-    return token_row["access_token"]
+    try:
+        token = await ensure_access_token(user_id)
+        return token
+    except WpsConnectionError as exc:
+        raise ToolError(str(exc)) from None
 
 
 async def _send_weixin(identity: dict, args: dict) -> dict:
@@ -209,6 +204,11 @@ async def _execute_special(name: str, args: dict, identity: dict) -> dict | None
 
 
 async def execute_tool(name: str, arguments: dict) -> dict:
+    with request_context(int(_identity()["user_id"])):
+        return await _execute_tool(name, arguments)
+
+
+async def _execute_tool(name: str, arguments: dict) -> dict:
     identity = _identity()
     hook_context = new_tool_context(identity, name, arguments)
     result: dict | None = None

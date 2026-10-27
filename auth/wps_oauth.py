@@ -104,7 +104,7 @@ async def exchange_code(code: str) -> dict:
 
 
 async def refresh_access_token(refresh_token: str) -> dict:
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.post(WPS_TOKEN_URL, data={
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
@@ -125,55 +125,31 @@ async def get_wps_user_info(access_token: str) -> dict:
 
 
 def calc_expires_at(expires_in: int) -> str:
-    return (datetime.now() + timedelta(seconds=expires_in - 60)).isoformat()
+    return (datetime.now() + timedelta(seconds=int(expires_in) - 60)).isoformat()
 
 
 def is_token_expired(expires_at: str) -> bool:
-    return datetime.now() >= datetime.fromisoformat(expires_at)
+    return is_token_expiring_soon(expires_at, minutes=0)
 
 
 def is_token_expiring_soon(expires_at: str, minutes: int = 5) -> bool:
     """检查 token 是否即将过期（默认5分钟内）"""
     try:
         exp_time = datetime.fromisoformat(expires_at)
-        return datetime.now() >= exp_time - timedelta(minutes=minutes)
-    except:
+        now = datetime.now(exp_time.tzinfo) if exp_time.tzinfo else datetime.now()
+        return now >= exp_time - timedelta(minutes=minutes)
+    except (ValueError, TypeError):
         return True
 
 
-async def auto_refresh_token_for_user(user_id: int) -> bool:
-    """自动刷新用户的 WPS token，返回是否成功"""
-    from auth.db import get_wps_token, save_wps_token
-
-    token_data = get_wps_token(user_id)
-    if not token_data or not token_data.get("refresh_token"):
-        return False
-
-    expires_at = token_data.get("expires_at", "2000-01-01")
-
-    # 如果还有 5 分钟以上就不刷新
-    if not is_token_expiring_soon(expires_at, minutes=5):
-        return True
-
+async def auto_refresh_token_for_user(user_id: int, *, force: bool = False) -> bool:
+    """兼容旧入口；所有用户凭证续期共用带租约和状态分类的实现。"""
+    from auth.wps_session import WpsConnectionError, ensure_access_token
     try:
-        result = await refresh_access_token(token_data["refresh_token"])
-        new_access_token = result.get("access_token")
-        new_refresh_token = result.get("refresh_token", token_data["refresh_token"])
-        new_expires_at = calc_expires_at(result.get("expires_in", 7200))
-
-        # 保存新 token
-        save_wps_token(
-            user_id,
-            new_access_token,
-            new_refresh_token,
-            new_expires_at,
-            token_data.get("wps_user_id", ""),
-            token_data.get("wps_username", "")
-        )
+        await ensure_access_token(user_id, force=force)
         return True
-    except Exception as e:
-        import traceback
-        logger.error(f"[WPS TOKEN] auto refresh failed for user {user_id}: {e}\n{traceback.format_exc()}")
+    except WpsConnectionError as exc:
+        logger.warning("[WPS TOKEN] user=%s status=%s", user_id, exc.status)
         return False
 
 

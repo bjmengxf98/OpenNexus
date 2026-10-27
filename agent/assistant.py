@@ -53,6 +53,7 @@ from agent.wecom_client import send_wecom_webhook as _wecom_send
 from auth.db import get_system_config as _db_get_system_config
 from auth.db import get_wecom_userid as _db_get_wecom_userid
 from core.document_generator import generate_and_upload_document as _generate_document
+from auth.wps_session import authorized_chat, WpsConnectionError, ensure_access_token
 from core.business_execution import (
     document_upload_anchors, prepare_document_arguments, execute_record_write,
     record_values_match,
@@ -2923,6 +2924,7 @@ class Assistant:
             parts.append(summarized)
         return "\n".join(parts)
 
+    @authorized_chat
     async def chat(self, messages: list, access_token: str,
                    on_tool_call=None, username: str = "用户",
                    role: str = "staff", default_file: dict = None,
@@ -4013,7 +4015,16 @@ class Assistant:
                             )
                         }
                     elif not access_token and name not in _LOCAL_TOOLS:
-                        result = {"error": "未连接WPS，请先点击右上角「连接WPS」完成授权"}
+                        if uid:
+                            try:
+                                access_token = await ensure_access_token(uid)
+                                result = {"error": "WPS 连接已自动恢复，请继续原读取操作；写入前先核实目标，禁止重放已提交的写入。",
+                                          "code": "wps_recovered", "retryable": True}
+                            except WpsConnectionError as exc:
+                                result = {"error": str(exc), "code": "wps_" + exc.status,
+                                          "reauth_required": exc.status == "reauth_required"}
+                        else:
+                            result = {"error": "未连接WPS，请先点击右上角「连接WPS」完成授权"}
                     elif name in TOOL_MAP:
                         if name == "generate_document":
                             requested_anchor = str(args.get("dbsheet_file_id") or "")

@@ -8,7 +8,7 @@ from typing import Any
 
 from agent.wps_client import get_schema, list_records
 from auth import db
-from auth.wps_oauth import auto_refresh_token_for_user, is_token_expiring_soon
+from auth.wps_session import ensure_access_token, authorized_user_call
 
 
 _SYNC_LOCKS: dict[tuple[int, str], asyncio.Lock] = {}
@@ -48,14 +48,7 @@ def _pick(sheets: list[dict], kind: str) -> dict | None:
 
 
 async def _token(user_id: int) -> str:
-    row = db.get_wps_token(user_id)
-    if not row or not row.get("access_token"):
-        raise RuntimeError("尚未连接 WPS")
-    if is_token_expiring_soon(row.get("expires_at") or "2000-01-01", minutes=5):
-        if not await auto_refresh_token_for_user(user_id):
-            raise RuntimeError("WPS 授权已过期，请重新连接")
-        row = db.get_wps_token(user_id)
-    return row.get("access_token", "")
+    return await ensure_access_token(user_id)
 
 
 def _view_id(sheet: dict) -> str | None:
@@ -127,6 +120,7 @@ def _merge(existing: list[dict], incoming: list[dict]) -> list[dict]:
     return list(merged.values())
 
 
+@authorized_user_call
 async def sync_dashboard_cache(
     user_id: int,
     file_id: str,

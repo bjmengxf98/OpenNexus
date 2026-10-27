@@ -35,6 +35,8 @@ The `+` menu supports file upload, attachment mode, conversation clearing, and u
 
 The top bar provides the current WPS file selector, connection status, dashboard, help, settings, administration, and sign-out actions. On mobile, less frequent actions move into the drawer.
 
+WPS status updates from runtime events, when the page regains focus, and approximately every 30 seconds while visible. Near-expiry user credentials are renewed automatically; chat, MCP, dashboard and WeChat share a cross-worker refresh lease. Yellow temporary/configuration errors are not reported as revoked authorization. Red reauthorization requirements open WPS only when you click. Known reads can retry once after a 401; writes are never automatically replayed. A disconnect or newer authorization cannot be overwritten by an in-flight renewal. Deployments with separate databases must maintain their own authorizations rather than copy rotating refresh credentials.
+
 ## 3. WPS Data Operations
 
 OpenNexus can query, summarize, create, update, and delete records; manage sheets and fields; and work with supported WPS structures. It reads the schema before complex operations and translates record links into business names when possible.

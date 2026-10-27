@@ -2653,19 +2653,18 @@ async def weixin_chat(request: Request):
 
     # 获取 WPS token（自动刷新过期 token，刷新后补订阅 webhook）
     # WPS 刷新失败不影响微信聊天，捕获异常后降级为无 token 继续运行
-    wps_token_row = db.get_wps_token(uid)
+    wps_token_row = db.get_wps_token(uid) or {}
     try:
-        if wps_token_row and wps_token_row.get("expires_at"):
-            if is_token_expired(wps_token_row["expires_at"]):
-                refreshed = await auto_refresh_token_for_user(uid)
-                if refreshed:
-                    wps_token_row = db.get_wps_token(uid)
-                    print(f"[WPS TOKEN] auto refreshed for uid={uid}, re-subscribing webhooks")
-                    await _ensure_webhooks(uid, wps_token_row["access_token"])
+        from auth.wps_session import ensure_access_token
+        access_token = await ensure_access_token(uid)
+        if access_token != wps_token_row.get("access_token"):
+            try:
+                await _ensure_webhooks(uid, access_token)
+            except Exception:
+                print(f"[WeChat Bot] WPS 授权已续期，webhook 补订阅暂未完成 uid={uid}")
     except Exception as _wps_err:
         print(f"[WeChat Bot] WPS token refresh failed, continuing without WPS: {_wps_err}")
-        wps_token_row = None
-    access_token = wps_token_row["access_token"] if wps_token_row else ""
+        access_token = ""
 
     # 处理图片：识别后追加到 text
     if images:

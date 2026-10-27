@@ -17,7 +17,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Stre
 
 from agent.assistant import Assistant, model_supports_vision
 from auth import db
-from auth.wps_oauth import build_auth_url, calc_expires_at, is_token_expired, refresh_access_token
+from auth.wps_oauth import build_auth_url
+from auth.wps_session import WpsConnectionError, connection_status, ensure_access_token
 from core import upload_queue
 from core.context_memory import build_user_context, sanitize_memory_content
 from core.file_parser import parse_file
@@ -193,11 +194,7 @@ async def app_new_bootstrap(request: Request):
         last_active = db.get_last_active_conv_id(uid)
         current_id = int(last_active or conversations[0]["id"])
 
-    token = db.get_wps_token(uid) or {}
-    wps_connected = bool(
-        token.get("access_token")
-        and not is_token_expired(token.get("expires_at", "2000-01-01T00:00:00"))
-    )
+    wps = await connection_status(uid)
     files = db.list_wps_files(uid)
     default_file = db.get_default_wps_file(uid)
     active_turn = db.get_active_agent_turn(uid, current_id) if current_id else None
@@ -211,9 +208,7 @@ async def app_new_bootstrap(request: Request):
             "is_admin": bool(user.get("is_admin")),
         },
         "wps": {
-            "connected": wps_connected,
-            "username": token.get("wps_username") or "已连接",
-            "connect_url": build_auth_url(uid),
+            **wps,
             "files": files,
             "default_file": default_file,
         },
@@ -225,6 +220,23 @@ async def app_new_bootstrap(request: Request):
             "status": active_turn["status"],
         } if active_turn else None),
     }
+
+
+@app_new_router.get("/api/app-new/wps/status")
+async def app_new_wps_status(request: Request):
+    uid, user = _current_user(request)
+    if not uid or not user:
+        return JSONResponse({"ok": False, "error": "未登录"}, status_code=401)
+    return JSONResponse({"ok": True, "wps": await connection_status(uid)},
+                        headers={"Cache-Control": "no-store"})
+
+
+@app_new_router.get("/api/app-new/wps/connect")
+async def app_new_wps_connect(request: Request):
+    uid, user = _current_user(request)
+    if not uid or not user:
+        return RedirectResponse("/login?next=/", status_code=302)
+    return RedirectResponse(build_auth_url(uid), status_code=302)
 
 
 @app_new_router.get("/api/app-new/help")
@@ -452,23 +464,14 @@ async def app_new_chat(request: Request):
                 await emit("accepted", conversation_id=conv_id, title=title,
                            files=[f.get("name", "") for f in files_to_send])
 
-                token_row = db.get_wps_token(uid) or {}
-                access_token = token_row.get("access_token") or ""
-                if access_token and is_token_expired(token_row.get("expires_at", "")):
-                    try:
-                        refresh_token = token_row.get("refresh_token") or ""
-                        if not refresh_token:
-                            raise ValueError("缺少 refresh_token")
-                        new_token = await refresh_access_token(refresh_token)
-                        access_token = new_token["access_token"]
-                        db.save_wps_token(
-                            uid, access_token, new_token.get("refresh_token", refresh_token),
-                            calc_expires_at(new_token["expires_in"]),
-                            token_row.get("wps_user_id", ""), token_row.get("wps_username", ""),
-                        )
-                    except Exception:
-                        access_token = ""
-                        await emit("notice", message="WPS 授权已过期，请重新连接；普通对话仍可继续。")
+                try:
+                    access_token = await ensure_access_token(uid)
+                except WpsConnectionError as exc:
+                    access_token = ""
+                    if exc.status != "disconnected":
+                        await emit("notice", message=str(exc) + "普通对话仍可继续。")
+                wps = await connection_status(uid, refresh=False)
+                await emit("wps_status", **wps)
                 ensure_not_cancelled()
 
                 llm_cfg = db.get_llm_key(uid)
@@ -557,6 +560,11 @@ async def app_new_chat(request: Request):
                 history_rows = db.get_chat_history(uid, conv_id=conv_id, limit=20)
                 history = [{"role": row["role"], "content": row["content"]} for row in history_rows]
                 history.append({"role": "user", "content": full_text})
+                if not wps["connected"] and not access_token:
+                    history.insert(0, {"role": "system", "content": (
+                        "当前 WPS 连接状态：" + wps["message"]
+                        + "本轮无法取得实时 WPS 数据，不要反复调用 WPS 工具，也不要将网络异常说成授权被撤销。"
+                    )})
                 upload_metadata = [
                     {
                         "name": item.get("name", ""),
