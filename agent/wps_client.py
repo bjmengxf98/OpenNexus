@@ -8,9 +8,11 @@ import json
 import hashlib
 import hmac
 import httpx
+import re
 from datetime import datetime, timezone
 from email.utils import formatdate
 from auth.wps_oauth import get_app_id, get_app_secret, get_app_token
+from auth.wps_session import request_token, recover_rejected_token, reject_refreshed_token
 
 OPENAPI_HOST = "https://openapi.wps.cn"
 
@@ -70,17 +72,30 @@ async def _post(access_token: str, path: str, body: dict, signed: bool = False,
     logger = logging.getLogger(__name__)
     body_str = json.dumps(body, ensure_ascii=False)
     url = f"{OPENAPI_HOST}{path}"
-    headers = (_signed_headers(access_token, "POST", path, body_str)
-               if signed else _base_headers(access_token))
-    if extra_headers:
-        headers.update(extra_headers)
+    access_token = await request_token(access_token)
+    # Only this explicit read endpoint is safe to replay after a 401.
+    # HTTP POST does not imply a write, but unknown endpoints must fail closed.
+    retry_read = re.fullmatch(r"/v7/coop/dbsheet/[^/]+/sheets/[^/]+/records", path) is not None
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(url, content=body_str.encode("utf-8"), headers=headers)
+        for attempt in range(2):
+            headers = (_signed_headers(access_token, "POST", path, body_str)
+                       if signed else _base_headers(access_token))
+            if extra_headers:
+                headers.update(extra_headers)
+            resp = await client.post(url, content=body_str.encode("utf-8"), headers=headers)
+            if resp.status_code != 401:
+                break
+            if attempt:
+                await reject_refreshed_token(access_token)
+                break
+            fresh = await recover_rejected_token(access_token)
+            if not fresh:
+                break
+            if not retry_read:
+                raise RuntimeError("WPS 授权已自动恢复；本次写请求未自动重放，请先读取目标核实结果，避免重复写入。")
+            access_token = fresh
         if not resp.is_success:
             logger.error(f"[WPS API ERROR] POST {resp.status_code} {path}")
-            logger.error(f"[WPS API ERROR] request body: {body_str}")
-            logger.error(f"[WPS API ERROR] signed: {signed}")
-            logger.error(f"[WPS API ERROR] response: {resp.text}")
             resp.raise_for_status()
         return resp.json()
 
@@ -90,14 +105,24 @@ async def _get(access_token: str, path: str, params: dict = None, signed: bool =
     logger = logging.getLogger(__name__)
     request_uri = _request_uri_with_query(path, params)
     url = f"{OPENAPI_HOST}{request_uri}"
-    headers = (_signed_headers(access_token, "GET", request_uri, "")
-               if signed else _base_headers(access_token))
+    access_token = await request_token(access_token)
     async with httpx.AsyncClient(timeout=30) as client:
         # 查询串已经固化进 URL，避免 httpx 再编码后与签名 URI 不一致。
-        resp = await client.get(url, headers=headers)
+        for attempt in range(2):
+            headers = (_signed_headers(access_token, "GET", request_uri, "")
+                       if signed else _base_headers(access_token))
+            resp = await client.get(url, headers=headers)
+            if resp.status_code != 401:
+                break
+            if attempt:
+                await reject_refreshed_token(access_token)
+                break
+            fresh = await recover_rejected_token(access_token)
+            if not fresh:
+                break
+            access_token = fresh
         if not resp.is_success:
             logger.error(f"[WPS API ERROR] GET {resp.status_code} {request_uri}")
-            logger.error(f"[WPS API ERROR] response: {resp.text}")
             resp.raise_for_status()
         return resp.json()
 

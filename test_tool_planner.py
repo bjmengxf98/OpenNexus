@@ -110,6 +110,7 @@ def test_signed_get_includes_query_parameters_in_kso_request_uri(monkeypatch):
 
     class FakeResponse:
         is_success = True
+        status_code = 200
         text = ""
 
         @staticmethod

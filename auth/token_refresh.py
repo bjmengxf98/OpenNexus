@@ -13,7 +13,7 @@ async def try_refresh_on_401(user_id: int) -> bool:
     返回 True 表示刷新成功，False 表示失败（需要用户重新授权）
     """
     logger.info(f"[WPS TOKEN] Attempting refresh for user {user_id} due to 401")
-    success = await auto_refresh_token_for_user(user_id)
+    success = await auto_refresh_token_for_user(user_id, force=True)
     if success:
         logger.info(f"[WPS TOKEN] Refresh successful for user {user_id}")
     else:
