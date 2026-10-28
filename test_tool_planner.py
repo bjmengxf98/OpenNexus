@@ -1272,7 +1272,7 @@ def test_all_tools_mode_really_sends_every_tool_while_smart_mode_routes():
     all_count = _tool_count_for_mode(False)
 
     assert smart_count == 6
-    assert all_count == len(TOOLS) == 54
+    assert all_count == len(TOOLS)
     assert all_count > smart_count
 
 

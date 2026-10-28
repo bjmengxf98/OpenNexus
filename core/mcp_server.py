@@ -26,6 +26,7 @@ from auth import db
 from auth.wps_session import WpsConnectionError, ensure_access_token, request_context
 from agent import assistant as assistant_module
 from core.context_memory import sanitize_memory_content
+from core.memory_management import MEMORY_TOOL_NAMES, execute_memory_tool
 from core.business_execution import document_upload_anchors, prepare_document_arguments
 from core.wechat_delivery import deliver_personal_weixin
 from core.tool_governance import (
@@ -135,6 +136,8 @@ async def _execute_special(name: str, args: dict, identity: dict) -> dict | None
             return {"error": str(exc)}
         token = await _wps_access_token(user_id)
         return await assistant_module.TOOL_MAP[name](token, prepared)
+    if name in MEMORY_TOOL_NAMES:
+        return execute_memory_tool(name, args, user_id)
     if name == "save_memory":
         content, rejected = sanitize_memory_content(args.get("content") or "")
         if not content:

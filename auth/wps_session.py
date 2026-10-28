@@ -47,10 +47,11 @@ def _saved_state(user_id: int, row: dict) -> dict:
     return state if isinstance(state, dict) and state.get("credential_fingerprint") == _fingerprint(row) else {}
 
 
-def _set_state(user_id: int, row: dict, status: str, *, retry_after: float = 0) -> None:
-    db.save_wps_connection_state(user_id, row, {
+def _set_state(user_id: int, row: dict, status: str, *, retry_after: float = 0,
+               reason: str = "") -> bool:
+    return db.save_wps_connection_state(user_id, row, {
         "credential_fingerprint": _fingerprint(row), "status": status,
-        "retry_after": retry_after,
+        "retry_after": retry_after, "state_version": 2, "reason": reason,
     })
 
 
@@ -81,14 +82,19 @@ def _refresh_failure(exc: Exception | dict) -> str:
             return "temporary_error"
     if not isinstance(payload, dict):
         return "temporary_error"
-    code = str(payload.get("error") or payload.get("code") or "").lower()
-    message = str(payload.get("msg") or payload.get("error_description") or "").lower()
-    if code in {"invalid_client", "unauthorized_client", "invalid_scope"}:
+    # WPS can place the OAuth error name in msg beside a numeric code.
+    values = [payload.get(field) for field in ("error", "code", "msg", "error_description")]
+    error_names = {value.strip().lower() for value in values if isinstance(value, str)}
+    if error_names & {"invalid_client", "unauthorized_client", "invalid_scope"}:
         return "configuration_error"
-    if code in {"invalid_grant", "invalid_refresh_token"} or re.search(
-        r"refresh[_ -]?token.{0,50}(?:invalid|expired|revoked)|"
-        r"(?:invalid|expired|revoked).{0,50}refresh[_ -]?token|刷新.{0,12}(?:失效|过期|无效)",
-        message,
+    if error_names & {"invalid_grant", "invalid_refresh_token"} or any(
+        re.search(
+            r"refresh[_ -]?token.{0,50}(?:invalid|expired|revoked)|"
+            r"(?:invalid|expired|revoked).{0,50}refresh[_ -]?token|刷新.{0,12}(?:失效|过期|无效)",
+            message.lower(),
+        )
+        for message in (payload.get("msg"), payload.get("error_description"))
+        if isinstance(message, str)
     ):
         return "reauth_required"
     return "temporary_error"
@@ -108,9 +114,10 @@ async def ensure_access_token(user_id: int, *, force: bool = False,
         if initial_pair is None:
             initial_pair = pair
         state = _saved_state(user_id, row)
-        if state.get("status") == "reauth_required":
+        legacy_red = state.get("status") == "reauth_required" and state.get("state_version") != 2
+        if state.get("status") == "reauth_required" and not legacy_red:
             raise WpsConnectionError(state["status"])
-        recoverable_failure = state.get("status") in {"temporary_error", "configuration_error"}
+        recoverable_failure = legacy_red or state.get("status") in {"temporary_error", "configuration_error"}
         if recoverable_failure and state.get("retry_after", 0) > time.time():
             if (not force and row.get("access_token")
                     and not wps_oauth.is_token_expired(row.get("expires_at"))):
@@ -126,7 +133,7 @@ async def ensure_access_token(user_id: int, *, force: bool = False,
                 return row["access_token"]
             status = "reauth_required" if row.get("access_token") else "disconnected"
             if row:
-                _set_state(user_id, row, status)
+                _set_state(user_id, row, status, reason="refresh_unavailable")
             raise WpsConnectionError(status)
         if db.claim_wps_refresh_lease(user_id, owner):
             try:
@@ -141,8 +148,10 @@ async def ensure_access_token(user_id: int, *, force: bool = False,
                             or not isinstance(result.get("access_token"), str)
                             or not result["access_token"].strip()
                             or int(result.get("expires_in", 0)) <= 60
-                            or not isinstance(result.get("refresh_token", row["refresh_token"]), str)
-                            or not result.get("refresh_token", row["refresh_token"])):
+                            or not isinstance(result.get("refresh_token"), str)
+                            or not result["refresh_token"].strip()
+                            or result["refresh_token"] != result["refresh_token"].strip()
+                            or result["refresh_token"] == row["refresh_token"]):
                         failure = _refresh_failure(result if isinstance(result, dict) else {})
                         raise WpsConnectionError(failure)
                 except Exception as exc:
@@ -150,20 +159,25 @@ async def ensure_access_token(user_id: int, *, force: bool = False,
                     if _fingerprint(db.get_wps_token(user_id) or {}) != pair:
                         continue
                     _set_state(user_id, row, failure, retry_after=time.time() + 30
-                               if failure in {"temporary_error", "configuration_error"} else 0)
+                               if failure in {"temporary_error", "configuration_error"} else 0,
+                               reason="refresh_rejected" if failure == "reauth_required" else "refresh_failed")
                     if (failure in {"temporary_error", "configuration_error"} and not force
                             and row.get("access_token")
                             and not wps_oauth.is_token_expired(row.get("expires_at"))):
                         return row["access_token"]
                     raise WpsConnectionError(failure) from None
                 saved = db.save_refreshed_wps_token(
-                    user_id, row, result["access_token"], result.get("refresh_token", row["refresh_token"]),
+                    user_id, row, result["access_token"], result["refresh_token"],
                     wps_oauth.calc_expires_at(result["expires_in"]),
                 )
                 if not saved:
                     continue
+                expected = {**row, "access_token": result["access_token"], "refresh_token": result["refresh_token"]}
                 latest = db.get_wps_token(user_id) or {}
-                _set_state(user_id, latest, "connected")
+                if _fingerprint(latest) != _fingerprint(expected):
+                    continue
+                if not _set_state(user_id, expected, "connected", reason="refresh_succeeded"):
+                    continue
                 return result["access_token"]
             finally:
                 db.release_wps_refresh_lease(user_id, owner)
@@ -219,6 +233,24 @@ async def request_token(token: str) -> str:
         await _publish(context)
 
 
+def validate_request_token(token: str) -> str:
+    """Last synchronous check before dispatch, including an awaited status callback."""
+    context = _REQUEST_CONTEXT.get()
+    if not context:
+        return token
+    row = db.get_wps_token(context["user_id"]) or {}
+    if token not in context["tokens"] and token != row.get("access_token"):
+        return token  # Preserve unrelated app credentials.
+    if not row.get("access_token"):
+        raise WpsConnectionError("refreshing" if row.get("refresh_token") else "disconnected")
+    if _saved_state(context["user_id"], row).get("status") == "reauth_required":
+        raise WpsConnectionError("reauth_required")
+    if wps_oauth.is_token_expired(row.get("expires_at")):
+        raise WpsConnectionError("refreshing")
+    context["tokens"].add(row["access_token"])
+    return row["access_token"]
+
+
 async def recover_rejected_token(token: str) -> str | None:
     context = _REQUEST_CONTEXT.get()
     if not context or token not in context["tokens"]:
@@ -231,13 +263,32 @@ async def recover_rejected_token(token: str) -> str | None:
         await _publish(context)
 
 
-async def reject_refreshed_token(token: str) -> None:
+async def reject_refreshed_token(token: str, *, verify=None) -> str | None:
+    """A repeated business 401 is not proof that the OAuth refresh grant is gone."""
     context = _REQUEST_CONTEXT.get()
-    if context and token in context["tokens"]:
-        row = db.get_wps_token(context["user_id"]) or {}
-        if row.get("access_token") == token:
-            _set_state(context["user_id"], row, "reauth_required")
-            await _publish(context)
+    if not context or token not in context["tokens"]:
+        return
+    row = db.get_wps_token(context["user_id"]) or {}
+    if row.get("access_token") != token:
+        return
+    try:
+        verified_user_id = await verify(token) if verify else None
+    except Exception:
+        verified_user_id = None
+    current = db.get_wps_token(context["user_id"]) or {}
+    if _fingerprint(current) != _fingerprint(row):
+        return  # The probe must not change a disconnected or newer authorization.
+    expected_user_id = str(row.get("wps_user_id") or "")
+    verified = bool(verified_user_id) and (not expected_user_id or str(verified_user_id) == expected_user_id)
+    status = "connected" if verified else "temporary_error"
+    if not _set_state(context["user_id"], row, status,
+                      retry_after=0 if verified else time.time() + 30,
+                      reason="identity_verified" if verified else "business_401_unverified"):
+        return None
+    await _publish(context)
+    if _fingerprint(db.get_wps_token(context["user_id"]) or {}) == _fingerprint(row):
+        return status
+    return None
 
 
 def authorized_chat(function):

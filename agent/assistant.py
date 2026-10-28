@@ -59,6 +59,7 @@ from core.business_execution import (
     record_values_match,
 )
 from core.context_memory import sanitize_memory_content
+from core.memory_management import MEMORY_TOOLS, MEMORY_TOOL_NAMES, execute_memory_tool
 from agent.tool_planner import (
     DISCOVER_TOOL_NAME,
     UPDATE_PLAN_TOOL_NAME,
@@ -468,6 +469,7 @@ content 参数是一个 JSON 对象（不是字符串），包含 sections 数�
 **绝对禁止说"我无法记忆""会话结束后会忘记""我没有长期记忆"等话**——这是错误的，系统已解决此问题。
 
 - 用户说「记住」「记下来」「下次也记得」「永久保存」等时，**立即调用 save_memory 工具**写入数据库，然后告知"已永久记住"
+- 用户明确要求忘记、删除或作废旧记忆时，先用 list_memories 查询定位，再用 delete_memory 删除；要求新内容替换旧内容时用 replace_memory 原子替换。不能只追加一条“旧内容作废”来冒充删除，不能猜记忆编号；多个旧条目无法区分时先确认。仅凭工具成功且 verified=true 的真实回执确认删除或替换；旧聊天中的过时内容不视为当前有效记忆。
 - 个人偏好、身份和长期习惯使用 global；只适用于当前对话的内容使用 current_topic；只适用于当前 WPS 表格的业务规则使用 current_table
 - WPS 的 file_id、sheet_id、默认表选择等实时配置绝对不能写入记忆
 - 用户问"你能记忆吗"时，回答：能，你说的重要内容我会永久记住，下次对话也不会忘
@@ -1947,6 +1949,8 @@ TOOLS.append({
     },
 })
 
+TOOLS.extend(MEMORY_TOOLS)
+
 TOOL_MAP = {
     "get_schema":    lambda at, a: get_file_structure(at, a["file_id"]),
     "list_records":  lambda at, a: list_records(at, a["file_id"], a["sheet_id"],
@@ -2834,11 +2838,13 @@ class Assistant:
                 if item and item not in ("无", "重复") and item.startswith("[纠错]"):
                     safe_item, _rejected = sanitize_memory_content(item)
                     if safe_item:
-                        _db_save_memory_item(
+                        saved_id = _db_save_memory_item(
                             uid, safe_item, scope_type=memory_scope,
                             scope_id=memory_scope_id, category="correction",
                             source_type="user_correction", confidence=0.95,
                         )
+                        if not saved_id:
+                            return
                         old = _db_get_user_memory(uid)
                         merged = (old + "\n- " + safe_item) if old else "- " + safe_item
                         _db_save_user_memory(uid, merged)
@@ -2873,11 +2879,13 @@ class Assistant:
             if item and item != "无" and item.startswith("[自动]"):
                 safe_item, _rejected = sanitize_memory_content(item)
                 if safe_item:
-                    _db_save_memory_item(
+                    saved_id = _db_save_memory_item(
                         uid, safe_item, scope_type=memory_scope,
                         scope_id=memory_scope_id, category="automatic",
                         source_type="user_statement", confidence=0.75,
                     )
+                    if not saved_id:
+                        return
                     old = _db_get_user_memory(uid)
                     merged = (old + "\n- " + safe_item) if old else "- " + safe_item
                     _db_save_user_memory(uid, merged)
@@ -3695,7 +3703,7 @@ class Assistant:
 
                 # 本地工具不依赖 WPS token，可在未连接时使用
                 # send_wps_bot_message 用 App Token，不依赖用户 WPS token
-                _LOCAL_TOOLS = {"search_knowledge", "get_change_log", "save_memory", "send_notification", "list_system_users", "send_wps_bot_message", "send_wecom_message", "send_weixin_message", "generate_document", "add_reminder", "list_reminders", "cancel_reminder"}
+                _LOCAL_TOOLS = {"search_knowledge", "get_change_log", "save_memory", "send_notification", "list_system_users", "send_wps_bot_message", "send_wecom_message", "send_weixin_message", "generate_document", "add_reminder", "list_reminders", "cancel_reminder"} | MEMORY_TOOL_NAMES
                 try:
                     if name == DISCOVER_TOOL_NAME:
                         names, fallback_all = discover_tool_names(
@@ -3773,6 +3781,11 @@ class Assistant:
                                     "receipt_index": receipt_index,
                                     "arguments": analysis_args,
                                 }
+                        except (ValueError, TypeError) as exc:
+                            result = {"error": str(exc)}
+                    elif name in MEMORY_TOOL_NAMES:
+                        try:
+                            result = execute_memory_tool(name, args, uid)
                         except (ValueError, TypeError) as exc:
                             result = {"error": str(exc)}
                     elif name == "save_memory":

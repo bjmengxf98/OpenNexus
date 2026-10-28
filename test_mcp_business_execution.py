@@ -123,7 +123,8 @@ def test_mcp_catalog_excludes_chat_receipt_tools_and_all_exposed_tools_have_disp
         assert {"read_record_window", "analyze_cached_records"} <= {
             tool["function"]["name"] for tool in assistant.TOOLS
         }
-        specials = {"save_memory", "send_wecom_message", "send_weixin_message", "get_change_log"}
+        specials = {"save_memory", "list_memories", "delete_memory", "replace_memory",
+                    "send_wecom_message", "send_weixin_message", "get_change_log"}
         extras = {tool["function"]["name"] for tool in service._EXTRA_TOOLS}
         assert names <= set(assistant.TOOL_MAP) | specials | extras
     asyncio.run(run())

@@ -86,12 +86,12 @@ TOOL_GROUPS: dict[str, ToolGroup] = {
     ),
     "knowledge_memory": ToolGroup(
         "知识与记忆",
-        "查询单位知识库或保存用户明确要求记住的信息",
+        "查询单位知识库，查询、保存、删除或替换用户明确指定的记忆",
         (
             "制度", "规定", "规范", "流程", "办法", "知识库", "单位要求",
-            "记住", "记下来", "保存记忆", "以后记得",
+            "记住", "记下来", "保存记忆", "以后记得", "记忆", "忘记", "作废",
         ),
-        ("search_knowledge", "save_memory"),
+        ("search_knowledge", "save_memory", "list_memories", "delete_memory", "replace_memory"),
     ),
     "people_messaging": ToolGroup(
         "人员与消息",
@@ -144,6 +144,8 @@ TOOL_GROUPS: dict[str, ToolGroup] = {
 
 
 TOOL_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    "delete_memory": ("list_memories",),
+    "replace_memory": ("list_memories",),
     "list_records": ("get_schema",),
     "analyze_records": ("get_schema",),
     "create_records": ("get_schema", "list_records"),
@@ -162,7 +164,7 @@ _EVIDENCE_TOOL_PREFIXES = (
 
 _SIDE_EFFECT_TOOL_PREFIXES = (
     "create_", "update_", "delete_", "upload_", "send_", "add_", "cancel_",
-    "copy_", "generate_", "bind_", "unbind_", "enable_", "disable_",
+    "copy_", "generate_", "bind_", "unbind_", "enable_", "disable_", "replace_",
     "sheets_create_", "sheets_update_", "sheets_delete_", "sheets_copy_",
 )
 

@@ -81,10 +81,13 @@ def recall_chat_history(user_id: int, query: str, *, conversation_id: int = 0,
     recent_normalized = {str(value or "").strip() for value in recent_contents}
     scored: list[tuple[float, int, dict]] = []
     candidates = db.get_user_chat_candidates(user_id, limit=600)
+    forgotten = db.get_forgotten_memory_contents(user_id)
     total = max(len(candidates), 1)
     for position, row in enumerate(candidates):
         raw_content = str(row.get("content") or "").strip()
         content = _safe_recall_content(raw_content)
+        if db.memory_matches_forgotten(content, forgotten):
+            continue
         if not content or raw_content == query or raw_content in recent_normalized or content == query:
             continue
         candidate_tokens = _tokens(content)
@@ -130,6 +133,11 @@ def build_user_context(user_id: int, conversation_id: int, query: str, *,
                        all_files: list[dict] | None = None,
                        recent_contents: Iterable[str] = ()) -> str:
     """组装模型上下文；异常时仅返回旧记忆，不影响既有功能。"""
+    # A caller may still hold a legacy snapshot from before a deletion.
+    try:
+        legacy_memory = db.filter_forgotten_memory(user_id, legacy_memory)
+    except Exception:
+        return ""  # Do not resurrect a forgotten entry through an unsafe fallback.
     try:
         sections: list[str] = []
         seen: set[str] = set()
