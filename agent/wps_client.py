@@ -12,7 +12,7 @@ import re
 from datetime import datetime, timezone
 from email.utils import formatdate
 from auth.wps_oauth import get_app_id, get_app_secret, get_app_token
-from auth.wps_session import request_token, recover_rejected_token, reject_refreshed_token
+from auth.wps_session import request_token, validate_request_token, recover_rejected_token, reject_refreshed_token
 
 OPENAPI_HOST = "https://openapi.wps.cn"
 
@@ -66,6 +66,39 @@ def _request_uri_with_query(path: str, params: dict | None = None) -> str:
 
 # ── HTTP 基础方法 ───────────────────────────────────────────
 
+async def _probe_user_identity(access_token: str) -> str | None:
+    """One bounded, direct read; never route this probe through the retry helpers."""
+    import asyncio
+    path = "/v7/users/current_id"
+    try:
+        async with asyncio.timeout(5), httpx.AsyncClient(timeout=5) as client:
+            access_token = validate_request_token(access_token)
+            response = await client.get(f"{OPENAPI_HOST}{path}",
+                                        headers=_signed_headers(access_token, "GET", path, ""))
+            if response.status_code != 200:
+                return None
+            payload = response.json()
+            if not isinstance(payload, dict) or payload.get("code") not in (0, "0"):
+                return None
+            data = payload.get("data")
+            user_id = data.get("user_id") if isinstance(data, dict) else None
+            return str(user_id).strip() if isinstance(user_id, (str, int)) and not isinstance(user_id, bool) else None
+    except Exception:
+        return None
+
+
+def _raise_business_401(response: httpx.Response, auth_status: str | None) -> None:
+    if response.status_code != 401 or auth_status not in {"connected", "temporary_error"}:
+        return
+    if auth_status == "connected":
+        message = ("WPS 当前用户凭证已通过独立核验，但当前业务接口仍返回 HTTP 401。"
+                   "请检查该接口的权限、签名或参数；此错误不代表整套 WPS 授权失效。")
+    else:
+        message = ("WPS 当前业务接口返回 HTTP 401，独立身份核验暂未通过；"
+                   "尚不能认定授权失效，请稍后重试或检查接口鉴权。")
+    raise httpx.HTTPStatusError(message, request=response.request, response=response)
+
+
 async def _post(access_token: str, path: str, body: dict, signed: bool = False,
                extra_headers: dict = None) -> dict:
     import logging
@@ -76,8 +109,10 @@ async def _post(access_token: str, path: str, body: dict, signed: bool = False,
     # Only this explicit read endpoint is safe to replay after a 401.
     # HTTP POST does not imply a write, but unknown endpoints must fail closed.
     retry_read = re.fullmatch(r"/v7/coop/dbsheet/[^/]+/sheets/[^/]+/records", path) is not None
+    auth_status = None
     async with httpx.AsyncClient(timeout=30) as client:
         for attempt in range(2):
+            access_token = validate_request_token(access_token)
             headers = (_signed_headers(access_token, "POST", path, body_str)
                        if signed else _base_headers(access_token))
             if extra_headers:
@@ -86,7 +121,7 @@ async def _post(access_token: str, path: str, body: dict, signed: bool = False,
             if resp.status_code != 401:
                 break
             if attempt:
-                await reject_refreshed_token(access_token)
+                auth_status = await reject_refreshed_token(access_token, verify=_probe_user_identity)
                 break
             fresh = await recover_rejected_token(access_token)
             if not fresh:
@@ -96,6 +131,7 @@ async def _post(access_token: str, path: str, body: dict, signed: bool = False,
             access_token = fresh
         if not resp.is_success:
             logger.error(f"[WPS API ERROR] POST {resp.status_code} {path}")
+            _raise_business_401(resp, auth_status)
             resp.raise_for_status()
         return resp.json()
 
@@ -106,16 +142,18 @@ async def _get(access_token: str, path: str, params: dict = None, signed: bool =
     request_uri = _request_uri_with_query(path, params)
     url = f"{OPENAPI_HOST}{request_uri}"
     access_token = await request_token(access_token)
+    auth_status = None
     async with httpx.AsyncClient(timeout=30) as client:
         # 查询串已经固化进 URL，避免 httpx 再编码后与签名 URI 不一致。
         for attempt in range(2):
+            access_token = validate_request_token(access_token)
             headers = (_signed_headers(access_token, "GET", request_uri, "")
                        if signed else _base_headers(access_token))
             resp = await client.get(url, headers=headers)
             if resp.status_code != 401:
                 break
             if attempt:
-                await reject_refreshed_token(access_token)
+                auth_status = await reject_refreshed_token(access_token, verify=_probe_user_identity)
                 break
             fresh = await recover_rejected_token(access_token)
             if not fresh:
@@ -123,6 +161,7 @@ async def _get(access_token: str, path: str, params: dict = None, signed: bool =
             access_token = fresh
         if not resp.is_success:
             logger.error(f"[WPS API ERROR] GET {resp.status_code} {request_uri}")
+            _raise_business_401(resp, auth_status)
             resp.raise_for_status()
         return resp.json()
 

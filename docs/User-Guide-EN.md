@@ -37,7 +37,11 @@ The top bar provides the current WPS file selector, connection status, dashboard
 
 WPS status updates from runtime events, when the page regains focus, and approximately every 30 seconds while visible. Near-expiry user credentials are renewed automatically; chat, MCP, dashboard and WeChat share a cross-worker refresh lease. Yellow temporary/configuration errors are not reported as revoked authorization. Red reauthorization requirements open WPS only when you click. Known reads can retry once after a 401; writes are never automatically replayed. A disconnect or newer authorization cannot be overwritten by an in-flight renewal. Deployments with separate databases must maintain their own authorizations rather than copy rotating refresh credentials.
 
+A repeated business-interface 401 triggers at most one independent identity read. A verified identity keeps the connection green; an uncertain probe stays yellow rather than declaring the refresh grant revoked. Renewal only succeeds with complete, rotated credentials. The stored credential pair is checked again after renewal and immediately before HTTP dispatch; already dispatched requests cannot be recalled by a local disconnect. Legacy red states without reliable provenance receive one serialized renewal check when a refresh credential is available; confirmed rejection still requires user reauthorization.
+
 ## 3. WPS Data Operations
+
+Memory can be searched, deleted, or explicitly replaced through chat and MCP. The assistant first locates the entry and uses a versioned reference; replacement is atomic and preserves the original scope. Deletion removes exact duplicate and legacy copies from active memory. Deletion markers suppress matching old text in automatic learning, derived summaries, stale legacy writes, and automatic history recall; they do not erase chat history or WPS records. An explicit new save can restore forgotten content. MCP lookup and saving require `manage_memory`; deletion and replacement additionally require `delete_data`, always for the token owner's own memory.
 
 OpenNexus can query, summarize, create, update, and delete records; manage sheets and fields; and work with supported WPS structures. It reads the schema before complex operations and translates record links into business names when possible.
 

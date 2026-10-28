@@ -1726,16 +1726,80 @@ def get_default_wps_file(user_id: int) -> dict | None:
 
 # ── 用户记忆 ───────────────────────────────────────────────
 
+def _memory_normalize(content: str) -> str:
+    lines = []
+    for line in str(content or "").splitlines():
+        line = line.strip()
+        if line.startswith(("- ", "* ", "• ")):
+            line = line[2:].strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _memory_digest(content: str) -> str:
+    return hashlib.sha256(_memory_normalize(content).encode("utf-8")).hexdigest()
+
+
+def _legacy_memory_blocks(text: str) -> list[str]:
+    """Keep multiline bullet entries together; old plain text remains line-based."""
+    lines = str(text or "").splitlines()
+    if not any(line.lstrip().startswith(("- ", "* ", "• ")) for line in lines):
+        return [line.strip() for line in lines if line.strip()]
+    blocks, current = [], []
+    for line in lines:
+        if line.lstrip().startswith(("- ", "* ", "• ")) and current:
+            blocks.append(_memory_normalize("\n".join(current)))
+            current = []
+        if line.strip():
+            current.append(line)
+    if current:
+        blocks.append(_memory_normalize("\n".join(current)))
+    return blocks
+
+
+def _forgotten_memory(conn, user_id: int) -> list[str]:
+    return [row["content"] for row in conn.execute(
+        "SELECT content FROM memory_items WHERE user_id=? AND status='deleted'", (user_id,)
+    ).fetchall() if row["content"]]
+
+
+def get_forgotten_memory_contents(user_id: int) -> list[str]:
+    with get_conn() as conn:
+        return _forgotten_memory(conn, user_id)
+
+
+def _filter_legacy_memory(text: str, forgotten: list[str]) -> str:
+    keys = {_memory_digest(content) for content in forgotten}
+    blocks = _legacy_memory_blocks(text)
+    kept = [block for block in blocks if _memory_digest(block) not in keys]
+    return text if len(kept) == len(blocks) else "\n".join("- " + block for block in kept)
+
+
+def memory_matches_forgotten(content: str, forgotten: list[str]) -> bool:
+    normalized = _memory_normalize(content)
+    # Short entries must match a complete line, not arbitrary words in other facts.
+    return any(value and (value in normalized.splitlines() or (len(value) >= 8 and value in normalized))
+               for value in (_memory_normalize(item) for item in forgotten))
+
+
+def filter_forgotten_memory(user_id: int, text: str) -> str:
+    with get_conn() as conn:
+        return _filter_legacy_memory(text, _forgotten_memory(conn, user_id))
+
+
 def get_user_memory(user_id: int) -> str:
     with get_conn() as conn:
         row = conn.execute(
             "SELECT memory_text FROM user_memory WHERE user_id=?", (user_id,)
         ).fetchone()
-        return row["memory_text"] if row else ""
+        return _filter_legacy_memory(row["memory_text"], _forgotten_memory(conn, user_id)) if row else ""
 
 
 def save_user_memory(user_id: int, memory_text: str):
     with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        memory_text = _filter_legacy_memory(memory_text, _forgotten_memory(conn, user_id))
         conn.execute("""
             INSERT INTO user_memory (user_id, memory_text, updated_at)
             VALUES (?, ?, datetime('now'))
@@ -1766,11 +1830,23 @@ def save_memory_item(user_id: int, content: str, *, scope_type: str = "global",
         confidence = 1.0
 
     with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        forgotten_rows = conn.execute(
+            "SELECT id, content FROM memory_items WHERE user_id=? AND status='deleted'", (user_id,)
+        ).fetchall()
+        if source_type in {"explicit", "mcp_explicit"}:
+            # Only an explicit new save may restore the same forgotten content.
+            restored_ids = [row["id"] for row in forgotten_rows
+                            if _memory_digest(row["content"]) == _memory_digest(content)]
+            conn.executemany("UPDATE memory_items SET status='superseded' WHERE id=? AND user_id=?",
+                             [(item_id, user_id) for item_id in restored_ids])
+        elif memory_matches_forgotten(content, [row["content"] for row in forgotten_rows]):
+            return 0
         row = None
         if replace_source and source_type and source_id:
             row = conn.execute(
                 "SELECT id FROM memory_items WHERE user_id=? AND scope_type=? AND scope_id=? "
-                "AND source_type=? AND source_id=? LIMIT 1",
+                "AND source_type=? AND source_id=? AND status='active' LIMIT 1",
                 (user_id, scope_type, scope_id, source_type, str(source_id)),
             ).fetchone()
         if not row:
@@ -1818,7 +1894,114 @@ def list_memory_items(user_id: int, *, scope_type: str | None = None,
             + " ORDER BY confidence DESC, updated_at DESC, id DESC LIMIT ?",
             params,
         ).fetchall()
-        return [dict(row) for row in rows]
+        forgotten = _forgotten_memory(conn, user_id)
+        return [dict(row) for row in rows
+                if row["source_type"] in {"explicit", "mcp_explicit"}
+                or not memory_matches_forgotten(row["content"], forgotten)]
+
+
+def list_manageable_memories(user_id: int, *, query: str = "", offset: int = 0,
+                            limit: int = 30) -> dict:
+    """Owner-scoped, versioned references, including legacy-only entries."""
+    offset, limit = max(0, int(offset)), max(1, min(int(limit), 100))
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, content, scope_type, scope_id, source_type FROM memory_items "
+            "WHERE user_id=? AND status='active' AND instr(lower(content), lower(?))>0 ORDER BY id",
+            (user_id, query),
+        ).fetchall()
+        forgotten = _forgotten_memory(conn, user_id)
+        rows = [row for row in rows if row["source_type"] in {"explicit", "mcp_explicit"}
+                or not memory_matches_forgotten(row["content"], forgotten)]
+        items = [{**dict(row), "memory_id": f"memory:{row['id']}:{_memory_digest(row['content'])}"}
+                 for row in rows]
+        legacy = conn.execute("SELECT memory_text FROM user_memory WHERE user_id=?", (user_id,)).fetchone()
+        global_keys = {_memory_digest(row["content"]) for row in rows if row["scope_type"] == "global"}
+        for content in _legacy_memory_blocks(_filter_legacy_memory(legacy["memory_text"] if legacy else "", forgotten)):
+            key = _memory_digest(content)
+            if query.casefold() in content.casefold() and key not in global_keys:
+                items.append({"memory_id": f"legacy:{key}", "content": content,
+                              "scope_type": "global", "scope_id": "", "source_type": "legacy"})
+                global_keys.add(key)
+        page = items[offset:offset + limit]
+        return {"ok": True, "memories": page, "total": len(items),
+                "next_offset": offset + len(page) if offset + len(page) < len(items) else None}
+
+
+def change_user_memory(user_id: int, memory_id: str, *, replacement: str | None = None) -> dict:
+    """Delete exact duplicates and their legacy copy, optionally replace atomically."""
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        legacy_row = conn.execute("SELECT memory_text FROM user_memory WHERE user_id=?", (user_id,)).fetchone()
+        legacy = legacy_row["memory_text"] if legacy_row else ""
+        parts = str(memory_id).split(":")
+        target = None
+        if len(parts) == 3 and parts[0] == "memory" and parts[1].isdigit():
+            row = conn.execute("SELECT * FROM memory_items WHERE user_id=? AND id=?",
+                               (user_id, int(parts[1]))).fetchone()
+            if row and parts[2] == _memory_digest(row["content"]):
+                if row["status"] == "deleted" and replacement is None:
+                    return {"ok": True, "verified": True, "deleted_count": 0, "already_deleted": True}
+                if row["status"] == "active":
+                    target = dict(row)
+        elif len(parts) == 2 and parts[0] == "legacy":
+            for block in _legacy_memory_blocks(legacy):
+                if parts[1] == _memory_digest(block):
+                    target = {"content": block, "scope_type": "global", "scope_id": ""}
+                    break
+            if target is None and replacement is None and any(
+                parts[1] == _memory_digest(content) for content in _forgotten_memory(conn, user_id)
+            ):
+                return {"ok": True, "verified": True, "deleted_count": 0, "already_deleted": True}
+        if target is None:
+            raise ValueError("记忆不存在、已变化或不属于当前用户；请重新查询后选择")
+        content, key = target["content"], _memory_digest(target["content"])
+        if replacement is not None:
+            replacement = str(replacement).strip()
+            if not replacement or _memory_digest(replacement) == key:
+                raise ValueError("替换内容不能为空，也不能与旧记忆相同")
+        copies = conn.execute("SELECT id, content FROM memory_items WHERE user_id=? AND status='active'",
+                              (user_id,)).fetchall()
+        removed_ids = [row["id"] for row in copies if _memory_digest(row["content"]) == key]
+        conn.executemany("UPDATE memory_items SET status='deleted', updated_at=datetime('now') "
+                         "WHERE user_id=? AND id=?", [(user_id, item_id) for item_id in removed_ids])
+        if not removed_ids:
+            conn.execute("INSERT INTO memory_items (user_id, content, status, source_type) "
+                         "VALUES (?,?,'deleted','legacy_deleted')", (user_id, content))
+        blocks = _legacy_memory_blocks(legacy)
+        kept = [block for block in blocks if _memory_digest(block) != key]
+        legacy_removed = len(blocks) - len(kept)
+        new_id = None
+        if replacement is not None:
+            for row in conn.execute("SELECT id, content FROM memory_items WHERE user_id=? AND status='deleted'",
+                                    (user_id,)).fetchall():
+                if _memory_digest(row["content"]) == _memory_digest(replacement):
+                    conn.execute("UPDATE memory_items SET status='superseded' WHERE user_id=? AND id=?",
+                                 (user_id, row["id"]))
+            cur = conn.execute("INSERT INTO memory_items (user_id, content, scope_type, scope_id, category, source_type) "
+                               "VALUES (?,?,?,?,'explicit','explicit')",
+                               (user_id, replacement, target["scope_type"], target["scope_id"]))
+            new_id = f"memory:{cur.lastrowid}:{_memory_digest(replacement)}"
+            if target["scope_type"] == "global" and all(_memory_digest(block) != _memory_digest(replacement) for block in kept):
+                kept.append(replacement)
+        if legacy_row or (replacement is not None and target["scope_type"] == "global"):
+            conn.execute("INSERT INTO user_memory (user_id, memory_text) VALUES (?,?) "
+                         "ON CONFLICT(user_id) DO UPDATE SET memory_text=excluded.memory_text, updated_at=datetime('now')",
+                         (user_id, "\n".join("- " + block for block in kept)))
+        remaining = conn.execute("SELECT content FROM memory_items WHERE user_id=? AND status='active'", (user_id,)).fetchall()
+        if any(_memory_digest(row["content"]) == key for row in remaining):
+            raise RuntimeError("旧记忆删除核验失败")
+        if replacement is not None and not any(row["content"] == replacement for row in remaining):
+            raise RuntimeError("新记忆保存核验失败")
+        stored_legacy = conn.execute("SELECT memory_text FROM user_memory WHERE user_id=?", (user_id,)).fetchone()
+        stored_blocks = _legacy_memory_blocks(stored_legacy["memory_text"] if stored_legacy else "")
+        if any(_memory_digest(block) == key for block in stored_blocks):
+            raise RuntimeError("旧版记忆删除核验失败")
+        if (replacement is not None and target["scope_type"] == "global"
+                and not any(_memory_digest(block) == _memory_digest(replacement) for block in stored_blocks)):
+            raise RuntimeError("旧版新记忆保存核验失败")
+        return {"ok": True, "verified": True, "deleted_count": len(removed_ids),
+                "legacy_removed": legacy_removed, "memory_id": new_id}
 
 
 def get_memory_item_by_source(user_id: int, source_type: str, source_id: str) -> dict | None:
@@ -1828,7 +2011,9 @@ def get_memory_item_by_source(user_id: int, source_type: str, source_id: str) ->
             "AND status='active' ORDER BY id DESC LIMIT 1",
             (user_id, source_type, str(source_id)),
         ).fetchone()
-        return dict(row) if row else None
+        if row and not memory_matches_forgotten(row["content"], _forgotten_memory(conn, user_id)):
+            return dict(row)
+        return None
 
 
 def get_user_chat_candidates(user_id: int, limit: int = 500) -> list:

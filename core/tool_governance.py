@@ -24,10 +24,10 @@ _SENSITIVE_KEYS = {
 MCP_SCOPE_DEFINITIONS = (
     {"id": "read", "label": "读取业务数据", "description": "查询 WPS、驾驶舱、知识库和审计记录"},
     {"id": "write_records", "label": "新增和修改业务数据", "description": "新增或更新记录、单元格和关联关系，不含删除"},
-    {"id": "delete_data", "label": "删除数据和解除关系", "description": "删除记录、单元格或解除关系；删除工作表、字段等还需结构管理权限"},
+    {"id": "delete_data", "label": "删除数据和解除关系", "description": "删除记录、单元格或解除关系；删除结构还需结构管理权限，删除或替换记忆还需管理记忆权限"},
     {"id": "manage_structure", "label": "管理表格结构", "description": "工作表、字段、视图、表单和 webhook；破坏性操作还需删除权限"},
     {"id": "send_messages", "label": "发送外部消息", "description": "邮件、WPS、企业微信和个人微信"},
-    {"id": "manage_memory", "label": "管理长期记忆", "description": "写入当前用户的长期记忆"},
+    {"id": "manage_memory", "label": "管理长期记忆", "description": "查询和保存本人记忆；删除或替换还需删除数据权限"},
     {"id": "manage_reminders", "label": "管理提醒", "description": "查看、新增和取消提醒"},
     {"id": "upload_files", "label": "上传附件", "description": "向 WPS 记录上传附件"},
     {"id": "generate_documents", "label": "生成文档", "description": "生成并保存业务文档"},
@@ -66,10 +66,12 @@ _DESTRUCTIVE_TOOLS = {
     "delete_records", "delete_sheet", "delete_fields", "delete_view",
     "disable_parent", "unbind_children", "delete_hook",
     "sheets_delete_worksheets", "sheets_delete_range",
+    "delete_memory", "replace_memory",
 }
 _KNOWN_TOOLS = (
     _READ_TOOLS | _WRITE_RECORD_TOOLS | _STRUCTURE_TOOLS | _MESSAGE_TOOLS |
-    _REMINDER_TOOLS | _UPLOAD_TOOLS | _DOCUMENT_TOOLS | {"save_memory"}
+    _REMINDER_TOOLS | _UPLOAD_TOOLS | _DOCUMENT_TOOLS |
+    {"save_memory", "list_memories", "delete_memory", "replace_memory"}
 )
 _BATCH_ARGUMENTS = {
     "create_records": "records",
@@ -178,7 +180,7 @@ def _required_scope(tool_name: str) -> str:
         return "manage_structure"
     if tool_name in _MESSAGE_TOOLS:
         return "send_messages"
-    if tool_name == "save_memory":
+    if tool_name in {"save_memory", "list_memories", "delete_memory", "replace_memory"}:
         return "manage_memory"
     if tool_name in _REMINDER_TOOLS:
         return "manage_reminders"
@@ -193,7 +195,7 @@ def _required_scope(tool_name: str) -> str:
 def policy_for_tool(tool_name: str, arguments: dict[str, Any] | None = None) -> ToolPolicy:
     arguments = arguments or {}
     required_scope = _required_scope(tool_name)
-    read_only = required_scope == "read" or tool_name == "list_reminders"
+    read_only = required_scope == "read" or tool_name in {"list_reminders", "list_memories"}
     destructive = tool_name in _DESTRUCTIVE_TOOLS
     required_scopes = (required_scope,)
     if destructive and required_scope != "delete_data":

@@ -98,10 +98,23 @@ def test_sqlite_lease_is_owner_checked_and_can_expire(monkeypatch):
 
 @pytest.mark.parametrize("payload,expected", [
     ({"error": "invalid_grant"}, "reauth_required"),
+    ({"code": 40100009, "msg": "invalid_grant"}, "reauth_required"),
+    ({"code": 40100009, "msg": "  INVALID_GRANT  "}, "reauth_required"),
+    ({"code": "invalid_grant"}, "reauth_required"),
+    ({"code": 1, "msg": "invalid_refresh_token"}, "reauth_required"),
+    ({"code": 1, "msg": "request failed", "error_description": "invalid_grant"}, "reauth_required"),
     ({"code": 1, "msg": "refresh_token is expired"}, "reauth_required"),
     ({"error": "invalid_client"}, "configuration_error"),
+    ({"code": 1, "msg": "invalid_client"}, "configuration_error"),
+    ({"code": 1, "msg": "unauthorized_client"}, "configuration_error"),
+    ({"code": 1, "error_description": "invalid_scope"}, "configuration_error"),
+    ({"code": 40100009}, "temporary_error"),
+    ({"code": 1, "msg": "diagnostic mentions invalid_grant"}, "temporary_error"),
     ({"code": 1, "msg": "service temporarily unavailable"}, "temporary_error"),
     ({"access_token": "fresh", "expires_in": "invalid"}, "temporary_error"),
+    ({"access_token": "fresh", "expires_in": 7200}, "temporary_error"),
+    ({"access_token": "fresh", "refresh_token": "refresh-old", "expires_in": 7200}, "temporary_error"),
+    ({"access_token": "fresh", "refresh_token": "   ", "expires_in": 7200}, "temporary_error"),
     ({"expires_in": 7200}, "temporary_error"),
     ({"access_token": "", "expires_in": 7200}, "temporary_error"),
     ({"access_token": "fresh", "refresh_token": "", "expires_in": 7200}, "temporary_error"),
@@ -153,9 +166,13 @@ def test_preemptive_network_failure_does_not_disable_still_valid_access(monkeypa
 
 @pytest.mark.parametrize("status,payload,expected", [
     (400, {"error": "invalid_grant"}, "reauth_required"),
+    (400, {"code": 40100009, "msg": "invalid_grant"}, "reauth_required"),
     (401, {"error": "invalid_client"}, "configuration_error"),
+    (401, {"code": 1, "msg": "invalid_client"}, "configuration_error"),
     (500, {"error": "invalid_grant"}, "temporary_error"),
+    (500, {"code": 40100009, "msg": "invalid_grant"}, "temporary_error"),
     (429, {"error": "invalid_grant"}, "temporary_error"),
+    (429, {"code": 40100009, "msg": "invalid_grant"}, "temporary_error"),
 ])
 def test_http_refresh_errors_do_not_confuse_server_failure_with_user_revocation(monkeypatch, status, payload, expected):
     token()
@@ -167,6 +184,43 @@ def test_http_refresh_errors_do_not_confuse_server_failure_with_user_revocation(
     assert error.value.status == expected
     assert "sensitive" not in str(error.value)
     assert db.get_wps_token(1)["access_token"] == "old"
+
+
+@pytest.mark.parametrize("http_status", [200, 400])
+def test_msg_invalid_grant_stops_refresh_until_new_authorization(monkeypatch, http_status):
+    token()
+    token(2, expired=False, access="other-user", refresh="other-refresh")
+    original = db.get_wps_token(1)
+    # Previously misclassified credentials must leave the yellow retry state.
+    session._set_state(1, original, "temporary_error", retry_after=0)
+    payload = {"code": 40100009, "msg": "invalid_grant"}
+    if http_status == 200:
+        renew = AsyncMock(return_value=payload)
+    else:
+        response = httpx.Response(http_status, json=payload,
+                                  request=httpx.Request("POST", wps_oauth.WPS_TOKEN_URL))
+        renew = AsyncMock(side_effect=httpx.HTTPStatusError(
+            "mock refresh rejection", request=response.request, response=response))
+    monkeypatch.setattr(wps_oauth, "refresh_access_token", renew)
+
+    status = asyncio.run(session.connection_status(1))
+    assert status["status"] == "reauth_required" and status["connected"] is False
+    assert "重新授权" in status["message"]
+    assert db.get_wps_token(1) == original
+    assert session.connection_snapshot(2)["status"] == "connected"
+
+    later = session.time.time() + 3600
+    monkeypatch.setattr(session.time, "time", lambda: later)
+    # Polling and forced recovery also stop after the former cooldown has elapsed.
+    assert asyncio.run(session.connection_status(1))["status"] == "reauth_required"
+    with pytest.raises(session.WpsConnectionError):
+        asyncio.run(session.ensure_access_token(1, force=True))
+    renew.assert_awaited_once_with("refresh-old")
+
+    token(expired=False, access="new-login", refresh="new-login-refresh")
+    assert asyncio.run(session.ensure_access_token(1)) == "new-login"
+    assert session.connection_snapshot(1)["status"] == "connected"
+    assert renew.await_count == 1
 
 
 def test_configuration_failure_is_rechecked_after_admin_fix_and_cooldown(monkeypatch):
@@ -259,7 +313,7 @@ def test_writes_are_not_replayed_after_auth_recovery(monkeypatch, suffix):
     assert session.connection_snapshot(1)["status"] == "connected"
 
 
-def test_second_401_stops_and_sets_red_state(monkeypatch):
+def test_second_business_401_does_not_prove_global_revocation(monkeypatch):
     token(expired=False)
     monkeypatch.setattr(wps_oauth, "refresh_access_token", AsyncMock(return_value=refreshed()))
     requests = []
@@ -274,8 +328,187 @@ def test_second_401_stops_and_sets_red_state(monkeypatch):
             await wps_client._get("old", "/v7/coop/dbsheet/f/schema")
     with pytest.raises(httpx.HTTPStatusError):
         asyncio.run(run())
-    assert len(requests) == 2
-    assert session.connection_snapshot(1)["status"] == "reauth_required"
+    assert len(requests) == 3  # Two business reads and one bounded identity probe.
+    assert session.connection_snapshot(1)["status"] == "temporary_error"
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+def test_business_401_keeps_verified_identity_connected(monkeypatch, method):
+    token(expired=False)
+    renew = AsyncMock(return_value=refreshed())
+    monkeypatch.setattr(wps_oauth, "refresh_access_token", renew)
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if request.url.path == "/v7/users/current_id":
+            assert request.headers["authorization"] == "Bearer fresh"
+            return httpx.Response(200, json={"code": 0, "data": {"user_id": "wps-1"}})
+        return httpx.Response(401, json={"msg": "business endpoint authentication failed"})
+    upstream(monkeypatch, handler)
+
+    async def run():
+        with session.request_context(1, "old"):
+            if method == "GET":
+                await wps_client._get("old", "/v7/coop/dbsheet/f/schema")
+            else:
+                await wps_client._post("old", "/v7/coop/dbsheet/f/sheets/1/records", {})
+    with pytest.raises(httpx.HTTPStatusError) as error:
+        asyncio.run(run())
+    assert len(requests) == 3
+    assert "已通过独立核验" in str(error.value)
+    assert error.value.response.status_code == 401
+    assert session.connection_snapshot(1)["status"] == "connected"
+    assert asyncio.run(session.ensure_access_token(1)) == "fresh"
+    renew.assert_awaited_once()
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+@pytest.mark.parametrize("new_authorization", [False, True])
+def test_post_save_disconnect_or_new_login_cannot_send_previous_credential(monkeypatch, new_authorization, method):
+    token()
+    monkeypatch.setattr(wps_oauth, "refresh_access_token", AsyncMock(return_value=refreshed()))
+    original = db.save_refreshed_wps_token
+
+    def interleave(*args, **kwargs):
+        result = original(*args, **kwargs)
+        assert result
+        if new_authorization:
+            token(expired=False, access="new-login", refresh="new-login-refresh")
+        else:
+            db.save_wps_token(1, "", "", "2000-01-01")
+        return result
+    monkeypatch.setattr(db, "save_refreshed_wps_token", interleave)
+    observed = []
+
+    def handler(request):
+        observed.append(request.headers["authorization"])
+        return httpx.Response(200, json={"code": 0})
+    upstream(monkeypatch, handler)
+
+    async def run():
+        with session.request_context(1, "old"):
+            if method == "POST":
+                return await wps_client._post("old", "/v7/coop/dbsheet/f/sheets/1/records/create", {})
+            return await wps_client._get("old", "/v7/coop/dbsheet/f/schema")
+    if new_authorization:
+        assert asyncio.run(run())["code"] == 0
+        assert observed == ["Bearer new-login"]
+    else:
+        with pytest.raises(session.WpsConnectionError):
+            asyncio.run(run())
+        assert not observed
+        assert session.connection_snapshot(1)["status"] == "disconnected"
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+@pytest.mark.parametrize("new_authorization", [False, True])
+def test_status_callback_race_is_checked_before_http_dispatch(monkeypatch, new_authorization, method):
+    token(expired=False)
+    observed = []
+
+    async def status(_snapshot):
+        if new_authorization:
+            token(expired=False, access="new-login", refresh="new-login-refresh")
+        else:
+            db.save_wps_token(1, "", "", "2000-01-01")
+
+    def handler(request):
+        observed.append(request.headers["authorization"])
+        return httpx.Response(200, json={"code": 0})
+    upstream(monkeypatch, handler)
+
+    async def run():
+        with session.request_context(1, "old", status):
+            if method == "POST":
+                return await wps_client._post("old", "/v7/coop/dbsheet/f/sheets/1/records/create", {})
+            return await wps_client._get("old", "/v7/coop/dbsheet/f/schema")
+    if new_authorization:
+        asyncio.run(run())
+        assert observed == ["Bearer new-login"]
+    else:
+        with pytest.raises(session.WpsConnectionError):
+            asyncio.run(run())
+        assert not observed
+
+
+@pytest.mark.parametrize("valid_refresh", [False, True])
+def test_legacy_red_state_gets_one_revalidation_and_confirmed_rejection_stops(monkeypatch, valid_refresh):
+    token(expired=False)
+    previous = db.get_wps_token(1)
+    db.save_wps_connection_state(1, previous, {
+        "credential_fingerprint": session._fingerprint(previous),
+        "status": "reauth_required", "retry_after": 0,
+    })
+    async def refresh(_token):
+        await asyncio.sleep(0.01)
+        return refreshed() if valid_refresh else {"error": "invalid_grant"}
+    renew = AsyncMock(side_effect=refresh)
+    monkeypatch.setattr(wps_oauth, "refresh_access_token", renew)
+    expected = "connected" if valid_refresh else "reauth_required"
+    async def simultaneous_checks():
+        return await asyncio.gather(*(session.connection_status(1) for _ in range(4)))
+    assert {status["status"] for status in asyncio.run(simultaneous_checks())} == {expected}
+    assert asyncio.run(session.connection_status(1))["status"] == expected
+    renew.assert_awaited_once()
+
+
+@pytest.mark.parametrize("probe_case", ["401", "403", "500", "429", "malformed", "other_user", "timeout"])
+def test_failed_identity_probe_stays_uncertain_and_bounded(monkeypatch, probe_case):
+    token(expired=False)
+    renew = AsyncMock(return_value=refreshed())
+    monkeypatch.setattr(wps_oauth, "refresh_access_token", renew)
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if request.url.path != "/v7/users/current_id":
+            return httpx.Response(401)
+        if probe_case == "timeout":
+            raise httpx.ReadTimeout("sensitive diagnostic must not leak")
+        if probe_case == "malformed":
+            return httpx.Response(200, text="not JSON")
+        if probe_case == "other_user":
+            return httpx.Response(200, json={"code": 0, "data": {"user_id": "not-this-user"}})
+        return httpx.Response(int(probe_case))
+    upstream(monkeypatch, handler)
+
+    async def run():
+        with session.request_context(1, "old"):
+            await wps_client._get("old", "/v7/coop/dbsheet/f/schema")
+    with pytest.raises(httpx.HTTPStatusError) as error:
+        asyncio.run(run())
+    assert len(calls) == 3
+    assert "尚不能认定授权失效" in str(error.value)
+    snapshot = session.connection_snapshot(1)
+    assert snapshot["status"] == "temporary_error"
+    assert "sensitive" not in json.dumps(snapshot)
+    assert asyncio.run(session.ensure_access_token(1)) == "fresh"
+    renew.assert_awaited_once()
+
+
+@pytest.mark.parametrize("new_authorization", [False, True])
+def test_identity_probe_cannot_overwrite_new_connection_state(monkeypatch, new_authorization):
+    token(expired=False)
+    monkeypatch.setattr(wps_oauth, "refresh_access_token", AsyncMock(return_value=refreshed()))
+
+    def handler(request):
+        if request.url.path == "/v7/users/current_id":
+            if new_authorization:
+                token(expired=False, access="new-login", refresh="new-login-refresh")
+            else:
+                db.save_wps_token(1, "", "", "2000-01-01")
+            return httpx.Response(200, json={"code": 0, "data": {"user_id": "wps-1"}})
+        return httpx.Response(401)
+    upstream(monkeypatch, handler)
+
+    async def run():
+        with session.request_context(1, "old"):
+            await wps_client._get("old", "/v7/coop/dbsheet/f/schema")
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(run())
+    assert session.connection_snapshot(1)["status"] == ("connected" if new_authorization else "disconnected")
+    assert db.get_wps_token(1)["access_token"] == ("new-login" if new_authorization else "")
 
 
 @pytest.mark.parametrize("status_code,api_token", [(403, "old"), (401, "app-level-token")])
