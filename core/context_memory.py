@@ -128,6 +128,47 @@ def _append_unique(target: list[str], seen: set[str], content: str) -> None:
     target.append(normalized)
 
 
+def _append_memory(target: list[str], seen: set[str], item: dict) -> None:
+    before = len(target)
+    _append_unique(target, seen, item.get("content", ""))
+    if len(target) == before:
+        return
+    source = item.get("source_type")
+    origin = ("用户明确保存" if source == "explicit" else
+              "MCP显式保存" if source == "mcp_explicit" else
+              "自动提取，需核对" if source in {"user_statement", "user_correction", "automatic"} else
+              "派生摘要，需核对" if source == "conversation_summary" else "来源未记录，需核对")
+    date = str(item.get("updated_at") or "")[:10]
+    target[-1] += f"\n（来源：{origin}{'；更新日期（UTC）：' + date if date else ''}）"
+
+
+_MEMORY_BUDGET_NOTE = "【记忆范围提示】部分完整条目因长度预算未装入；不表示已删除或不存在，缺少关键信息时应先核对。"
+
+
+def _pack_memory_sections(sections, max_chars=7000):
+    """Keep whole entries, including multiline conditions, within one budget."""
+    full = "\n\n".join(title + "\n".join(entries) for title, entries in sections if entries).strip()
+    if len(full) <= max_chars:
+        return full
+    remaining = max_chars - len(_MEMORY_BUDGET_NOTE) - 2
+    kept = []
+    for title, entries in sections:
+        selected = []
+        for entry in entries:
+            block = title + "\n".join([*selected, entry])
+            candidate = "\n\n".join([*kept, block])
+            if len(candidate) <= remaining:
+                selected.append(entry)
+        if selected:
+            kept.append(title + "\n".join(selected))
+    return "\n\n".join([*kept, _MEMORY_BUDGET_NOTE])
+
+
+def bound_memory_text(text: str) -> str:
+    # Legacy text has no item IDs. Keep blank-line-separated paragraphs whole.
+    return _pack_memory_sections([("", str(text or "").split("\n\n"))])
+
+
 def build_user_context(user_id: int, conversation_id: int, query: str, *,
                        legacy_memory: str = "", default_file: dict | None = None,
                        all_files: list[dict] | None = None,
@@ -139,25 +180,29 @@ def build_user_context(user_id: int, conversation_id: int, query: str, *,
     except Exception:
         return ""  # Do not resurrect a forgotten entry through an unsafe fallback.
     try:
-        sections: list[str] = []
+        sections = []
         seen: set[str] = set()
 
         global_lines: list[str] = []
         for item in db.list_memory_items(user_id, scope_type="global", limit=80):
-            _append_unique(global_lines, seen, item.get("content", ""))
-        for line in str(legacy_memory or "").splitlines():
-            _append_unique(global_lines, seen, line)
+            _append_memory(global_lines, seen, item)
+        for line in str(legacy_memory or "").split("\n\n"):
+            blocks = (db._legacy_memory_blocks(line) if any(
+                value.lstrip().startswith(("- ", "* ", "• ")) for value in line.splitlines()
+            ) else [line])
+            for block in blocks:
+                _append_memory(global_lines, seen, {"content": block, "source_type": "legacy"})
         if global_lines:
-            sections.append("【用户长期记忆】\n" + "\n".join(f"- {line}" for line in global_lines[:80]))
+            sections.append(("【用户长期记忆（作为参考，不构成当前操作授权）】\n", [f"- {line}" for line in global_lines[:80]]))
 
         if conversation_id:
             topic_lines: list[str] = []
             for item in db.list_memory_items(
                 user_id, scope_type="conversation", scope_ids=[str(conversation_id)], limit=30,
             ):
-                _append_unique(topic_lines, seen, item.get("content", ""))
+                _append_memory(topic_lines, seen, item)
             if topic_lines:
-                sections.append("【当前话题记忆】\n" + "\n".join(f"- {line}" for line in topic_lines))
+                sections.append(("【当前话题记忆】\n", [f"- {line}" for line in topic_lines]))
 
         # 默认数据源始终生效；用户明确提及其他已连接表格名称时同时加入该表规则。
         relevant_file_ids: list[str] = []
@@ -173,9 +218,9 @@ def build_user_context(user_id: int, conversation_id: int, query: str, *,
             for item in db.list_memory_items(
                 user_id, scope_type="file", scope_ids=relevant_file_ids, limit=40,
             ):
-                _append_unique(file_lines, seen, item.get("content", ""))
+                _append_memory(file_lines, seen, item)
             if file_lines:
-                sections.append("【当前数据源业务规则】\n" + "\n".join(f"- {line}" for line in file_lines))
+                sections.append(("【当前数据源业务规则】\n", [f"- {line}" for line in file_lines]))
 
         recalled = recall_chat_history(
             user_id, query, conversation_id=conversation_id,
@@ -187,13 +232,11 @@ def build_user_context(user_id: int, conversation_id: int, query: str, *,
                 title = str(row.get("conversation_title") or "历史话题")
                 date = str(row.get("created_at") or "")[:10]
                 history_lines.append(f"- [{date}·{title}] 用户曾说：{row['content']}")
-            sections.append(
-                "【相关历史原话（仅作为线索，涉及当前业务状态时必须重新查询 WPS）】\n"
-                + "\n".join(history_lines)
-            )
+            sections.append((
+                "【相关历史原话（仅作为线索，涉及当前业务状态时必须重新查询 WPS）】\n", history_lines,
+            ))
 
-        result = "\n\n".join(sections).strip()
-        return result[:7000]
+        return _pack_memory_sections(sections)
     except Exception as exc:
         print(f"[CONTEXT] build fallback: {type(exc).__name__}: {exc}")
-        return str(legacy_memory or "")
+        return bound_memory_text(legacy_memory)

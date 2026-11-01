@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
+import tempfile
 import unittest
 from datetime import date
 from unittest.mock import AsyncMock, patch
@@ -12,6 +14,26 @@ from core.dashboard_generic import build_generic_dashboard
 
 
 class GenericDashboardTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(prefix="opennexus-dashboard-test-")
+        self.addCleanup(directory.cleanup)
+        database = patch.object(dashboard_service.db, "DB_PATH", Path(directory.name) / "test.db")
+        database.start()
+        self.addCleanup(database.stop)
+        connections = []
+        original_get_conn = dashboard_service.db.get_conn
+
+        def get_test_conn():
+            connection = original_get_conn()
+            connections.append(connection)
+            return connection
+
+        factory = patch.object(dashboard_service.db, "get_conn", side_effect=get_test_conn)
+        factory.start()
+        self.addCleanup(factory.stop)
+        self.addCleanup(lambda: [connection.close() for connection in connections])
+        dashboard_service.db.init_db()
+
     def test_unrelated_business_sheet_uses_its_own_fields(self):
         index = {
             "sheets": [{"id": "sheet-1", "name": "国家课题管理", "total": 3, "complete": True}],
@@ -107,7 +129,7 @@ class GenericDashboardTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["skipped"][0]["name"], "月报操作简要说明")
         self.assertEqual(result["skipped"][1]["name"], "仪表盘")
-        self.assertEqual(stored["generic_index"]["version"], 4)
+        self.assertEqual(stored["generic_index"]["version"], dashboard_generic_cache.GENERIC_CACHE_VERSION)
         payload = build_generic_dashboard(
             stored["generic_index"], lambda _sheet: {"records": [{"fields": {"状态": "正常"}}]},
             date(2026, 9, 15), {},
@@ -116,7 +138,7 @@ class GenericDashboardTests(unittest.TestCase):
         self.assertIn("月报操作简要说明", payload["insights"][0])
 
     def test_old_overview_snapshot_rebuilds_from_generic_data(self):
-        index = {"version": 4, "sheets": [{"id": "1", "name": "客户", "total": 1, "complete": True}],
+        index = {"version": dashboard_generic_cache.GENERIC_CACHE_VERSION, "sheets": [{"id": "1", "name": "客户", "total": 1, "complete": True}],
                  "schema_sheets": [{"id": "1", "name": "客户"}]}
 
         def get_cache(_user, _file, kind):

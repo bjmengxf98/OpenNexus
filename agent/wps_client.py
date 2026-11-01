@@ -12,7 +12,8 @@ import re
 from datetime import datetime, timezone
 from email.utils import formatdate
 from auth.wps_oauth import get_app_id, get_app_secret, get_app_token
-from auth.wps_session import request_token, validate_request_token, recover_rejected_token, reject_refreshed_token
+from auth.wps_session import WpsConnectionError, request_token, validate_request_token, recover_rejected_token, reject_refreshed_token
+from core.read_diagnostics import observed_business_request
 
 OPENAPI_HOST = "https://openapi.wps.cn"
 
@@ -117,7 +118,7 @@ async def _post(access_token: str, path: str, body: dict, signed: bool = False,
                        if signed else _base_headers(access_token))
             if extra_headers:
                 headers.update(extra_headers)
-            resp = await client.post(url, content=body_str.encode("utf-8"), headers=headers)
+            resp = await observed_business_request(client.post, url, content=body_str.encode("utf-8"), headers=headers)
             if resp.status_code != 401:
                 break
             if attempt:
@@ -149,7 +150,7 @@ async def _get(access_token: str, path: str, params: dict = None, signed: bool =
             access_token = validate_request_token(access_token)
             headers = (_signed_headers(access_token, "GET", request_uri, "")
                        if signed else _base_headers(access_token))
-            resp = await client.get(url, headers=headers)
+            resp = await observed_business_request(client.get, url, headers=headers)
             if resp.status_code != 401:
                 break
             if attempt:
@@ -311,60 +312,84 @@ async def get_file_structure(access_token: str, file_id: str) -> dict:
 # ── 记录 ───────────────────────────────────────────────────
 
 async def list_records(access_token: str, file_id: str, sheet_id: int,
-                       page_size: int = 500, page_token: str = None,
+                       page_size: int = None, page_token: str = None,
                        fields: list = None, filter: dict = None,
                        view_id: str = None, max_records: int = None) -> dict:
-    # 指定了 page_token（AI 手动翻页）或 max_records（限量查询）时，单次请求
-    if page_token is not None or max_records is not None:
-        body = {"page_size": min(page_size, 1000)}
-        if page_token:   body["page_token"] = page_token
-        if fields:       body["fields"] = fields
-        if filter:       body["filter"] = filter
-        if view_id:      body["view_id"] = view_id
-        if max_records:  body["max_records"] = max_records
-        result = await _post(access_token,
-                             f"/v7/coop/dbsheet/{file_id}/sheets/{sheet_id}/records", body)
-        parsed = _parse_records(result.get("data", result))
-        parsed["fetched"] = len(parsed.get("records", []))
-        parsed["has_more"] = bool(parsed.get("has_more", False))
-        parsed["is_complete"] = not parsed["has_more"]
-        parsed.setdefault("next_page_token", None)
-        return parsed
+    """Explicit controls read one page; omitted controls auto-read up to 3000 rows."""
+    from copy import deepcopy
+    from core.record_evidence import continuation, exhausted, normalize_page, record_counts, record_scope, valid_page
 
-    # 默认：自动翻页，拉取全部记录（上限 3000 条，防止超大表撑爆 token）
-    MAX_AUTO_FETCH = 3000
-    all_records = []
-    current_token = None
-    total = 0
+    scope = record_scope(file_id=file_id, sheet_id=sheet_id, fields=fields,
+                         filter=filter, view_id=view_id, start_token=page_token)
+    for key, value in (("page_size", page_size), ("max_records", max_records)):
+        if value is not None and (type(value) is not int or value <= 0):
+            return {"ok": False, "error": key + " 必须是正整数。", "code": "invalid_" + key,
+                    "is_complete": False, "_record_scope": scope}
+    if page_token is not None and not isinstance(page_token, str):
+        return {"ok": False, "error": "page_token 必须是服务端返回的字符串游标。",
+                "code": "invalid_page_token", "is_complete": False, "_record_scope": scope}
+    single_page = page_size is not None or page_token is not None or max_records is not None
+    size = min(page_size or 1000, max_records or 1000, 1000)
 
-    has_more = False
-    while True:
-        body = {"page_size": 1000}
-        if current_token: body["page_token"] = current_token
-        if fields:        body["fields"] = fields
-        if filter:        body["filter"] = filter
-        if view_id:       body["view_id"] = view_id
-        result = await _post(access_token,
-                             f"/v7/coop/dbsheet/{file_id}/sheets/{sheet_id}/records", body)
-        parsed = _parse_records(result.get("data", result))
-        batch = parsed.get("records", [])
-        all_records.extend(batch)
-        total = parsed.get("total", len(all_records))
-        has_more = parsed.get("has_more", False)
-        current_token = parsed.get("next_page_token")
-        if not has_more or not current_token or len(all_records) >= MAX_AUTO_FETCH:
+    async def fetch(token, limit):
+        request_scope = record_scope(file_id=file_id, sheet_id=sheet_id, fields=fields,
+                                     filter=filter, view_id=view_id, start_token=token)
+        body = {"page_size": limit}
+        if token: body["page_token"] = token
+        if fields: body["fields"] = fields
+        if filter: body["filter"] = filter
+        if view_id: body["view_id"] = view_id
+        try:
+            wire = await _post(access_token, f"/v7/coop/dbsheet/{file_id}/sheets/{sheet_id}/records", body)
+            if not isinstance(wire, dict) or wire.get("code", 0) not in (0, "0"):
+                return normalize_page({"error": "WPS 记录读取失败。", "code": wire.get("code") if isinstance(wire, dict) else "invalid_response"}, scope=request_scope)
+            data = deepcopy(wire.get("data", wire))
+            parsed = _parse_records(data) if isinstance(data, dict) else {}
+            return normalize_page(parsed, scope=request_scope)
+        except WpsConnectionError as exc:
+            return normalize_page({"error": str(exc), "code": "wps_connection_" + exc.status}, scope=request_scope)
+        except Exception as exc:
+            # Preserve the requested range without leaking token-bearing URLs or
+            # interpreting transport/auth failures as a successful empty table.
+            status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+            return normalize_page({"error": "WPS 记录读取失败" + (f"（HTTP {status}）" if status else "") + "。",
+                                   "code": "record_read_failed"}, scope=request_scope)
+
+    if single_page:
+        return await fetch(page_token, size)
+    limit = 3000
+    records, seen = [], set()
+    token, reported_total, error = None, None, ""
+    pages = 0
+    done = False
+    while len(records) < limit:
+        page = await fetch(token, min(size, limit - len(records)))
+        pages += 1
+        if not valid_page(page):
+            error = page.get("error") or "记录页无效。"
             break
-
-    return {
-        "records": all_records,
-        "total": total,
-        "has_more": bool(has_more),
-        "fetched": len(all_records),
-        "next_page_token": current_token if has_more else None,
-        "is_complete": not bool(has_more),
-        "auto_fetch_limit": MAX_AUTO_FETCH,
-        "continuation_available": bool(has_more and current_token),
-    }
+        records.extend(page["records"])
+        if page.get("total_basis") == "server_reported_query_total":
+            reported_total = page["total"]
+        if exhausted(page):
+            token, done = None, True
+            break
+        following = continuation(page)
+        if not following or following in seen:
+            error = page.get("continuation_error") or "记录页缺少有效继续游标或重复返回同一游标。"
+            token = following
+            break
+        seen.add(following)
+        token = following
+    result = {"records": records, **record_counts(records, complete=done, reported_total=reported_total),
+              "has_more": not done, "next_page_token": token, "is_complete": done,
+              "page_exhausted": done, "pages_fetched": pages, "auto_fetch_limit": limit,
+              "continuation_available": bool(not done and token), "_record_scope": scope}
+    if error:
+        result["continuation_error"] = error
+        if not records:
+            result.update(ok=False, error=error)
+    return result
 
 
 async def create_records(access_token: str, file_id: str, sheet_id: int,
@@ -1061,7 +1086,7 @@ async def _drive_upload_commit(access_token: str, drive_id: str, parent_id: str,
 async def upload_to_drive(access_token: str, dbsheet_file_id: str,
                            file_name: str, file_data: bytes,
                            content_type: str = "application/octet-stream",
-                           candidate_file_ids=None) -> dict:
+                            candidate_file_ids=None, *, on_phase=None) -> dict:
     """
     将文件上传到 WPS 网盘（与多维表格同目录），返回可写入 Attachment 字段的云文档格式：
     {"name": "...", "mode": "cloud", "type": "docx", "uploadId": "网盘file_id", "size": N}
@@ -1079,6 +1104,8 @@ async def upload_to_drive(access_token: str, dbsheet_file_id: str,
     drive_id, parent_id = await _resolve_ai_attachment_folder(
         access_token, dbsheet_file_id, candidate_file_ids,
     )
+    if on_phase is not None:
+        on_phase("prepared", {"drive_id": drive_id, "parent_id": parent_id})
 
     # Step 2: 申请上传（hashes 数组格式，公网必传 sha256）
     import hashlib as _hashlib
@@ -1086,7 +1113,6 @@ async def upload_to_drive(access_token: str, dbsheet_file_id: str,
     print(f"[DRIVE UPLOAD] apply drive_id={drive_id} parent_id={parent_id} name={file_name} size={len(file_data)} sha256={file_sha256}")
     apply = await _drive_upload_apply(access_token, drive_id, parent_id, file_name, len(file_data),
                                        sha256=file_sha256, content_type=content_type)
-    print(f"[DRIVE UPLOAD] apply result={str(apply)[:300]}")
     upload_id  = apply.get("upload_id")
     store_req  = apply.get("store_request", {})
     upload_url = store_req.get("url")
@@ -1095,14 +1121,15 @@ async def upload_to_drive(access_token: str, dbsheet_file_id: str,
 
     # Step 3: 直传文件到底层存储
     # ⚠️ ksc-bj.ag.wps.cn 是 WPS 金山云存储，非标准预签名 URL，可能需要 WPS token 认证
-    print(f"[DRIVE UPLOAD] PUT to storage url={upload_url[:80]}...")
-    print(f"[DRIVE UPLOAD] store_request 完整内容: {store_req}")
+    print("[DRIVE UPLOAD] PUT file bytes to storage")
     # 尝试带 Authorization header（如果 ksc 存储需要 WPS token）
     auth_headers = {"Authorization": f"Bearer {access_token}"}
     await _put_raw(upload_url, file_data, extra_headers=auth_headers)
 
     # Step 4: 提交完成
     print(f"[DRIVE UPLOAD] commit upload_id={upload_id}")
+    if on_phase is not None:
+        on_phase("commit_started", {})
     commit = await _drive_upload_commit(access_token, drive_id, parent_id, upload_id)
     print(f"[DRIVE UPLOAD] commit result={str(commit)[:300]}")
     cloud_file_id = commit.get("id")

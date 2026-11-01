@@ -62,7 +62,7 @@ def test_deepseek_tool_history_keeps_current_reasoning_without_persisting_old_ch
     )
 
 
-def test_deepseek_tool_history_does_not_turn_old_answers_into_templates():
+def test_deepseek_tool_history_keeps_budgeted_history_without_using_it_as_templates():
     messages = [
         {"role": "system", "content": "system"},
         {"role": "user", "content": "很久以前的问题"},
@@ -83,8 +83,8 @@ def test_deepseek_tool_history_does_not_turn_old_answers_into_templates():
 
     assert "上一轮问题" in prepared[1]["content"]
     assert "上一轮答复" in prepared[1]["content"]
-    assert "很久以前的问题" not in prepared[1]["content"]
-    assert "固定模板" not in prepared[1]["content"]
+    assert "很久以前的问题" in prepared[1]["content"]
+    assert "固定模板" in prepared[1]["content"]
     assert "不是回答格式模板" in prepared[1]["content"]
 
 
@@ -922,7 +922,8 @@ def test_history_budget_preserves_latest_user_message():
         max_output_tokens=512,
     )
     assert len(trimmed) < len(history)
-    assert trimmed[-1]["content"] == "必须保留的当前任务"
+    assert trimmed[-1]["content"].endswith("必须保留的当前任务")
+    assert "未装入" in trimmed[-1]["content"]
     assert trimmed[0]["role"] == "user"
 
 
@@ -1078,7 +1079,10 @@ def test_local_analyzer_reads_all_pages_and_returns_compact_windows(monkeypatch)
         "token", {**arguments, "row_offset": first["next_row_offset"]}
     ))
     assert second["rows"][0][0] == "r3"
-    assert second["is_complete"] is True
+    assert second["is_complete"] is False  # Tail display is not the complete row set.
+    assert second["source_is_complete"] is True
+    assert second["matched_records_is_exact"] is True
+    assert second["has_more"] is False
     assert calls == [None, "p2"]
 
 
@@ -1327,7 +1331,9 @@ def test_cached_analysis_filters_full_receipt_without_wps():
             {"field": "不存在的字段", "operator": "eq", "value": "x"},
         ],
     })
-    assert "error" in invalid
+    assert "error" not in invalid
+    assert invalid["filter_unknown_records"] == 1000
+    assert invalid["matched_records_is_exact"] is False
     assert "日期" in invalid["available_fields"]
 
 

@@ -642,3 +642,133 @@ def test_bad_or_expired_dates_fail_closed_without_crashing(value):
 def test_legacy_naive_and_utc_dates_remain_compatible():
     assert not wps_oauth.is_token_expired((datetime.now() + timedelta(hours=1)).isoformat())
     assert not wps_oauth.is_token_expired((datetime.now(timezone.utc) + timedelta(hours=1)).isoformat())
+
+
+def refresh_events(uid=1):
+    return json.loads(db.get_system_config(f"wps_refresh_events:{uid}", "[]"))
+
+
+@pytest.mark.parametrize("http_status", [200, 400])
+def test_refresh_rejection_keeps_safe_evidence_after_reauthorization(monkeypatch, http_status):
+    token(access="private-access", refresh="private-refresh")
+    payload = {"code": 40100009, "msg": "invalid_grant",
+               "error_description": "private-debug-with-client-secret",
+               "access_token": "private-upstream-access", "refresh_token": "private-upstream-refresh"}
+    if http_status == 200:
+        renew = AsyncMock(return_value=payload)
+    else:
+        response = httpx.Response(http_status, json=payload,
+                                  request=httpx.Request("POST", wps_oauth.WPS_TOKEN_URL))
+        renew = AsyncMock(side_effect=httpx.HTTPStatusError(
+            "private-exception-details", request=response.request, response=response))
+    monkeypatch.setattr(wps_oauth, "refresh_access_token", renew)
+    assert asyncio.run(session.connection_status(1))["status"] == "reauth_required"
+    events = refresh_events()
+    assert len(events) == 1
+    event = events[0]
+    assert event["status"] == "reauth_required"
+    assert event["reason"] == "refresh_rejected"
+    assert event["trigger"] == "expired_or_missing_access"
+    assert event["wps_code"] == 40100009 and event["oauth_error"] == "invalid_grant"
+    assert event.get("http_status") == (400 if http_status == 400 else None)
+    assert datetime.fromisoformat(event["at"]).tzinfo is not None
+    assert "private" not in json.dumps(events)
+    assert "credential_fingerprint" not in event
+    # Polling a terminal state does not grow the history or renew again.
+    for _ in range(3):
+        assert asyncio.run(session.connection_status(1))["status"] == "reauth_required"
+    assert refresh_events() == events
+    renew.assert_awaited_once()
+    token(expired=False, access="new-login", refresh="new-login-refresh")
+    snapshot = asyncio.run(session.connection_status(1))
+    assert snapshot["connected"] is True
+    assert refresh_events() == events
+    assert "oauth_error" not in json.dumps(snapshot) and "refresh_events" not in snapshot
+    assert refresh_events(2) == []
+
+
+@pytest.mark.parametrize("source,expected_kind", [
+    ({"code": "sensitive-code", "msg": "sensitive-message", "error": "sensitive-error"}, "invalid_reply"),
+    (httpx.ReadTimeout("sensitive-timeout"), "timeout"),
+    (httpx.ConnectError("sensitive-network"), "network_error"),
+    ({"code": "50300007", "msg": "temporarily_unavailable"}, "invalid_reply"),
+])
+def test_refresh_diagnostics_do_not_retain_arbitrary_error_text(monkeypatch, source, expected_kind):
+    token()
+    renew = AsyncMock(side_effect=source) if isinstance(source, Exception) else AsyncMock(return_value=source)
+    monkeypatch.setattr(wps_oauth, "refresh_access_token", renew)
+    assert asyncio.run(session.connection_status(1))["status"] == "temporary_error"
+    event = refresh_events()[0]
+    assert event["error_type"] == expected_kind
+    assert "sensitive" not in json.dumps(event)
+    if isinstance(source, dict) and source.get("code") == "50300007":
+        assert event["wps_code"] == 50300007
+    else:
+        assert "wps_code" not in event
+
+
+def test_only_one_success_event_for_concurrent_refresh_and_history_is_bounded(monkeypatch):
+    token()
+
+    async def run_refresh(_refresh):
+        await asyncio.sleep(0.01)
+        return refreshed()
+
+    renew = AsyncMock(side_effect=run_refresh)
+    monkeypatch.setattr(wps_oauth, "refresh_access_token", renew)
+
+    async def run():
+        return await asyncio.gather(*(session.ensure_access_token(1) for _ in range(5)))
+
+    assert asyncio.run(run()) == ["fresh"] * 5
+    assert len(refresh_events()) == 1
+    assert refresh_events()[0]["reason"] == "refresh_succeeded"
+    assert refresh_events()[0]["status"] == "connected"
+    for i in range(23):
+        monkeypatch.setattr(wps_oauth, "refresh_access_token", AsyncMock(return_value={
+            "access_token": f"new-{i}", "refresh_token": f"new-refresh-{i}", "expires_in": 7200,
+        }))
+        assert asyncio.run(session.ensure_access_token(1, force=True)) == f"new-{i}"
+    assert len(refresh_events()) == 20
+    assert all(e["trigger"] == "forced" for e in refresh_events())
+    assert refresh_events(2) == []
+
+
+def test_diagnostic_storage_failure_does_not_break_refresh(monkeypatch, caplog):
+    token()
+    monkeypatch.setattr(wps_oauth, "refresh_access_token", AsyncMock(return_value=refreshed()))
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("private-storage-error")
+
+    monkeypatch.setattr(db, "record_wps_refresh_event", fail)
+    assert asyncio.run(session.ensure_access_token(1)) == "fresh"
+    assert session.connection_snapshot(1)["connected"] is True
+    assert "private-storage-error" not in caplog.text
+    assert "diagnostic" in caplog.text
+
+
+def test_superseded_refresh_does_not_record_failure_for_new_authorization(monkeypatch):
+    token()
+
+    async def renew(_refresh):
+        token(expired=False, access="new-login", refresh="new-login-refresh")
+        return {"msg": "invalid_grant"}
+
+    monkeypatch.setattr(wps_oauth, "refresh_access_token", renew)
+    assert asyncio.run(session.ensure_access_token(1)) == "new-login"
+    assert refresh_events() == []
+
+
+def test_diagnostic_store_drops_unknown_fields_and_rejects_changed_credentials():
+    token()
+    previous = db.get_wps_token(1)
+    event = {"status": "temporary_error", "reason": "refresh_failed", "trigger": "forced",
+             "error_type": "network_error", "msg": "private-text", "refresh_token": "private-token"}
+    db.set_system_config("wps_refresh_events:1", "not-json")
+    assert db.record_wps_refresh_event(1, previous, event) is True
+    assert len(refresh_events()) == 1
+    assert "private" not in json.dumps(refresh_events())
+    token(expired=False, access="new-login", refresh="new-login-refresh")
+    assert db.record_wps_refresh_event(1, previous, event) is False
+    assert len(refresh_events()) == 1

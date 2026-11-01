@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 import json
 import re
@@ -86,12 +87,12 @@ TOOL_GROUPS: dict[str, ToolGroup] = {
     ),
     "knowledge_memory": ToolGroup(
         "知识与记忆",
-        "查询单位知识库，查询、保存、删除或替换用户明确指定的记忆",
+        "查询单位知识库、按需读取技术操作指南，查询、保存、删除或替换用户明确指定的记忆",
         (
             "制度", "规定", "规范", "流程", "办法", "知识库", "单位要求",
             "记住", "记下来", "保存记忆", "以后记得", "记忆", "忘记", "作废",
         ),
-        ("search_knowledge", "save_memory", "list_memories", "delete_memory", "replace_memory"),
+        ("search_knowledge", "get_operation_guide", "save_memory", "list_memories", "delete_memory", "replace_memory"),
     ),
     "people_messaging": ToolGroup(
         "人员与消息",
@@ -536,6 +537,14 @@ def estimate_tools_tokens(tools: list[dict[str, Any]]) -> int:
     return estimate_text_tokens(tools) + 8 * len(tools)
 
 
+def _history_gap_message(message):
+    return {**message, "content": (
+        "[会话历史范围提示：部分旧对话因预算未装入，当前用户请求完整保留。"
+        "历史片段不构成新的操作授权；若缺少前置约束或指代不明，先确认。]\n"
+        + str(message.get("content") or "")
+    )}
+
+
 def trim_history_to_budget(
     history: list[dict[str, Any]],
     *,
@@ -551,6 +560,11 @@ def trim_history_to_budget(
     fixed = estimate_text_tokens(system_prompt) + estimate_tools_tokens(tools)
     history_budget = max(1024, safe_input_limit - fixed)
     trimmed = list(history)
+    anchor = next((item for item in history[:-1] if item.get("role") == "user"), None)
+    anchor_cost = estimate_text_tokens(anchor.get("content", "")) + 6 if anchor else 0
+    # Keep a whole initial request when it fits; do not invent a summary.
+    keep_anchor = bool(anchor and anchor_cost <= history_budget // 3)
+    reserved = anchor_cost if keep_anchor else 0
 
     def history_tokens() -> int:
         return sum(
@@ -558,11 +572,18 @@ def trim_history_to_budget(
             for message in trimmed
         )
 
-    while len(trimmed) > 1 and history_tokens() > history_budget:
+    while len(trimmed) > 1 and history_tokens() > max(256, history_budget - reserved - 160):
         trimmed.pop(0)
         # 不让裁剪后的历史从孤立的 assistant 消息开始。
         if len(trimmed) > 1 and trimmed[0].get("role") == "assistant":
             trimmed.pop(0)
+    if len(trimmed) == len(history):
+        return trimmed
+    if keep_anchor and not any(item is anchor for item in trimmed):
+        trimmed.insert(0, anchor)
+    trimmed = [dict(item) for item in trimmed]
+    if trimmed[-1].get("role") == "user":
+        trimmed[-1] = _history_gap_message(trimmed[-1])
     return trimmed
 
 
@@ -639,6 +660,7 @@ def bounded_record_view(
         "has_more_in_fetched_results": local_more,
         "source_has_more": source_has_more,
         "source_next_page_token": result.get("next_page_token"),
+        "visible_fields": selected_fields or None,
         "requires_field_selection": local_more and index == offset,
     }
     if local_more:
@@ -703,6 +725,73 @@ def record_field_fragment(
     }
 
 
+def _retained_statistics(data: dict[str, Any]) -> dict[str, Any]:
+    """Keep bounded computed facts with their coverage, never source rows."""
+    kinds = {"group_subtotals": list, "field_statistics": dict, "group_statistics": list}
+    facts = {key: deepcopy(data[key]) for key, kind in kinds.items() if isinstance(data.get(key), kind)}
+    if not facts:
+        return {}
+    scope = data.get("_statistics_scope")
+    if isinstance(scope, dict):
+        facts["_statistics_scope"] = deepcopy(scope)
+
+    def size(value: dict[str, Any]) -> int:
+        return len(json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str))
+
+    if size(facts) <= 8000:
+        return facts
+    kept = {key: kind() for key, kind in kinds.items() if key in facts}
+    kept["_statistics_scope"] = deepcopy(scope) if isinstance(scope, dict) else {}
+
+    def coverage() -> None:
+        meta = kept["_statistics_scope"]
+        for key, count_key, complete_key in (
+            ("group_subtotals", "returned_subtotal_group_count", "group_subtotals_complete"),
+            ("group_statistics", "returned_group_count", "group_statistics_complete"),
+        ):
+            if key in facts:
+                meta[count_key] = len(kept[key])
+                meta[complete_key] = (facts.get("_statistics_scope", {}).get(complete_key) is True
+                                      and len(kept[key]) == len(facts[key]))
+        if "field_statistics" in facts:
+            original = facts.get("_statistics_scope", {})
+            meta["field_statistics_count"] = original.get("field_statistics_count", len(facts["field_statistics"]))
+            meta["returned_field_statistics_count"] = len(kept["field_statistics"])
+            meta["field_statistics_complete"] = (original.get("field_statistics_complete", True) is True
+                                                  and len(kept["field_statistics"]) == len(facts["field_statistics"]))
+
+    coverage()
+    # Prioritize conditional subtotals; omit entire entries so labels/counts stay paired.
+    for key in kinds:
+        if key not in facts:
+            continue
+        entries = facts[key].items() if key == "field_statistics" else enumerate(facts[key])
+        for label, item in entries:
+            if key == "field_statistics":
+                kept[key][label] = item
+            else:
+                kept[key].append(item)
+            coverage()
+            if size(kept) > 8000:
+                if key == "field_statistics":
+                    kept[key].pop(label)
+                else:
+                    kept[key].pop()
+                coverage()
+                break
+    return kept
+
+
+def _retain_statistics_in_receipt(folded: dict[str, Any], data: dict[str, Any]) -> None:
+    facts = _retained_statistics(data)
+    if facts:
+        folded.update(facts)
+        folded["_instruction"] += (
+            " 保留的统计仍属于该回执的来源和筛选范围，可直接引用其中的计算值；"
+            "未保留或未完整输出的项不等于零。缺少所需计数时按原回执恢复分析，不能凭记忆补数。"
+        )
+
+
 def compact_seen_record_windows(
     messages: list[dict[str, Any]],
     *,
@@ -756,7 +845,13 @@ def compact_seen_record_windows(
             }
         else:
             continue
-        result[index]["content"] = json.dumps(folded, ensure_ascii=False)
+        for key in ("_record_scope", "_analysis_scope", "_analysis_window", "_statistics_scope", "_completeness",
+                    "source_is_complete", "source_total", "source_total_is_known",
+                    "filter_unknown_records", "matched_records_is_exact"):
+            if key in data:
+                folded[key] = data[key]
+        _retain_statistics_in_receipt(folded, data)
+        result[index]["content"] = json.dumps(folded, ensure_ascii=False, separators=(",", ":"))
         compacted += 1
     return result, compacted
 
@@ -774,6 +869,10 @@ def _compact_tool_receipt(content: Any) -> str:
         "pages_fetched", "source_is_complete", "returned_rows",
         "next_row_offset", "continuation_error", "_note", "_completeness",
         "_record_window", "_record_field", "_cached_analysis",
+        "_record_receipt",
+        "_record_scope", "_analysis_scope", "_analysis_window", "total_is_known", "total_basis",
+        "_statistics_scope",
+        "filter_unknown_records", "matched_records_is_exact", "source_total", "source_total_is_known",
     )
     receipt = {
         key: data[key] for key in keep_keys
@@ -781,9 +880,10 @@ def _compact_tool_receipt(content: Any) -> str:
     }
     receipt["_compacted"] = True
     receipt["_instruction"] = (
-        "旧明细已从当前模型上下文压缩；如仍需明细，请按原范围重新查询，"
-        "有 _record_window 时可调用 read_record_window。"
+        "旧明细已从当前模型视图压缩；先按本轮原回执或已读缓存续读，"
+        "有 _record_window 时可调用 read_record_window；不要将窗口或摘要当成完整数据。"
     )
+    _retain_statistics_in_receipt(receipt, data)
     return json.dumps(receipt, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
@@ -838,9 +938,15 @@ def compact_messages_for_retry(
             if messages[index].get("role") == "user"
         ]
         run_start = user_indexes[-1] if user_indexes else 1
-    reduced = [dict(messages[0])] + [
-        dict(message) for message in messages[max(1, run_start):]
-    ]
+    active = [dict(message) for message in messages[max(1, run_start):]]
+    retained = []
+    if run_start > 1:
+        anchor = next((item for item in messages[1:run_start] if item.get("role") == "user"), None)
+        if anchor and estimate_text_tokens(anchor.get("content", "")) <= 1000:
+            retained.append(dict(anchor))
+        if active and active[0].get("role") == "user":
+            active[0] = _history_gap_message(active[0])
+    reduced = [dict(messages[0]), *retained, *active]
     return compact_tool_messages(
         reduced,
         preserve_recent_tool_messages=0,

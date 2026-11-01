@@ -99,6 +99,8 @@ def test_mcp_document_target_uses_only_authenticated_users_configured_files(monk
     asyncio.run(run())
     assert generate.await_args.args[3] == f"shared-{uid}"
     assert generate.await_args.args[6] == [f"shared-{uid}", f"own-{uid}"]
+    assert generate.await_args.kwargs["user_id"] == uid
+    assert generate.await_args.kwargs["conv_id"] == 0
     assert arguments["dbsheet_file_id"] == "another-users-source"
     service._wps_access_token.assert_awaited_once_with(uid)
 

@@ -39,9 +39,15 @@ WPS status updates from runtime events, when the page regains focus, and approxi
 
 A repeated business-interface 401 triggers at most one independent identity read. A verified identity keeps the connection green; an uncertain probe stays yellow rather than declaring the refresh grant revoked. Renewal only succeeds with complete, rotated credentials. The stored credential pair is checked again after renewal and immediately before HTTP dispatch; already dispatched requests cannot be recalled by a local disconnect. Legacy red states without reliable provenance receive one serialized renewal check when a refresh credential is available; confirmed rejection still requires user reauthorization.
 
+The last 20 actual renewal attempts are retained locally per user for maintenance, including time, trigger and available standard error codes. These records survive reauthorization, contain no credentials or raw error prose, and are excluded from chat, MCP and status responses. Diagnostic-storage failures do not block renewal.
+
 ## 3. WPS Data Operations
 
 Memory can be searched, deleted, or explicitly replaced through chat and MCP. The assistant first locates the entry and uses a versioned reference; replacement is atomic and preserves the original scope. Deletion removes exact duplicate and legacy copies from active memory. Deletion markers suppress matching old text in automatic learning, derived summaries, stale legacy writes, and automatic history recall; they do not erase chat history or WPS records. An explicit new save can restore forgotten content. MCP lookup and saving require `manage_memory`; deletion and replacement additionally require `delete_data`, always for the token owner's own memory.
+
+Lookup also reports known origins, timestamps (UTC) and direct replacement links. Inactive entries appear only when requested and do not become current rules. Extracted or unattributed information is distinguished from explicit saves; an explicit global save survives deletion of its source conversation. Summaries retain at most two prior versions, while deletion guards remain intact.
+
+Ask for available technical operation guides to see titles and versions, then read one when needed. These reviewed tool-use notes are not business templates or executable skills. Disabled or mismatched versions return no old instructions. Chat and MCP share the read-only guide tool; MCP requires `read`, and no WPS connection is needed. Guides cannot grant permission or register tools.
 
 OpenNexus can query, summarize, create, update, and delete records; manage sheets and fields; and work with supported WPS structures. It reads the schema before complex operations and translates record links into business names when possible.
 
@@ -110,6 +116,8 @@ If the assistant must clarify the target record, field, or content first, the up
 
 Generated documents should be reviewed before external distribution.
 
+Generation and upload have separate outcomes. If a DOCX was generated but upload failed, reconnect WPS and ask to continue uploading it in the same conversation; the original file can be reused without rewriting its contents. An uncertain upload must be checked in WPS before another submission. References are valid for seven days; later document operations clean expired files. Pending storage is limited to 100 files / 128 MiB per user, 16 MiB each, and confirmed upload releases local bytes. Clearing/deleting the conversation stops automatic recovery references; unresolved delivery records expire under the same retention policy. MCP clients can pass the returned `document_id` to `generate_document` without resending the title or content, and must inspect `ok`, `uploaded`, and `delivery_status` in structured business receipts.
+
 ## 9. Knowledge and Memory
 
 Administrators can upload policies, templates, and workflows to the shared knowledge base. With embedding configured, documents are chunked and retrieved semantically during relevant conversations.
@@ -125,6 +133,14 @@ Settings cover WPS files and account ID, primary and image models, display theme
 Keep **Smart tool selection and Token saving** enabled for the primary model unless compatibility troubleshooting requires the legacy full-tool mode. Large-table analysis reads every required page, performs filtering and aggregation locally, and returns compact row windows for semantic review. Each new assistant reply shows Token usage, model rounds, tool calls, and tool-schema savings. If the provider omits exact usage, the value is marked as estimated. Context-limit errors trigger automatic compaction and retry without claiming that incomplete data is complete.
 
 API keys are deployment secrets. Never include them in screenshots or public issues.
+
+Source paging, local analysis and visible row windows retain separate coverage. An unreturned field is unknown, not empty; fetched rows are not a substitute for an unknown query total. Same-turn record receipts can be analyzed locally without another WPS request. Long-history trimming reports gaps and keeps a whole initial request when it fits. Memory budgets retain whole entries rather than severing conditions; missing constraints may require clarification before action.
+
+Small reads also expose local-analysis references. Contiguous pages from one verified query can be combined without fetching the whole table; mixed scopes and overlapping records are rejected. Reuse applies within one assistant execution, and an old receipt cannot verify a later write or replace a fresh cross-turn business-state check.
+
+Local analysis computes group subtotals, conditional field counts and percentages with explicit denominators. For example, grouping by person and status provides each person's total and status distribution. Chat guidance requires computed evidence for derived figures or omission of unsupported breakdowns. Bounded results disclose omitted groups; an unshown group does not mean zero and can be examined with a narrower local filter.
+
+Read diagnostics distinguish source-cache hits, local snapshot analysis and observed WPS `_get`/`_post` attempts. Query-component and record-identity fingerprints help compare read scopes without adding raw business bodies or credentials to these diagnostic fields. Counts exclude OAuth, identity probes, direct upload traffic and uninstrumented calls; an attempt does not prove server receipt, and a cache hit does not prove freshness. Model/tool metrics retain their existing meaning. Cancelled MCP calls are not reported as successful, and possible remote submissions still require verification before replay.
 
 ## 11. WorkBuddy and MCP
 

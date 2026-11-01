@@ -9,6 +9,7 @@ from typing import Any
 from agent.wps_client import get_schema, list_records
 from auth import db
 from auth.wps_session import ensure_access_token, authorized_user_call
+from core.record_evidence import exhausted, valid_page
 
 
 _SYNC_LOCKS: dict[tuple[int, str], asyncio.Lock] = {}
@@ -67,7 +68,9 @@ async def _load_all(token: str, file_id: str, sheet: dict) -> list[dict]:
         token, file_id, _sheet_id(sheet), page_size=1000,
         max_records=limit, view_id=_view_id(sheet),
     )
-    return result.get("records", []) if isinstance(result, dict) else []
+    if not valid_page(result):
+        raise RuntimeError("驾驶舱记录读取失败，不覆盖原缓存")
+    return result["records"]
 
 
 async def _load_daily_dates(
@@ -87,7 +90,9 @@ async def _load_daily_dates(
                 }],
             },
         )
-        return result.get("records", []) if isinstance(result, dict) else []
+        if not valid_page(result) or not exhausted(result):
+            raise RuntimeError("指定日期的驾驶舱记录未完整读取，不覆盖原缓存")
+        return result["records"]
 
     batches = await asyncio.gather(*(one(item) for item in sorted(set(dates))))
     return [record for batch in batches for record in batch]

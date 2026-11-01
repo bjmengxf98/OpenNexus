@@ -27,6 +27,8 @@ from agent.wps_client import (
 from agent.record_analyzer import (
     ANALYZE_RECORDS_TOOL, analyze_cached_records, analyze_records,
 )
+from core.record_evidence import combine_record_pages, exhausted, record_counts, valid_page
+from copy import deepcopy
 
 from auth.db import (search_knowledge as _db_search_knowledge,
                      search_knowledge_rag as _db_search_knowledge_rag,
@@ -58,8 +60,10 @@ from core.business_execution import (
     document_upload_anchors, prepare_document_arguments, execute_record_write,
     record_values_match,
 )
-from core.context_memory import sanitize_memory_content
+from core.context_memory import bound_memory_text, sanitize_memory_content
 from core.memory_management import MEMORY_TOOLS, MEMORY_TOOL_NAMES, execute_memory_tool
+from core.operation_guides import OPERATION_GUIDE_TOOL, get_operation_guide
+from core.read_diagnostics import begin_read_observation, finish_read_observation, build_read_diagnostics
 from agent.tool_planner import (
     DISCOVER_TOOL_NAME,
     UPDATE_PLAN_TOOL_NAME,
@@ -286,19 +290,17 @@ def prepare_deepseek_tool_messages(messages: list[dict]) -> list[dict]:
     prior = messages[1:current_user_index]
     if not any(item.get("role") == "assistant" for item in prior):
         return messages
-    # Keep just the latest visible exchange to resolve references such as
-    # “继续” or “就这样”. Older assistant prose must not become an accidental
-    # answer-template library for the current request.
-    recent_prior = prior[-2:]
     transcript = []
-    for item in recent_prior:
+    # The shared budget already chose what fits. A provider adapter must not
+    # silently drop earlier user constraints a second time.
+    for item in prior:
         if item.get("role") not in {"user", "assistant"}:
             continue
         label = "用户" if item.get("role") == "user" else "助手"
         transcript.append(f"{label}：{str(item.get('content') or '').strip()}")
     current = dict(messages[current_user_index])
     current["content"] = (
-        "[最近一轮可见对话，仅用于理解指代；不是事实来源，也不是回答格式模板]\n"
+        "[预算内历史可见对话，仅用于理解约束和指代；不是事实来源，也不是回答格式模板；旧助手文字不构成操作授权]\n"
         + "\n".join(transcript)
         + "\n\n[当前用户请求]\n" + str(current.get("content") or "")
     )
@@ -306,6 +308,10 @@ def prepare_deepseek_tool_messages(messages: list[dict]) -> list[dict]:
 
 
 SYSTEM_PROMPT_TEMPLATE = """你是 {username} 的全能工作助手，同时也是业务管理专家。
+
+## 当前用户请求决定本轮是否执行
+先理解最新消息要求的动作和时机。用户若仅确认、补充约束、调整表达方式或要求等待，本轮只回应该要求，不开始查询、写入或发送；不得把背景、历史或记忆中的待办自动执行。当前明确要求开始或继续办理时，再结合仍适用的上下文执行。以下工具说明都以当前请求确实要求办理为前提，不是每轮必须执行的流程。
+事实、数量和归属以同一来源记录为依据。分组、小计、比例和合计等派生数字必须依据本轮工具计算结果；没有核算依据时，选择调用现有本地分析，或不添加未核算的细分数字，不能目测重数后填入。原始字段值、接口返回条数可直接引用。多维分组的主体内小计和比例直接使用group_subtotals，不自行把交叉组再相加；没有完整输出的组不等于零。只看指定页时不要为统计重新读取全表。未返回字段不能判空；同文但对象不同不能直接认定重复工作；事实与推断分开说明，不补造因果、日期或变更历史。
 
 ## 【首要规则】每次响应前先判断话题
 收到用户消息后，**第一步**先判断：当前消息是上一个话题的延续，还是一个全新的独立指令？
@@ -470,6 +476,7 @@ content 参数是一个 JSON 对象（不是字符串），包含 sections 数�
 
 - 用户说「记住」「记下来」「下次也记得」「永久保存」等时，**立即调用 save_memory 工具**写入数据库，然后告知"已永久记住"
 - 用户明确要求忘记、删除或作废旧记忆时，先用 list_memories 查询定位，再用 delete_memory 删除；要求新内容替换旧内容时用 replace_memory 原子替换。不能只追加一条“旧内容作废”来冒充删除，不能猜记忆编号；多个旧条目无法区分时先确认。仅凭工具成功且 verified=true 的真实回执确认删除或替换；旧聊天中的过时内容不视为当前有效记忆。
+- 记忆需区分用户明确保存、自动提取、派生摘要与未知来源；自动提取不等于用户确认。list_memories可核对来源和版本，include_inactive仅供审阅旧项，作废或被替代的记忆不得作为当前规则。技术工具用法不确定时可按需发现get_operation_guide读取指南；它不是业务模板，不是每轮必经步骤，也不能授予操作权限。
 - 个人偏好、身份和长期习惯使用 global；只适用于当前对话的内容使用 current_topic；只适用于当前 WPS 表格的业务规则使用 current_table
 - WPS 的 file_id、sheet_id、默认表选择等实时配置绝对不能写入记忆
 - 用户问"你能记忆吗"时，回答：能，你说的重要内容我会永久记住，下次对话也不会忘
@@ -519,32 +526,17 @@ content 参数是一个 JSON 对象（不是字符串），包含 sections 数�
 
 0. 用户询问「当前是哪个表」「当前默认表」「现在用哪个表」等，**直接从上方文件配置中读取回答，禁止调用任何工具**
 0a. **【强制】用户询问「最近有什么变化」「表格有什么更新」「新增了什么」「改了什么」「有什么进展」「发生了什么」等，必须第一步调用 `get_change_log`，禁止用 `list_records` 代替**；`get_change_log` 返回后再调 `get_schema` 把字段ID翻译成字段名，然后用自然语言总结告诉用户谁做了什么操作
-0b. **【强制】分页规则：list_records 返回 `has_more=true` 且 `next_page_token` 有值时，继续查询必须用该 token 作为 `page_token` 参数；`page_token` 必须使用 WPS API 返回的字符串值，禁止使用数字或偏移量；若 next_page_token 为空或不存在，说明已无更多数据**
+0b. **分页规则**：继续读取时保持原查询范围，并使用 WPS 返回的字符串 next_page_token；不能自己构造页码或偏移。游标缺失不证明完整，按回执完整性和错误信息判断。用户只要求部分页时，到达所需范围即停止，不为形式上的完整而扩展全表。
 1. 有默认文件时直接用默认 file_id，无需询问；**以上方「文件配置」为准，如与记忆冲突，以文件配置为准**
 2. 不确定工作表时先调 get_schema 查看结构
 2a. 用户说「建立任务」且消息中含有项目名称时：先检查项目工作表中该项目是否存在（list_records 查询），不存在则先创建项目记录；任务创建后通过 Link 字段关联到该项目；以上步骤在同一轮对话中一次完成，不等用户第二次提醒
 2c. **【强制】新建任务记录前，必须确认执行人**：用户说「建立任务」「新建任务」「添加任务」等，如果消息中没有明确指定执行人（如"分配给张三""执行人是李四""我来负责"），**必须先追问"请问这个任务的执行人是谁？"，等用户回答后再建立记录**；禁止建立没有执行人的任务记录
-2b. **【强制】新建记录时，第一步必须是 list_records，禁止直接调用 create_records**：先用 list_records 查询目标工作表全部记录，找出所有字段全部为空的行（整行无任何数据，不只看第一个字段）；若存在空行，必须用 update_records 填入第一条空行；只有在确认不存在任何空行时，才允许调用 create_records 新建——违反此规则会导致新记录排在空行之后，顺序混乱
-2d. **【灵活】查询行数规则**：
-- **默认返回前 1000 条记录**（WPS API 支持，足以覆盖大多数表格）
-- 当用户明确要求查看特定数量时（如"查看最近200行""给我看500行数据"），调用 list_records 时设置 `max_records` 参数为用户指定的数量
-- 当用户说"查看从第100到300行"时，先调用 `list_records(max_records: 300)`，然后在返回的记录中提取第100-300行的数据展示给用户
-2e. **【强制】查询特定人员或特定时间段的记录时，必须使用 filter 参数**：
-- 当用户问"某某人最近有没有填""某某人上次填是什么时候""某某人这周/本月的记录"等涉及特定人的问题时，**必须先用 filter 过滤 "填报人" 字段**再查询，不得全量拉取后在返回结果中查找
-- 原因：系统会自动翻页拉取全量（最多3000条），拉取900条+再搜索极慢且消耗大量token
-- 正确做法：`list_records(filter={{"填报人": "张三"}})` 这样只返回该人的记录，条数少，速度快
-- **严禁在未使用 filter 的全量查询结果中，得出"某人未填报""某人最后一次是X月"等结论**
-2f. **【强制】分析大表（每日进展等记录超过200条的工作表）时，必须用日期 filter 缩小范围**：
-- 当用户问"最近的进展""本周/本月情况""近期工作汇总"等分析类问题时，**必须带日期范围 filter**，不得无条件全量拉取全部记录
-- **时间范围判断规则**（按优先级）：
-  - 用户明确说了时间范围（"全年""上半年""1月到6月""2026年""某某人全年工作"等）→ **严格按用户说的范围查**，不得缩短
-  - 用户说"最近""近期""现在"等模糊词 → 默认取**最近30天**
-  - 用户完全没提时间 → 默认取**最近30天**
-- 全量拉取900条+数据再分析，既浪费时间，又可能导致回答不准确
-- **例外**：查空行、建记录前检查空行，仍需全量查询，不受此规则限制
+2b. 新建前按实际目标核对重复及必要字段，不要求扫描全表找空行；未返回字段或局部字段为空不证明整行空白，不得因此覆盖已有记录。
+2d. 查询范围、日期和必要字段由当前目标与实际表结构确定，不固定取最近若干天或要求每类问题查固定几张表；范围不明且影响结论时先核对。能在服务端筛选就使用实际支持的filter格式；同轮已有数据足够时直接本地分析。显式页大小/数量限制只控制单页，上限1000，更多数据按真实游标续读。
+2e. 统计已读的一个或多个连续页时，使用analyze_cached_records和对应回执引用；需要完整源查询时再用analyze_records。统计口径必须与已读来源一致，分组数不等于关联记录去重数，不以局部零匹配推断全表不存在。
 3. create_records / update_records 的 records 参数：每项是普通 dict，key 为字段名，value 为字段值；update 时额外加 "id" 字段
 4. Link 关联字段的值是记录 id 数组，如 ["B", "C"]；**赋值前必须先 list_records 查询目标工作表，找到对应记录的真实 id，禁止直接填人名或猜测 id**
-4a. **【强制】翻译 Link 字段中的记录 ID**：当遇到「任务执行人」「负责人」等 Link 字段中的记录 ID（如 `Nc、IN、Me、NF` 等）时，必须调用 `list_records` 查询人员信息表，设置 `max_records=1000` 确保全量查询，**禁止传 `fields` 参数**（必须返回全部字段才能找到姓名），拿到结果后逐条匹配记录的 `id` 字段，找到对应姓名。禁止说"无法查询""fields数据为空""不知道这个人是谁"——必须通过全量查询人员表来翻译所有 ID；如果一次查询仍未找到，检查 sheet_id 是否正确（先调 get_schema 确认人员信息表的 sheet_id）。**严禁通过 Contact 联系人字段反推姓名**——Contact 字段存的是数字 account_id，与人员信息表记录 ID 是两套完全不同的体系，不可混用
+4a. Link ID 按实际关联表的记录身份匹配业务名称，同轮已有名称映射可复用；缺口再取必要姓名/名称字段，不强制取全部字段或反复扫描人员表。Contact 的数字 account_id 与 Link 记录 ID 不同，不得混用。核实失败时如实说明名称未解析。
 5. **批量操作优先**：create_fields 一次传所有字段；create_records 一次传所有记录；减少工具调用轮次
 6. create_sheet 创建工作表时直接在 fields 参数里带上所有字段
 7. 操作前简要告知将要执行的内容，操作后汇报结果；**回复中引用的数据必须来自本轮工具调用结果，禁止引用历史对话中的数据**；create_records / update_records / delete_records 会自动回读核验，只有 verified=true 才能称已确认生效，实际值见 verification.observed_records，无需重复读取。verified=false 或 write_submitted=null 表示尚未确认，先读取核对，禁止自动重复写入；不能把“已提交”说成“已完成”。旧回执没有 verified 或包含 _verify_hint 时，必须调用 list_records 核验关键字段或删除后确实不存在。**禁止在未回读验证前就向用户宣称"已成功分配给XXX"**
@@ -677,7 +669,7 @@ def build_system_prompt(username: str, role: str,
                         default_file: dict | None,
                         all_files: list | None = None,
                         memory: str = "",
-                        now=None) -> str:
+                        now=None, *, available_tools: set[str] | None = None) -> str:
     if not all_files:
         # 兼容只传 default_file 的旧调用
         if default_file:
@@ -713,6 +705,7 @@ def build_system_prompt(username: str, role: str,
         line for line in memory.splitlines()
         if not any(k in line for k in _filter_kw)
     )
+    _clean_memory = bound_memory_text(_clean_memory)
     memory_hint = (
         f"\n## 你对该用户的长期记忆（仅供参考，如与上方系统配置冲突，以系统配置为准）\n{_clean_memory.strip()}"
         if _clean_memory.strip() else ""
@@ -727,7 +720,20 @@ def build_system_prompt(username: str, role: str,
     # 转义用户来源字符串中的 { }，防止 str.format() 将记忆/文件名中的 JSON 花括号误当占位符
     safe_memory_hint = memory_hint.replace("{", "{{").replace("}", "}}")
     safe_file_hint = file_hint.replace("{", "{{").replace("}", "}}")
-    return default_header + time_header + SYSTEM_PROMPT_TEMPLATE.format(
+    template = SYSTEM_PROMPT_TEMPLATE
+    if available_tools is not None:
+        optional_guides = {
+            "文档生成": {"generate_document"},
+            "当前用户的定时提醒（最高优先级）": {"add_reminder", "list_reminders", "cancel_reminder"},
+            "给他人的即时通知（三通道强制）": {"send_notification", "send_wps_bot_message", "send_wecom_message", "send_weixin_message"},
+            "用户记忆（重要）": {"save_memory", "list_memories", "delete_memory", "replace_memory", "get_operation_guide"},
+            "规章制度知识库": {"search_knowledge"},
+            "传统电子表格操作": {"sheets_get_range", "sheets_update_range", "sheets_list_worksheets"},
+        }
+        for heading, required in optional_guides.items():
+            if not required.intersection(available_tools):
+                template = re.sub(r"(?m)^## " + re.escape(heading) + r"\n.*?(?=^## |\Z)", "", template, flags=re.S)
+    return default_header + time_header + template.format(
         username=username,
         role=role_labels.get(role, role),
         file_hint=safe_file_hint,
@@ -800,16 +806,16 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "list_records",
-            "description": "查询工作表记录，支持筛选、分页、指定返回字段",
+            "description": "查询工作表记录，支持筛选、分页、指定返回字段。不传分页控制时最多自动读取3000条；显式指定页大小、游标或数量上限时仅取一页。字段未返回不等于空值；统计以返回的范围和完整性为准。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "file_id":    {"type": "string",  "description": "WPS文件ID"},
                     "sheet_id":   {"type": "integer", "description": "工作表ID"},
-                    "page_size":  {"type": "integer", "description": "每页记录数，默认100，最大1000"},
+                    "page_size":  {"type": "integer", "description": "显式指定时仅取一页，正整数、最大1000；省略时可自动分页"},
                     "page_token": {"type": "string",  "description": "游标分页token（仅当返回结果中 has_more=true 且 next_page_token 有值时使用，将 next_page_token 值作为此参数）"},
                     "fields":     {"type": "array",   "description": "只返回指定字段，不填返回全部", "items": {"type": "string"}},
-                    "max_records":{"type": "integer", "description": "最多返回前N条记录（当用户明确要求查看特定数量数据时使用，如「查看最近200行」用 max_records: 200）"},
+                    "max_records":{"type": "integer", "description": "本次单页最多返回N条（正整数，最多1000）；不代表全表总数，更多记录按真实游标续读"},
                     "view_id":    {"type": "string",  "description": "指定视图ID，从该视图获取记录"},
                     "filter": {
                         "type": "object",
@@ -1731,6 +1737,9 @@ TOOLS = [
                 "用户说「生成报告」「写通知」「生成纪要」「导出文档」「生成word」「生成文档」「写文档」「导出word」时调用此工具。"
                 "\n\n【content 参数是 JSON 对象，不是字符串】直接传递对象，无需序列化。"
                 "若返回 code=invalid_document_structure 且 retryable=true，修正 content 后重新调用，未取得 ok=true 前不得报告成功。"
+                "已生成但上传失败时保留原 document_id；补传只传 document_id，不重写正文。"
+                "uploaded=null 或 delivery_status=upload_unknown 时先核对 WPS，禁止自动重新上传。"
+                "document_id 是内部引用，不向普通用户展示。"
                 "\n\n【支持的 section 类型】"
                 "\n- org_header: 发文机关标志（红色大字，仅红头公文使用）"
                 "\n- doc_number: 发文字号"
@@ -1759,6 +1768,10 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "document_id": {
+                        "type": "string",
+                        "description": "此前回执返回的本人文档引用。补传或查询原交付结果时仅传此项；首次生成必须提供 title 和 content。"
+                    },
                     "title": {
                         "type": "string",
                         "description": "文档标题（用于文件命名）"
@@ -1808,7 +1821,7 @@ TOOLS = [
                         }
                     }
                 },
-                "required": ["title", "content"]
+                "required": []
             }
         }
     },
@@ -1920,9 +1933,12 @@ TOOLS.append({
         "name": "analyze_cached_records",
         "description": (
             "直接分析本轮 list_records 已读到的完整内存回执，不再次请求 WPS。"
-            "可按实际字段 local_filters 筛选、分组统计；需要阅读匹配记录时设 "
-            "include_rows=true 并明确 fields，按 next_row_offset 续读紧凑行。"
+            "小结果同样可用；receipt_index 选择一页，receipt_indexes 按游标顺序合并同查询连续页。"
+            "可按实际字段 local_filters 筛选、分组统计。"
+            "group_by首字段的主体小计及其余字段分布见group_subtotals，直接引用本地计数和百分比。"
+            "需要阅读匹配记录时设 include_rows=true 并明确 fields，按 next_row_offset 续读紧凑行。"
             "只统计已读到的源记录；source_is_complete=false 时不得声称全表完整。"
+            "这是读取时点的快照；写入后的最新状态须新读取，不能用旧回执核验新写入。"
             "若源数据有后续页，可继续按 WPS 游标读取或用 analyze_records 完整翻页。"
             "比逐窗查看未筛选原始 JSON 更适合提取目标数据，且不预设业务表结构。"
         ),
@@ -1934,6 +1950,10 @@ TOOLS.append({
                     "type": "integer",
                     "description": "本轮 list_records 结果的 receipt_index",
                 },
+                "receipt_indexes": {
+                    "type": "array", "items": {"type": "integer"}, "minItems": 1, "maxItems": 20,
+                    "description": "同一查询的连续原始页引用，按实际游标顺序列出；与receipt_index二选一",
+                },
                 **{
                     key: value
                     for key, value in ANALYZE_RECORDS_TOOL["function"]["parameters"]["properties"].items()
@@ -1944,18 +1964,20 @@ TOOLS.append({
                     "description": "紧凑行字符预算，默认 40000，最大 60000",
                 },
             },
-            "required": ["receipt_index"],
+            "required": [],
         },
     },
 })
 
 TOOLS.extend(MEMORY_TOOLS)
+TOOLS.append(OPERATION_GUIDE_TOOL)
 
 TOOL_MAP = {
+    "get_operation_guide": lambda at, a: get_operation_guide(a),
     "get_schema":    lambda at, a: get_file_structure(at, a["file_id"]),
     "list_records":  lambda at, a: list_records(at, a["file_id"], a["sheet_id"],
-                                                a.get("page_size", 1000),
-                                                a.get("page_token") if isinstance(a.get("page_token"), str) and not a.get("page_token", "").isdigit() else None,
+                                                a.get("page_size"),
+                                                a.get("page_token"),
                                                 a.get("fields"), a.get("filter"),
                                                 a.get("view_id"), a.get("max_records")),
     "analyze_records": lambda at, a: analyze_records(at, a),
@@ -1982,9 +2004,11 @@ TOOL_MAP = {
     "send_wps_bot_message": lambda at, a: _wps_send_bot_message(a["wps_user_id"], a["text"]),
     "send_wecom_message":   lambda at, a: a,  # 占位，实际在 chat() 中处理
     "generate_document": lambda at, a: _generate_document(
-        at, a["title"], a["content"],
+        at, a.get("title", ""), a.get("content"),
         a.get("dbsheet_file_id"), a.get("doc_type", "report"),
-        a.get("metadata"), a.get("_upload_anchor_file_ids")
+        a.get("metadata"), a.get("_upload_anchor_file_ids"),
+        user_id=a.get("_document_user_id"), document_id=a.get("document_id"),
+        conv_id=a.get("_document_conversation_id"),
     ),  # 返回 coroutine，由 chat() 中的 await 处理
     # 仪表盘
     "list_dashboards":   lambda at, a: list_dashboards(at, a["file_id"]),
@@ -2258,47 +2282,48 @@ def _compress_tool_result(
     只把有明确分页标记的窗口发给模型，完整结果仍保留在本轮回执中。
     """
     if name == "list_records":
+        # The authoritative receipt is retained for local analysis/readback.
+        # Projection must never add inferred empty fields or mutate that receipt.
+        result = deepcopy(result)
         records = result.get("records", [])
-        total = result.get("total", len(records))
-        fetched = result.get("fetched", len(records))
+        records = records if isinstance(records, list) else []
         has_more = bool(result.get("has_more", False))
         next_page_token = result.get("next_page_token")
-        is_complete = bool(result.get("is_complete", not has_more))
+        is_complete = (valid_page(result) and exhausted(result)
+                       and result.get("is_complete") is not False
+                       and not (result.get("_record_scope") or {}).get("start_token"))
+        counts = record_counts(records, complete=is_complete,
+                               reported_total=result.get("total"))
+        result.update(counts, is_complete=is_complete)
         result["_completeness"] = {
-            "total": total,
-            "fetched": fetched,
+            **counts,
             "has_more": has_more,
             "next_page_token": next_page_token,
             "is_complete": is_complete,
         }
 
-        # 代码层计算空行，AI 直接用，无需自己遍历
-        empty_row_ids = []
-        for r in records:
-            fields = r.get("fields") or {}
-            if isinstance(fields, dict):
-                is_empty = all(
-                    v is None or v == "" or v == [] or v == {}
-                    for v in fields.values()
-                )
-                if is_empty:
-                    empty_row_ids.append(r["id"])
-
-        result["empty_row_ids"] = empty_row_ids
-        result["empty_row_count"] = len(empty_row_ids)
-        if has_more:
+        result.pop("empty_row_ids", None)
+        result.pop("empty_row_count", None)
+        result["_field_scope"] = {
+            "empty_rows_evaluated": False,
+            "missing_field": "not_returned",
+            "note": "未返回的字段不能判空；局部字段不能证明整行空白，不作为覆盖候选。",
+        }
+        if receipt_index is not None:
+            result["_record_receipt"] = {"receipt_index": receipt_index, "fetched_rows": len(records)}
+        if is_complete:
+            result["_note"] = f"当前源查询范围已完整读取 {len(records)} 条；字段覆盖仍以实际返回为准。"
+        elif has_more:
             result["_note"] = (
-                f"本次返回 {fetched} 条（共 {total} 条），尚未取完。"
-                f"必须使用 next_page_token={next_page_token!r} 继续调用 list_records，"
+                f"本次已读 {len(records)} 条，源查询范围尚未完整读取。"
+                f"如需继续，保留原查询参数并使用 next_page_token={next_page_token!r}；"
                 "不能把当前结果称为全部数据。"
             )
         else:
-            result["_note"] = f"已完整返回 {fetched} 条记录（共 {total} 条）。"
-        if empty_row_ids:
-            result["_note"] += (
-                f" 空行共 {len(empty_row_ids)} 条，首条 ID：{empty_row_ids[0]}；"
-                "新建记录前请优先用 update_records 填入空行。"
-            )
+            result["_note"] = "当前为局部页或读取失败，不能据此认定源查询完整或零条匹配。"
+        if receipt_index is not None and valid_page(result):
+            result["_note"] += (" 派生分组、小计、比例应先用analyze_cached_records核算；"
+                                "连续页用receipt_indexes合并，不必为统计重读全表。未核算就不要额外添加细分数字。")
         if receipt_index is not None:
             view, windowed = bounded_record_view(result, receipt_index)
             return json.dumps(view, ensure_ascii=False), windowed
@@ -2841,7 +2866,7 @@ class Assistant:
                         saved_id = _db_save_memory_item(
                             uid, safe_item, scope_type=memory_scope,
                             scope_id=memory_scope_id, category="correction",
-                            source_type="user_correction", confidence=0.95,
+                            source_type="user_correction", source_id=f"conversation:{conv_id}" if conv_id else "", confidence=0.95,
                         )
                         if not saved_id:
                             return
@@ -2882,7 +2907,7 @@ class Assistant:
                     saved_id = _db_save_memory_item(
                         uid, safe_item, scope_type=memory_scope,
                         scope_id=memory_scope_id, category="automatic",
-                        source_type="user_statement", confidence=0.75,
+                        source_type="user_statement", source_id=f"conversation:{conv_id}" if conv_id else "", confidence=0.75,
                     )
                     if not saved_id:
                         return
@@ -2974,7 +2999,10 @@ class Assistant:
         from datetime import datetime, timezone, timedelta
         _now = datetime.now(tz=timezone(timedelta(hours=8)))
         _calendar_context = _beijing_calendar_context(_now)
-        system_prompt = build_system_prompt(username, role, default_file, all_files, memory, now=_now)
+        system_prompt = build_system_prompt(
+            username, role, default_file, all_files, memory, now=_now,
+            available_tools={tool["function"]["name"] for tool in TOOLS} if self.supports_tools else set(),
+        )
         if self.supports_tools and self.smart_tool_routing:
             system_prompt += (
                 "\n\n## 自适应目标驱动执行\n"
@@ -3002,6 +3030,9 @@ class Assistant:
                 "如用户未指定表格，必须使用此 file_id；"
                 "如用户明确指定了其他已配置表格，直接使用用户指定的表格。"
             )
+
+        from core.document_delivery import recovery_context
+        system_prompt += recovery_context(uid, conv_id)
 
         # ── 历史清洗 ──────────────────────────────────────────
         # 去掉传给 API 的 tool_calls / tool 消息，断掉模型对历史成功结果的"幻觉依赖"
@@ -3641,11 +3672,16 @@ class Assistant:
                 )
                 # 后台自动学习：不阻塞响应，fire-and-forget
                 import asyncio as _asyncio
-                _asyncio.create_task(
-                    self._auto_learn(
-                        _last_user_content, reply, uid, _actual_model, conv_id=conv_id,
+                # An explicit memory edit already chose its scope and lifecycle.
+                # Re-extracting this request can widen topic-only saves or learn
+                # a paraphrase of something the user has just asked to forget.
+                if not any(receipt.get("name") in {"save_memory", "delete_memory", "replace_memory"}
+                           for receipt in self.last_tool_receipts):
+                    _asyncio.create_task(
+                        self._auto_learn(
+                            _last_user_content, reply, uid, _actual_model, conv_id=conv_id,
+                        )
                     )
-                )
                 return reply
 
             _premature_final_attempts = 0
@@ -3703,7 +3739,8 @@ class Assistant:
 
                 # 本地工具不依赖 WPS token，可在未连接时使用
                 # send_wps_bot_message 用 App Token，不依赖用户 WPS token
-                _LOCAL_TOOLS = {"search_knowledge", "get_change_log", "save_memory", "send_notification", "list_system_users", "send_wps_bot_message", "send_wecom_message", "send_weixin_message", "generate_document", "add_reminder", "list_reminders", "cancel_reminder"} | MEMORY_TOOL_NAMES
+                _LOCAL_TOOLS = {"search_knowledge", "get_operation_guide", "get_change_log", "save_memory", "send_notification", "list_system_users", "send_wps_bot_message", "send_wecom_message", "send_weixin_message", "generate_document", "add_reminder", "list_reminders", "cancel_reminder"} | MEMORY_TOOL_NAMES
+                _read_observation = begin_read_observation()
                 try:
                     if name == DISCOVER_TOOL_NAME:
                         names, fallback_all = discover_tool_names(
@@ -3762,15 +3799,20 @@ class Assistant:
                             result = {"error": str(exc)}
                     elif name == "analyze_cached_records":
                         try:
-                            receipt_index = int(args.get("receipt_index"))
-                            if not 0 <= receipt_index < len(self.last_tool_receipts):
-                                raise ValueError("receipt_index 不属于本轮工具结果")
-                            source_receipt = self.last_tool_receipts[receipt_index]
-                            if source_receipt.get("name") != "list_records":
-                                raise ValueError("只能分析本轮 list_records 结果")
-                            source = source_receipt.get("result")
-                            if not isinstance(source, dict):
-                                raise ValueError("该记录结果不可分析")
+                            if "receipt_index" in args and "receipt_indexes" in args:
+                                raise ValueError("receipt_index和receipt_indexes必须二选一")
+                            indices = args.get("receipt_indexes") if "receipt_indexes" in args else [args.get("receipt_index")]
+                            if (not isinstance(indices, list) or not 1 <= len(indices) <= 20
+                                    or any(type(i) is not int or not 0 <= i < len(self.last_tool_receipts) for i in indices)
+                                    or len(set(indices)) != len(indices)):
+                                raise ValueError("请选择本轮有效且不重复的记录页引用")
+                            pages = []
+                            for index in indices:
+                                original = self.last_tool_receipts[index]
+                                if original.get("name") != "list_records" or not valid_page(original.get("result")):
+                                    raise ValueError("只能分析本轮成功的原始list_records回执")
+                                pages.append(original["result"])
+                            source = combine_record_pages(pages) if len(pages) > 1 else pages[0]
                             analysis_args = dict(args)
                             analysis_args["max_chars"] = min(
                                 60_000, int(args.get("max_chars") or 40_000),
@@ -3778,7 +3820,7 @@ class Assistant:
                             result = analyze_cached_records(source, analysis_args)
                             if isinstance(result, dict) and not result.get("error"):
                                 result["_cached_analysis"] = {
-                                    "receipt_index": receipt_index,
+                                    **({"receipt_indexes": indices} if "receipt_indexes" in args else {"receipt_index": indices[0]}),
                                     "arguments": analysis_args,
                                 }
                         except (ValueError, TypeError) as exc:
@@ -3797,6 +3839,10 @@ class Assistant:
                                 }
                             else:
                                 requested_scope = str(args.get("scope") or "global")
+                                if requested_scope not in {"global", "current_topic", "current_table"}:
+                                    raise ValueError("记忆范围无效，不能自动扩大为全局记忆")
+                                if requested_scope == "current_topic" and not conv_id:
+                                    raise ValueError("当前没有可定位的话题，不能保存为话题记忆")
                                 if requested_scope == "current_topic" and conv_id:
                                     scope_type, scope_id = "conversation", str(conv_id)
                                     scope_label = "当前话题"
@@ -3814,7 +3860,8 @@ class Assistant:
                                 if (requested_scope != "current_table") or target_file_id:
                                     _db_save_memory_item(
                                         uid, new_content, scope_type=scope_type, scope_id=scope_id,
-                                        category="explicit", source_type="explicit", confidence=1.0,
+                                        category="explicit", source_type="explicit",
+                                        source_id=f"conversation:{conv_id}" if conv_id else "", confidence=1.0,
                                     )
                                     # 旧表继续维护全局显式记忆，保证旧版本/插件读取行为不变。
                                     if scope_type == "global":
@@ -4047,7 +4094,9 @@ class Assistant:
                                     f"override requested={requested_anchor or '<empty>'} "
                                     f"with primary_user_anchor={_document_upload_anchor_id}"
                                 )
-                            args = prepare_document_arguments(args, _document_upload_anchor_ids)
+                            args = prepare_document_arguments(
+                                args, _document_upload_anchor_ids, user_id=uid, conversation_id=conv_id or 0,
+                            )
 
                         # 传统表格工具（sheets_*）不做 file_id 白名单校验，用户直接提供 file_id
                         _is_sheets_tool = name.startswith("sheets_")
@@ -4201,6 +4250,8 @@ class Assistant:
                     except UnicodeEncodeError:
                         sys.stdout.write(f"[TOOL ERROR] {name} 执行失败:\n{error_detail}\n")
                     result = {"error": str(e)}
+                finally:
+                    _read_observed = finish_read_observation(_read_observation)
 
                 # 捕获授权缺失、参数校验和执行异常等所有真实写工具错误。
                 # 这段位于统一异常处理之后，避免模型在没有工具回执时自行猜测 403。
@@ -4219,17 +4270,32 @@ class Assistant:
                     sys.stdout.write(f"[TOOL RESULT] {name} => {str(result)[:200]}\n")
                 receipt_index = len(self.last_tool_receipts)
                 _receipt_args = dict(args)
-                _receipt_args.pop("_upload_anchor_file_ids", None)
+                for _private_key in ("_upload_anchor_file_ids", "_document_user_id", "_document_conversation_id"):
+                    _receipt_args.pop(_private_key, None)
                 _turn_receipts.append({"name": name, "args": _receipt_args, "result": result})
                 self.last_tool_receipts.append({"name": name, "args": _receipt_args, "result": result})
                 tool_content, windowed = _compress_tool_result(
                     name, result,
                     receipt_index=receipt_index if name == "list_records" else None,
                 )
-                if windowed:
+                if name == "list_records" and valid_page(result):
                     _active_tool_names.update({
                         "read_record_window", "analyze_cached_records",
                     })
+                if name in {"list_records", "analyze_records", "analyze_cached_records"}:
+                    # Diagnostic facts only: no raw query, cursor, fields, token
+                    # or business content is persisted in the event stream.
+                    await _publish_agent_event(
+                        "evidence", tool=name, receipt_index=receipt_index,
+                        query_fingerprint=hashlib.sha256(json.dumps(
+                            _receipt_args, sort_keys=True, ensure_ascii=False, default=str,
+                        ).encode("utf-8")).hexdigest(),
+                        row_count=(len(result["records"]) if isinstance(result.get("records"), list)
+                                   else result.get("source_records")),
+                        scope_complete=bool(result.get("source_is_complete", result.get("is_complete", False))),
+                        succeeded=not bool(result.get("error")),
+                        read_diagnostics=build_read_diagnostics(_receipt_args, result, _read_observed),
+                    )
                 full_messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,

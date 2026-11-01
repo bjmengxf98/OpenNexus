@@ -7,11 +7,12 @@ MEMORY_TOOL_NAMES = {"list_memories", "delete_memory", "replace_memory"}
 MEMORY_TOOLS = [
     {"type": "function", "function": {
         "name": "list_memories",
-        "description": "查询当前用户已保存的记忆，包括旧版兼容记忆。修改或删除前先查询，使用返回的 memory_id，不猜编号。支持关键词和分页。",
+        "description": "查询本人记忆及已知来源、时间、版本替换关系，包括旧版兼容记忆。默认只返回有效项；核查作废旧版本可用include_inactive。修改或删除前使用返回的memory_id，不猜编号；来源未记录不冒充用户确认。",
         "parameters": {"type": "object", "additionalProperties": False, "properties": {
             "query": {"type": "string", "description": "要查找的记忆关键词；省略则列出本人记忆"},
             "offset": {"type": "integer", "minimum": 0, "description": "续读使用上次返回的 next_offset"},
             "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+            "include_inactive": {"type": "boolean", "description": "核查已删除或被新版本替代的旧记忆；默认false，旧项不能作为当前规则"},
         }},
     }},
     {"type": "function", "function": {
@@ -35,7 +36,7 @@ MEMORY_TOOLS = [
 def execute_memory_tool(name: str, args: dict, user_id: int) -> dict:
     if not user_id or int(user_id) <= 0:
         raise ValueError("无法获取当前用户，不能操作记忆")
-    allowed = {"query", "offset", "limit"} if name == "list_memories" else {"memory_id"}
+    allowed = {"query", "offset", "limit", "include_inactive"} if name == "list_memories" else {"memory_id"}
     if name == "replace_memory":
         allowed.add("content")
     if name not in MEMORY_TOOL_NAMES or set(args) - allowed:
@@ -44,7 +45,10 @@ def execute_memory_tool(name: str, args: dict, user_id: int) -> dict:
         query = args.get("query") or ""
         if not isinstance(query, str):
             raise ValueError("记忆查询关键词必须是文本")
-        return db.list_manageable_memories(user_id, query=query.strip(),
+        inactive = args.get("include_inactive", False)
+        if not isinstance(inactive, bool):
+            raise ValueError("include_inactive必须是布尔值")
+        return db.list_manageable_memories(user_id, query=query.strip(), include_inactive=inactive,
                                            offset=args.get("offset", 0), limit=args.get("limit", 30))
     memory_id = args.get("memory_id")
     if not isinstance(memory_id, str) or not memory_id:
