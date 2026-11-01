@@ -119,10 +119,10 @@ def test_chat_turn_can_resume_and_be_cancelled_without_replacing_chat_entrypoint
     assert "/cancel" in HTML
     assert "function resumeTurn(" in HTML
     assert "function cancelActiveTurn(" in HTML
-    assert "sendBtn.onclick=()=>state.sending?cancelActiveTurn():send()" in HTML
+    assert "sendBtn.onclick=()=>state.sending&&viewingTurn()?cancelActiveTurn():send()" in HTML
     assert ".send.stop{background:#ef4444}" in HTML
     assert ".send.stop::before{content:\"\";display:block;width:12px;height:12px" in HTML
-    assert "sendBtn.textContent=state.sending?'':'↑'" in HTML
+    assert "sendBtn.textContent=stop?'':'↑'" in HTML
 
 def test_chat_shows_plan_and_persisted_token_metrics():
     assert "e.type==='plan'" in HTML

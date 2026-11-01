@@ -7,7 +7,8 @@ for (const match of html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)) new v
 const start = html.indexOf('let wpsStatusRequest=');
 const end = html.indexOf('async function bootstrap()', start);
 assert(start > 0 && end > start);
-const handle = html.split('\n').find(line => line.startsWith('function handleEvent(e)'));
+const handleStart = html.indexOf('function handleEvent(e');
+const handle = html.slice(handleStart, html.indexOf('function showUploadNotice(', handleStart));
 const elements = new Map();
 const classes = () => ({ toggle() {} });
 const element = id => {
