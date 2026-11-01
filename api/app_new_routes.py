@@ -197,7 +197,7 @@ async def app_new_bootstrap(request: Request):
     wps = await connection_status(uid)
     files = db.list_wps_files(uid)
     default_file = db.get_default_wps_file(uid)
-    active_turn = db.get_active_agent_turn(uid, current_id) if current_id else None
+    active_turn = (db.get_active_agent_turn(uid, current_id) if current_id else None) or db.get_active_agent_turn(uid)
     return {
         "ok": True,
         "user": {

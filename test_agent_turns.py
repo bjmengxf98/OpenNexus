@@ -231,6 +231,73 @@ def test_existing_chat_endpoint_keeps_sse_contract_and_persists_turn(monkeypatch
     assert history[-1]["metadata"]["run_metrics"]["total_tokens"] == 321
 
 
+def test_browsing_other_topic_does_not_cancel_running_turn_or_change_its_result_owner(monkeypatch, tmp_path):
+    import httpx
+    from unittest.mock import AsyncMock
+    from core import state as core_state
+
+    _fresh_db(monkeypatch, tmp_path)
+    first = db.create_conversation(1, "task A")
+    other = db.create_conversation(1, "history B")
+    db.add_chat(1, "assistant", "old B", conv_id=other)
+    monkeypatch.setattr(core_state, "user_current_conv", {})
+    for attr in ("_user_locks", "_turn_tasks", "_turn_subscribers"):
+        monkeypatch.setattr(app_new_routes, attr, {})
+    actor = {"uid": 1}
+    monkeypatch.setattr(app_new_routes, "_current_user", lambda _r: (actor["uid"], {"username": "test", "role": "staff"}))
+    monkeypatch.setattr(app_new_routes, "ensure_access_token", AsyncMock(return_value="mock"))
+    monkeypatch.setattr(app_new_routes, "connection_status", AsyncMock(return_value={"status": "connected", "connected": True}))
+    monkeypatch.setattr(db, "get_llm_key", lambda _uid: {"api_key": "mock", "provider": "mock", "advanced": {}})
+    monkeypatch.setattr(app_new_routes, "build_user_context", lambda *_a, **_kw: "")
+    monkeypatch.setattr(app_new_routes.upload_queue, "peek", lambda _uid: [])
+    monkeypatch.setattr(app_new_routes.upload_queue, "dequeue_all", lambda _uid: [])
+
+    async def run():
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        class FakeAssistant:
+            last_tool_receipts = []
+            last_run_metrics = {}
+
+            def __init__(self, **_kwargs):
+                pass
+
+            async def chat(self, *_args, **_kwargs):
+                entered.set()
+                await release.wait()
+                return "result A"
+
+        monkeypatch.setattr(app_new_routes, "Assistant", FakeAssistant)
+        app = FastAPI()
+        app.include_router(app_new_routes.app_new_router)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            post = asyncio.create_task(client.post("/api/app-new/chat", json={"text": "work A", "conversation_id": first}))
+            try:
+                await asyncio.wait_for(entered.wait(), 5)
+                active = db.get_active_agent_turn(1, first)
+                history = await asyncio.wait_for(client.get(f"/api/app-new/conversations/{other}/messages"), 3)
+                assert [m["content"] for m in history.json()["messages"]] == ["old B"]
+                assert not post.done()
+                bootstrap = (await client.get("/api/app-new/bootstrap")).json()
+                assert bootstrap["current_conversation_id"] == other
+                assert bootstrap["active_turn"]["id"] == active["id"]
+                assert bootstrap["active_turn"]["conversation_id"] == first
+                assert db.get_agent_turn(active["id"], 1)["cancel_requested"] is False
+                actor["uid"] = 2
+                assert (await client.get(f"/api/app-new/conversations/{other}/messages")).status_code == 404
+                assert (await client.get("/api/app-new/bootstrap")).json()["active_turn"] is None
+                actor["uid"] = 1
+            finally:
+                release.set()
+                result = await asyncio.wait_for(post, 5)
+            assert result.status_code == 200
+        assert [m["content"] for m in db.get_chat_history(1, conv_id=first)] == ["work A", "result A"]
+        assert [m["content"] for m in db.get_chat_history(1, conv_id=other)] == ["old B"]
+        assert db.get_agent_turn(active["id"], 1)["status"] == "completed"
+
+    asyncio.run(run())
+
+
 def test_cancel_endpoint_is_owner_scoped_and_reaches_terminal_state(monkeypatch, tmp_path):
     _fresh_db(monkeypatch, tmp_path)
     conv_id = db.create_conversation(1, "停止任务")
