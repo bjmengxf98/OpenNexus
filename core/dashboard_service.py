@@ -14,6 +14,7 @@ from openai import AsyncOpenAI
 from agent.wps_client import get_schema, list_records
 from auth import db
 from auth.wps_session import WpsConnectionError, ensure_access_token, authorized_user_call
+from core.record_evidence import valid_page
 
 
 VALID_VIEWS = {"overview", "daily", "tasks", "projects"}
@@ -220,13 +221,14 @@ async def _load_records(
                 token, file_id, _sheet_id(sheet), page_size=500,
                 max_records=1000, filter=date_filter,
             )
-            records = result.get("records", []) if isinstance(result, dict) else []
-            if records:
-                return records
+            if valid_page(result):
+                return result["records"]
         except Exception as exc:
             print(f"[DASHBOARD] WPS date filter fallback: {exc}")
     result = await list_records(token, file_id, _sheet_id(sheet))
-    return result.get("records", []) if isinstance(result, dict) else []
+    if not valid_page(result):
+        raise DashboardError("WPS 未返回有效记录页，不能作为零条结果")
+    return result["records"]
 
 
 def _people_lookup(records: list[dict]) -> dict[str, str]:

@@ -8,6 +8,7 @@ from functools import wraps
 import hashlib
 import inspect
 import json
+import logging
 import re
 import secrets
 import time
@@ -16,6 +17,7 @@ import httpx
 
 from auth import db, wps_oauth
 
+logger = logging.getLogger(__name__)
 _REQUEST_CONTEXT = ContextVar("wps_request_context", default=None)
 _MESSAGES = {
     "disconnected": "尚未连接 WPS，请点击右上角连接。",
@@ -100,6 +102,44 @@ def _refresh_failure(exc: Exception | dict) -> str:
     return "temporary_error"
 
 
+def _record_refresh_event(user_id: int, row: dict, status: str, reason: str,
+                          trigger: str, source=None) -> None:
+    """Store only protocol codes and fixed labels; diagnostics cannot disable renewal."""
+    try:
+        event = {"status": status, "reason": reason, "trigger": trigger}
+        payload = source if isinstance(source, dict) else {}
+        if isinstance(source, httpx.HTTPStatusError):
+            event.update(http_status=source.response.status_code, error_type="http_error")
+            try:
+                payload = source.response.json()
+            except ValueError:
+                payload = {}
+        elif isinstance(source, httpx.TimeoutException):
+            event["error_type"] = "timeout"
+        elif isinstance(source, httpx.RequestError):
+            event["error_type"] = "network_error"
+        elif isinstance(source, Exception):
+            event["error_type"] = "unexpected_error"
+        elif source is not None and status != "connected":
+            event["error_type"] = "invalid_reply"
+        if isinstance(payload, dict):
+            code = payload.get("code")
+            if type(code) is int or (isinstance(code, str) and re.fullmatch(r"[0-9]{1,9}", code)):
+                event["wps_code"] = int(code)
+            for field in ("error", "msg", "error_description", "code"):
+                name = payload.get(field)
+                if isinstance(name, str) and name.strip().lower() in {
+                    "invalid_grant", "invalid_refresh_token", "invalid_client", "unauthorized_client",
+                    "invalid_scope", "temporarily_unavailable", "server_error",
+                }:
+                    event["oauth_error"] = name.strip().lower()
+                    break
+        db.record_wps_refresh_event(user_id, row, event)
+    except Exception:
+        # Exception text and raw responses can contain credentials.
+        logger.warning("[WPS SESSION] renewal diagnostic could not be stored")
+
+
 async def ensure_access_token(user_id: int, *, force: bool = False,
                                rejected_token: str | None = None) -> str:
     """Refresh once under a cross-worker lease. Never persist malformed replies."""
@@ -141,6 +181,12 @@ async def ensure_access_token(user_id: int, *, force: bool = False,
                 latest = db.get_wps_token(user_id) or {}
                 if _fingerprint(latest) != pair:
                     continue
+                trigger = ("business_401" if rejected_token is not None else "forced" if force
+                           else "legacy_state" if legacy_red else "state_recheck" if recoverable_failure
+                           else "near_expiry" if row.get("access_token")
+                           and not wps_oauth.is_token_expired(row.get("expires_at"))
+                           else "expired_or_missing_access")
+                result = None
                 try:
                     result = await wps_oauth.refresh_access_token(row["refresh_token"])
                     if (not isinstance(result, dict) or result.get("error")
@@ -158,9 +204,12 @@ async def ensure_access_token(user_id: int, *, force: bool = False,
                     failure = exc.status if isinstance(exc, WpsConnectionError) else _refresh_failure(exc)
                     if _fingerprint(db.get_wps_token(user_id) or {}) != pair:
                         continue
-                    _set_state(user_id, row, failure, retry_after=time.time() + 30
-                               if failure in {"temporary_error", "configuration_error"} else 0,
-                               reason="refresh_rejected" if failure == "reauth_required" else "refresh_failed")
+                    reason = "refresh_rejected" if failure == "reauth_required" else "refresh_failed"
+                    if _set_state(user_id, row, failure, retry_after=time.time() + 30
+                                  if failure in {"temporary_error", "configuration_error"} else 0,
+                                  reason=reason):
+                        _record_refresh_event(user_id, row, failure, reason, trigger,
+                                              result if isinstance(exc, WpsConnectionError) else exc)
                     if (failure in {"temporary_error", "configuration_error"} and not force
                             and row.get("access_token")
                             and not wps_oauth.is_token_expired(row.get("expires_at"))):
@@ -178,6 +227,7 @@ async def ensure_access_token(user_id: int, *, force: bool = False,
                     continue
                 if not _set_state(user_id, expected, "connected", reason="refresh_succeeded"):
                     continue
+                _record_refresh_event(user_id, expected, "connected", "refresh_succeeded", trigger)
                 return result["access_token"]
             finally:
                 db.release_wps_refresh_lease(user_id, owner)

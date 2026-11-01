@@ -5,6 +5,7 @@
 """
 import ast
 import io
+import hashlib
 import json
 import logging
 import re
@@ -155,6 +156,7 @@ def _invalid_structure_result(error: Exception) -> Dict[str, Any]:
         "ok": False,
         "code": "invalid_document_structure",
         "retryable": True,
+        "generated": False,
         "uploaded": False,
         "error": (
             f"文档结构解析失败，未生成或上传任何文件：{error}。"
@@ -166,15 +168,19 @@ def _invalid_structure_result(error: Exception) -> Dict[str, Any]:
 
 async def generate_and_upload_document(
     access_token: str,
-    title: str,
-    content,
+    title: str = "",
+    content=None,
     dbsheet_file_id: Optional[str] = None,
     doc_type: str = "report",
     metadata: Optional[Dict[str, Any]] = None,
     upload_anchor_file_ids: Optional[list[str]] = None,
+    *,
+    user_id: Optional[int] = None,
+    conv_id: Optional[int] = None,
+    document_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    在内存中生成 Word 文档并上传到 WPS 网盘。
+    生成 Word 文档并交付；本人暂存文档可按引用补传，无需重新生成。
 
     Args:
         access_token: WPS OAuth token
@@ -203,8 +209,19 @@ async def generate_and_upload_document(
         成功: {"ok": True, "file_name": "...", "cloud_file_id": "..."}
         失败: {"ok": False, "error": "..."}
     """
+    from core.document_delivery import DeliveryError, deliver_document, pending_document_id
+
+    if document_id:
+        if title or content is not None or metadata:
+            return {"ok": False, "code": "invalid_document_request", "uploaded": False,
+                    "error": "补传原文档时只传 document_id；修改正文或标题请发起新的文档生成。"}
+        return await deliver_document(
+            access_token, dbsheet_file_id, upload_anchor_file_ids,
+            user_id=user_id, conversation_id=conv_id, document_id=document_id,
+        )
     if not title or not content:
-        return {"ok": False, "error": "标题和内容不能为空"}
+        return {"ok": False, "generated": False, "uploaded": False,
+                "code": "invalid_document_request", "error": "首次生成必须提供标题和内容；补传原文档只提供 document_id。"}
 
     try:
         # 解析失败时绝不降级为普通文本，否则会把整段 JSON 原样写进 Word。
@@ -225,6 +242,19 @@ async def generate_and_upload_document(
             len(structure["sections"]),
         )
 
+        request_hash = ""
+        if type(user_id) is int and user_id > 0:
+            request_hash = hashlib.sha256(json.dumps(
+                [title, structure, doc_type, metadata or {}], ensure_ascii=False,
+                sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()
+            pending_id = pending_document_id(user_id, conv_id, request_hash)
+            if pending_id:
+                return await deliver_document(
+                    access_token, dbsheet_file_id, upload_anchor_file_ids,
+                    user_id=user_id, conversation_id=conv_id, document_id=pending_id,
+                )
+
         # 生成文档
         doc = Document()
         _apply_document_template(doc, structure, doc_type, metadata or {})
@@ -238,32 +268,19 @@ async def generate_and_upload_document(
         file_name = f"{title}_{timestamp}.docx"
         logger.info(f"文档生成成功: {file_name}，大小: {len(file_data)} bytes")
 
-        # 上传到 WPS 云盘
-        if not access_token:
-            return {"ok": False, "error": f"文档《{title}》已生成，但未连接 WPS，无法上传。"}
-
-        if not dbsheet_file_id:
-            return {"ok": False, "error": f"文档《{title}》已生成，但未指定 WPS 文件 ID。"}
-
-        from agent.wps_client import upload_to_drive
-        upload_result = await upload_to_drive(access_token, dbsheet_file_id, file_name, file_data,
-                                               content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                                               candidate_file_ids=upload_anchor_file_ids)
-
-        cloud_file_id = upload_result.get("uploadId") or upload_result.get("id")
-        if not cloud_file_id:
-            raise ValueError(f"上传返回数据异常: {upload_result}")
-
-        return {
-            "ok": True,
-            "file_name": file_name,
-            "cloud_file_id": cloud_file_id,
-            "message": f"文档《{title}》已生成并上传到 WPS\n文件名：{file_name}\n可在 WPS 云文档「AI附件」文件夹中查看"
-        }
-
+    except DeliveryError as e:
+        return {"ok": False, "generated": False, "uploaded": False,
+                "code": e.code, "error": str(e)}
     except Exception as e:
-        logger.error(f"文档生成/上传失败: {str(e)}", exc_info=True)
-        return {"ok": False, "error": f"文档生成失败: {str(e)}"}
+        logger.error("Document rendering failed: %s", type(e).__name__)
+        return {"ok": False, "generated": False, "uploaded": False,
+                "code": "document_generation_failed", "error": "文档生成失败，未提交上传；请检查文档内容和模板。"}
+
+    return await deliver_document(
+        access_token, dbsheet_file_id, upload_anchor_file_ids,
+        user_id=user_id, conversation_id=conv_id, file_name=file_name, file_data=file_data,
+        request_hash=request_hash,
+    )
 
 
 def _apply_document_template(doc: Document, structure: dict, doc_type: str, metadata: dict) -> None:

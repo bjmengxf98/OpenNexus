@@ -7,6 +7,7 @@ WPS 授权、微信绑定、记忆、提醒和驾驶舱数据。
 from __future__ import annotations
 
 import base64
+import asyncio
 import copy
 import inspect
 import os
@@ -27,6 +28,8 @@ from auth.wps_session import WpsConnectionError, ensure_access_token, request_co
 from agent import assistant as assistant_module
 from core.context_memory import sanitize_memory_content
 from core.memory_management import MEMORY_TOOL_NAMES, execute_memory_tool
+from core.read_diagnostics import (READ_DIAGNOSTIC_TOOLS, begin_read_observation,
+                                   finish_read_observation, build_read_diagnostics)
 from core.business_execution import document_upload_anchors, prepare_document_arguments
 from core.wechat_delivery import deliver_personal_weixin
 from core.tool_governance import (
@@ -131,7 +134,7 @@ async def _execute_special(name: str, args: dict, identity: dict) -> dict | None
     if name == "generate_document":
         anchors = document_upload_anchors(db.get_default_wps_file(user_id), db.list_wps_files(user_id))
         try:
-            prepared = prepare_document_arguments(args, anchors)
+            prepared = prepare_document_arguments(args, anchors, user_id=user_id)
         except ValueError as exc:
             return {"error": str(exc)}
         token = await _wps_access_token(user_id)
@@ -143,6 +146,8 @@ async def _execute_special(name: str, args: dict, identity: dict) -> dict | None
         if not content:
             return {"error": "该内容属于实时 WPS 配置，不写入长期记忆"}
         requested_scope = str(args.get("scope") or "global")
+        if requested_scope not in {"global", "current_topic", "current_table"}:
+            return {"error": "记忆范围无效，不能自动扩大为全局记忆"}
         if requested_scope == "current_table":
             file_id = str(args.get("file_id") or "")
             allowed = {str(item.get("file_id") or "") for item in db.list_wps_files(user_id)}
@@ -216,6 +221,7 @@ async def _execute_tool(name: str, arguments: dict) -> dict:
     hook_context = new_tool_context(identity, name, arguments)
     result: dict | None = None
     error_text = ""
+    observation = begin_read_observation()
     try:
         decision = await run_pre_tool_hooks(hook_context)
         if decision.action == "deny":
@@ -299,7 +305,7 @@ async def _execute_tool(name: str, arguments: dict) -> dict:
                 call = assistant_module.TOOL_MAP[name](token, arguments)
                 result = await call if inspect.isawaitable(call) else call
         elif name in assistant_module.TOOL_MAP:
-            local_without_wps = {"search_knowledge", "list_system_users", "send_wps_bot_message"}
+            local_without_wps = {"search_knowledge", "get_operation_guide", "list_system_users", "send_wps_bot_message"}
             token = "" if name in local_without_wps else await _wps_access_token(identity["user_id"])
             call = assistant_module.TOOL_MAP[name](token, arguments)
             result = await call if inspect.isawaitable(call) else call
@@ -309,14 +315,29 @@ async def _execute_tool(name: str, arguments: dict) -> dict:
         if not isinstance(result, dict):
             result = {"ok": True, "result": result}
         if result.get("error"):
+            # A recoverable business outcome must retain its reference and state
+            # for remote clients. Authorization/argument failures still raise.
+            if name == "generate_document" and result.get("generated") is True and result.get("document_id"):
+                error_text = str(result["error"])
+                return result
+            if (name in {"list_records", "analyze_records"} and isinstance(result.get("_record_scope"), dict)
+                    and not str(result.get("code") or "").startswith("invalid_")):
+                error_text = str(result["error"])
+                return {**result, "ok": False}
             raise ToolError(str(result["error"]))
         return result
+    except asyncio.CancelledError:
+        error_text = "执行被取消；如涉及远端提交，须核对实际结果，不能据此自动重放。"
+        raise
     except Exception as exc:
         error_text = str(exc)
         if isinstance(exc, ToolError):
             raise
         raise ToolError(error_text) from exc
     finally:
+        observed = finish_read_observation(observation)
+        if name in READ_DIAGNOSTIC_TOOLS:
+            hook_context.read_diagnostics = build_read_diagnostics(arguments, result, observed)
         await run_post_tool_hooks(hook_context, result, error_text)
 
 

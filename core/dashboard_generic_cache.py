@@ -8,10 +8,11 @@ from agent.wps_client import get_schema, list_records
 from auth import db
 from core.dashboard_cache import _SYNC_LOCKS, _sheet_id, _sheet_name, _token
 from core.dashboard_service import _schema_sheets
+from core.record_evidence import continuation, exhausted, record_counts, valid_page
 
 
 _SHEET_LIMIT = 5000
-GENERIC_CACHE_VERSION = 4
+GENERIC_CACHE_VERSION = 5
 
 
 def _sheet_type(sheet: dict) -> str:
@@ -34,12 +35,15 @@ async def _load_sheet(token: str, file_id: str, sheet: dict) -> dict:
     next_token: str | None = None
     total: int | None = None
     complete = False
+    seen_tokens = set()
     while len(records) < _SHEET_LIMIT:
         response = await list_records(
             token, file_id, _sheet_id(sheet), page_size=1000, max_records=1000,
             page_token=next_token,
         )
-        page = response.get("records") or []
+        if not valid_page(response):
+            raise RuntimeError("工作表未返回有效记录页，不覆盖原驾驶舱缓存")
+        page = response["records"]
         records.extend(page)
         raw_total = response.get("total")
         if raw_total is not None:
@@ -47,12 +51,13 @@ async def _load_sheet(token: str, file_id: str, sheet: dict) -> dict:
                 total = int(raw_total)
             except (TypeError, ValueError):
                 pass
-        if not response.get("has_more"):
+        if exhausted(response):
             complete = True
             break
-        following = response.get("next_page_token")
-        if not following or following == next_token or not page:
+        following = continuation(response)
+        if not following or following in seen_tokens:
             break
+        seen_tokens.add(following)
         next_token = following
     schema_count = sheet.get("records_count")
     if schema_count is not None:
@@ -65,7 +70,9 @@ async def _load_sheet(token: str, file_id: str, sheet: dict) -> dict:
             pass
     if total is not None and total > len(records):
         complete = False
-    return {"records": records[:_SHEET_LIMIT], "total": total, "complete": complete}
+    complete = complete and len(records) <= _SHEET_LIMIT
+    counts = record_counts(records, complete=complete, reported_total=total)
+    return {"records": records[:_SHEET_LIMIT], "total": counts["total"], "complete": complete}
 
 
 async def sync_generic_dashboard_cache(user_id: int, file_id: str) -> dict:

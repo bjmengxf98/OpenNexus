@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from auth import db
+from core.read_diagnostics import AUDIT_DIAGNOSTIC_KEY, public_read_diagnostics
 
 
 APPROVAL_ARGUMENT = "approval_id"
@@ -37,7 +38,7 @@ _VALID_SCOPES = {item["id"] for item in MCP_SCOPE_DEFINITIONS}
 _READ_TOOLS = {
     "get_current_user", "list_wps_files", "get_schema", "list_records",
     "list_dashboards", "get_form_meta", "list_form_fields", "get_parent_status",
-    "list_children", "list_hooks", "search_knowledge", "get_change_log",
+    "list_children", "list_hooks", "search_knowledge", "get_operation_guide", "get_change_log",
     "list_wps_contacts", "list_system_users", "sheets_list_worksheets",
     "sheets_get_range", "sheets_find_range", "get_dashboard",
     "list_dashboard_dates", "get_mcp_audit_log", "analyze_records",
@@ -126,6 +127,7 @@ class ToolHookContext:
     started_at: float = field(default_factory=time.perf_counter)
     decision: ToolDecision = field(default_factory=ToolDecision)
     approval_id: str = ""
+    read_diagnostics: dict[str, Any] | None = None
 
 
 PreToolHook = Callable[[ToolHookContext], ToolDecision | None | Awaitable[ToolDecision | None]]
@@ -365,9 +367,14 @@ def _audit_hook(context: ToolHookContext, result: dict[str, Any] | None, error: 
     audit_error = error
     if not audit_error and isinstance(result, dict) and result.get("ok") is False:
         audit_error = str(result.get("message") or result.get("code") or "工具未执行")
+    audit_arguments = json.loads(redacted_arguments(context.arguments))
+    audit_arguments.pop(AUDIT_DIAGNOSTIC_KEY, None)
+    diagnostics = public_read_diagnostics(context.read_diagnostics)
+    if diagnostics:
+        audit_arguments[AUDIT_DIAGNOSTIC_KEY] = diagnostics
     db.add_mcp_audit_log(
         int(context.identity["user_id"]), context.identity.get("id"), context.tool_name,
-        redacted_arguments(context.arguments), success, audit_error, duration_ms,
+        json.dumps(audit_arguments, ensure_ascii=False, sort_keys=True), success, audit_error, duration_ms,
         risk=context.policy.risk, decision=decision,
         approval_id=context.approval_id,
         required_scope=",".join(context.policy.required_scopes or (context.policy.required_scope,)),

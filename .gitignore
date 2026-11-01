@@ -91,3 +91,10 @@ qrcode.png
 /test_upload_debug.py
 /test_wps.py
 /test_wps_api.py
+
+# Private stable-line validation captures and disposable databases
+/tmp/current_goal_repair_20261031/
+/tmp/evidence_contracts_20261031/
+/tmp/statistics_subtotals_20261031/
+/tmp/memory_provenance_20261031/
+/tmp/read_diagnostics_20261101/

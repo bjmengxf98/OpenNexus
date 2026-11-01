@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+from core.record_evidence import continuation, exhausted, valid_page
 from typing import Callable
 
 from agent.record_analyzer import invalidate_record_cache
@@ -24,14 +25,16 @@ def document_upload_anchors(default_file: dict | None, files: list | None) -> li
     ))
 
 
-def prepare_document_arguments(arguments: dict, anchors: list[str]) -> dict:
+def prepare_document_arguments(arguments: dict, anchors: list[str], *, user_id: int = 0,
+                               conversation_id: int = 0) -> dict:
     if not anchors:
         raise ValueError(
             "当前用户尚未配置可用于定位本人 WPS 网盘的文件，"
             "请先在设置中添加一个由本人创建的 WPS 文件。"
         )
     return {**arguments, "dbsheet_file_id": anchors[0],
-            "_upload_anchor_file_ids": list(anchors)}
+            "_upload_anchor_file_ids": list(anchors), "_document_user_id": user_id,
+            "_document_conversation_id": conversation_id}
 
 
 def _record_id(record: dict) -> str:
@@ -79,19 +82,19 @@ async def _read_targets(read: Callable, token: str, arguments: dict,
     for page_number in range(1, _VERIFY_MAX_PAGES + 1):
         page = await read(token, arguments["file_id"], arguments["sheet_id"],
                           page_size=1000, page_token=page_token, fields=fields or None)
-        if (not isinstance(page, dict) or page.get("error") or page.get("ok") is False
-                or page.get("code", 0) not in (0, "0")
-                or not isinstance(page.get("records"), list)):
+        if not valid_page(page):
             raise ValueError("写后读取没有返回有效记录页")
         for record in page["records"]:
             if not isinstance(record, dict) or not _record_id(record):
                 raise ValueError("写后读取缺少记录身份，不能据此判断目标是否存在")
             if target_ids is None or _record_id(record) in target_ids:
                 found[_record_id(record)] = record
-        complete = not page.get("has_more") and page.get("is_complete") is not False
+        # This function follows one fixed query from its head; an exhausted
+        # tail closes that chain even though that single tail is not all rows.
+        complete = exhausted(page)
         if complete or (target_ids is not None and len(found) == len(target_ids)):
             return found, complete, page_number
-        next_token = page.get("next_page_token")
+        next_token = continuation(page)
         if not next_token or str(next_token) in seen_tokens:
             return found, False, page_number
         page_token = str(next_token)

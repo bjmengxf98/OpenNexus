@@ -704,6 +704,48 @@ def save_wps_connection_state(user_id: int, previous: dict, state: dict) -> bool
     return True
 
 
+def record_wps_refresh_event(user_id: int, previous: dict, event: dict) -> bool:
+    """Keep bounded, private renewal evidence without retaining response text or tokens."""
+    enums = {
+        "status": {"connected", "reauth_required", "temporary_error", "configuration_error"},
+        "reason": {"refresh_succeeded", "refresh_rejected", "refresh_failed"},
+        "trigger": {"business_401", "forced", "legacy_state", "state_recheck",
+                    "near_expiry", "expired_or_missing_access"},
+        "error_type": {"http_error", "timeout", "network_error", "invalid_reply", "unexpected_error"},
+        "oauth_error": {"invalid_grant", "invalid_refresh_token", "invalid_client",
+                        "unauthorized_client", "invalid_scope", "temporarily_unavailable", "server_error"},
+    }
+    safe = {key: value for key, value in event.items()
+            if key in enums and isinstance(value, str) and value in enums[key]}
+    for key, upper in (("wps_code", 999999999), ("http_status", 599)):
+        value = event.get(key)
+        if type(value) is int and (100 if key == "http_status" else 0) <= value <= upper:
+            safe[key] = value
+    safe["at"] = datetime.now(timezone.utc).isoformat()
+    key = f"wps_refresh_events:{int(user_id)}"
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT access_token, refresh_token FROM wps_tokens WHERE user_id=?", (user_id,),
+        ).fetchone()
+        if not row or any((row[field] or "") != (previous.get(field) or "")
+                          for field in ("access_token", "refresh_token")):
+            return False
+        stored = conn.execute("SELECT value FROM system_config WHERE key=?", (key,)).fetchone()
+        try:
+            events = json.loads(stored["value"]) if stored else []
+        except (TypeError, ValueError):
+            events = []
+        if not isinstance(events, list):
+            events = []
+        conn.execute(
+            "INSERT INTO system_config(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, json.dumps((events + [safe])[-20:])),
+        )
+    return True
+
+
 def list_users_for_ai() -> list:
     """返回所有启用用户及其 WPS open_id，供 AI 填写 Contact 字段使用"""
     with get_conn() as conn:
@@ -1809,6 +1851,14 @@ def save_user_memory(user_id: int, memory_text: str):
         """, (user_id, memory_text))
 
 
+def _verify_memory_write(conn, user_id, item_id, content, source_type, source_id):
+    stored = conn.execute("SELECT content,source_type,source_id,status FROM memory_items WHERE user_id=? AND id=?",
+                          (user_id, item_id)).fetchone()
+    if (not stored or stored["content"] != content or stored["source_type"] != source_type
+            or stored["source_id"] != source_id or stored["status"] != "active"):
+        raise RuntimeError("记忆内容及来源保存核验失败")
+
+
 def save_memory_item(user_id: int, content: str, *, scope_type: str = "global",
                      scope_id: str = "", category: str = "general",
                      source_type: str = "explicit", source_id: str = "",
@@ -1821,6 +1871,7 @@ def save_memory_item(user_id: int, content: str, *, scope_type: str = "global",
     allowed_scopes = {"global", "conversation", "file", "contact", "workspace"}
     scope_type = scope_type if scope_type in allowed_scopes else "global"
     scope_id = str(scope_id or "")
+    source_id = str(source_id or "")
     content = str(content or "").strip()
     if not content:
         return 0
@@ -1831,6 +1882,17 @@ def save_memory_item(user_id: int, content: str, *, scope_type: str = "global",
 
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        origin_conversation = (source_id.removeprefix("conversation:") if source_id.startswith("conversation:")
+                               else source_id if source_type == "conversation_summary" else None)
+        if origin_conversation is not None:
+            conv_id = origin_conversation
+            available = conv_id.isdigit() and conn.execute(
+                "SELECT 1 FROM conversations WHERE user_id=? AND id=?", (user_id, int(conv_id)),
+            ).fetchone()
+            if not available:
+                if source_type in {"explicit", "mcp_explicit"}:
+                    raise ValueError("记忆来源话题不存在或不属于当前用户")
+                return 0  # A late background result must not recreate a deleted source.
         forgotten_rows = conn.execute(
             "SELECT id, content FROM memory_items WHERE user_id=? AND status='deleted'", (user_id,)
         ).fetchall()
@@ -1842,13 +1904,27 @@ def save_memory_item(user_id: int, content: str, *, scope_type: str = "global",
                              [(item_id, user_id) for item_id in restored_ids])
         elif memory_matches_forgotten(content, [row["content"] for row in forgotten_rows]):
             return 0
+        if source_type not in {"explicit", "mcp_explicit"}:
+            confirmed = conn.execute(
+                "SELECT id FROM memory_items WHERE user_id=? AND scope_type=? AND scope_id=? "
+                "AND content=? AND status='active' AND source_type IN ('explicit','mcp_explicit') LIMIT 1",
+                (user_id, scope_type, scope_id, content),
+            ).fetchone()
+            if confirmed:
+                return int(confirmed["id"])
         row = None
         if replace_source and source_type and source_id:
             row = conn.execute(
-                "SELECT id FROM memory_items WHERE user_id=? AND scope_type=? AND scope_id=? "
+                "SELECT id, content FROM memory_items WHERE user_id=? AND scope_type=? AND scope_id=? "
                 "AND source_type=? AND source_id=? AND status='active' LIMIT 1",
                 (user_id, scope_type, scope_id, source_type, str(source_id)),
             ).fetchone()
+            if row:
+                if row["content"] == content:
+                    return int(row["id"])
+                conn.execute("UPDATE memory_items SET status='superseded', updated_at=datetime('now') "
+                             "WHERE user_id=? AND id=?", (user_id, row["id"]))
+                row = None
         if not row:
             row = conn.execute(
                 "SELECT id FROM memory_items WHERE user_id=? AND scope_type=? AND scope_id=? "
@@ -1861,6 +1937,7 @@ def save_memory_item(user_id: int, content: str, *, scope_type: str = "global",
                 "confidence=?, status='active', updated_at=datetime('now') WHERE id=?",
                 (content, category, source_type, str(source_id or ""), confidence, row["id"]),
             )
+            _verify_memory_write(conn, user_id, row["id"], content, source_type, source_id)
             return int(row["id"])
         cur = conn.execute(
             "INSERT INTO memory_items "
@@ -1869,7 +1946,19 @@ def save_memory_item(user_id: int, content: str, *, scope_type: str = "global",
             (user_id, scope_type, scope_id, category, content,
              source_type, str(source_id or ""), confidence),
         )
-        return int(cur.lastrowid)
+        saved_id = int(cur.lastrowid)
+        _verify_memory_write(conn, user_id, saved_id, content, source_type, source_id)
+        if replace_source and source_type == "conversation_summary":
+            # Keep two prior derived versions. Never prune deletion guards or
+            # explicitly saved entries as a side effect of summary renewal.
+            history = conn.execute(
+                "SELECT id FROM memory_items WHERE user_id=? AND scope_type=? AND scope_id=? "
+                "AND source_type=? AND source_id=? AND status='superseded' ORDER BY id DESC",
+                (user_id, scope_type, scope_id, source_type, source_id),
+            ).fetchall()
+            conn.executemany("DELETE FROM memory_items WHERE user_id=? AND id=? AND status='superseded'",
+                             [(user_id, row["id"]) for row in history[2:]])
+        return saved_id
 
 
 def list_memory_items(user_id: int, *, scope_type: str | None = None,
@@ -1900,31 +1989,63 @@ def list_memory_items(user_id: int, *, scope_type: str | None = None,
                 or not memory_matches_forgotten(row["content"], forgotten)]
 
 
+def _memory_provenance(conn, user_id: int, item: dict) -> dict:
+    """Describe known origins and direct revision links without inventing evidence."""
+    source = str(item.get("source_id") or "")
+    available = None
+    conv_id = source.removeprefix("conversation:") if source.startswith("conversation:") else ""
+    if item.get("source_type") == "conversation_summary" and source.isdigit():
+        conv_id = source  # Original summary-source format remains compatible.
+    if conv_id.isdigit():
+        available = bool(conn.execute("SELECT 1 FROM conversations WHERE user_id=? AND id=?",
+                                      (user_id, int(conv_id))).fetchone())
+    replaces = source if source.startswith(("memory:", "legacy:")) else None
+    ref = item["memory_id"]
+    successors = conn.execute("SELECT id,content FROM memory_items WHERE user_id=? AND source_id=? "
+                              "ORDER BY id LIMIT 20", (user_id, ref)).fetchall()
+    if item.get("status") == "superseded" and item.get("source_type") == "conversation_summary":
+        successors = conn.execute(
+            "SELECT id,content FROM memory_items WHERE user_id=? AND scope_type=? AND scope_id=? "
+            "AND source_type=? AND source_id=? AND id>? ORDER BY id LIMIT 1",
+            (user_id, item["scope_type"], item["scope_id"], item["source_type"], source, item["id"]),
+        ).fetchall()
+    return {"source_available": available, "replaces": replaces,
+            "replaced_by": [f"memory:{r['id']}:{_memory_digest(r['content'])}" for r in successors]}
+
+
 def list_manageable_memories(user_id: int, *, query: str = "", offset: int = 0,
-                            limit: int = 30) -> dict:
+                            limit: int = 30, include_inactive: bool = False) -> dict:
     """Owner-scoped, versioned references, including legacy-only entries."""
     offset, limit = max(0, int(offset)), max(1, min(int(limit), 100))
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT id, content, scope_type, scope_id, source_type FROM memory_items "
-            "WHERE user_id=? AND status='active' AND instr(lower(content), lower(?))>0 ORDER BY id",
-            (user_id, query),
+            "SELECT id, content, scope_type, scope_id, category, source_type, source_id, confidence, "
+            "status, created_at, updated_at FROM memory_items "
+            "WHERE user_id=? AND (status='active' OR ?) AND instr(lower(content), lower(?))>0 ORDER BY id",
+            (user_id, bool(include_inactive), query),
         ).fetchall()
         forgotten = _forgotten_memory(conn, user_id)
-        rows = [row for row in rows if row["source_type"] in {"explicit", "mcp_explicit"}
+        rows = [row for row in rows if (include_inactive and row["status"] != "active")
+                or row["source_type"] in {"explicit", "mcp_explicit"}
                 or not memory_matches_forgotten(row["content"], forgotten)]
         items = [{**dict(row), "memory_id": f"memory:{row['id']}:{_memory_digest(row['content'])}"}
                  for row in rows]
         legacy = conn.execute("SELECT memory_text FROM user_memory WHERE user_id=?", (user_id,)).fetchone()
-        global_keys = {_memory_digest(row["content"]) for row in rows if row["scope_type"] == "global"}
+        global_keys = {_memory_digest(row["content"]) for row in rows
+                       if row["scope_type"] == "global" and row["status"] == "active"}
         for content in _legacy_memory_blocks(_filter_legacy_memory(legacy["memory_text"] if legacy else "", forgotten)):
             key = _memory_digest(content)
             if query.casefold() in content.casefold() and key not in global_keys:
                 items.append({"memory_id": f"legacy:{key}", "content": content,
-                              "scope_type": "global", "scope_id": "", "source_type": "legacy"})
+                              "scope_type": "global", "scope_id": "", "source_type": "legacy",
+                              "source_id": "", "status": "active", "created_at": None,
+                              "updated_at": None, "confidence": None})
                 global_keys.add(key)
         page = items[offset:offset + limit]
+        page = [{**item, **_memory_provenance(conn, user_id, item)} for item in page]
         return {"ok": True, "memories": page, "total": len(items),
+                "timestamp_timezone": "UTC",
+                "_note": "仅本人记忆；摘要最多保留两份旧版本，不代表完整审计历史。删除防恢复标记不自动清理。",
                 "next_offset": offset + len(page) if offset + len(page) < len(items) else None}
 
 
@@ -1978,9 +2099,9 @@ def change_user_memory(user_id: int, memory_id: str, *, replacement: str | None 
                 if _memory_digest(row["content"]) == _memory_digest(replacement):
                     conn.execute("UPDATE memory_items SET status='superseded' WHERE user_id=? AND id=?",
                                  (user_id, row["id"]))
-            cur = conn.execute("INSERT INTO memory_items (user_id, content, scope_type, scope_id, category, source_type) "
-                               "VALUES (?,?,?,?,'explicit','explicit')",
-                               (user_id, replacement, target["scope_type"], target["scope_id"]))
+            cur = conn.execute("INSERT INTO memory_items (user_id, content, scope_type, scope_id, category, source_type, source_id) "
+                               "VALUES (?,?,?,?,'explicit','explicit',?)",
+                               (user_id, replacement, target["scope_type"], target["scope_id"], memory_id))
             new_id = f"memory:{cur.lastrowid}:{_memory_digest(replacement)}"
             if target["scope_type"] == "global" and all(_memory_digest(block) != _memory_digest(replacement) for block in kept):
                 kept.append(replacement)
@@ -1993,6 +2114,13 @@ def change_user_memory(user_id: int, memory_id: str, *, replacement: str | None 
             raise RuntimeError("旧记忆删除核验失败")
         if replacement is not None and not any(row["content"] == replacement for row in remaining):
             raise RuntimeError("新记忆保存核验失败")
+        if replacement is not None:
+            stored_new = conn.execute("SELECT content,source_id,status,scope_type,scope_id FROM memory_items "
+                                      "WHERE user_id=? AND id=?", (user_id, cur.lastrowid)).fetchone()
+            if (not stored_new or stored_new["content"] != replacement or stored_new["source_id"] != memory_id
+                    or stored_new["status"] != "active" or stored_new["scope_type"] != target["scope_type"]
+                    or stored_new["scope_id"] != target["scope_id"]):
+                raise RuntimeError("新记忆来源及替换关系核验失败")
         stored_legacy = conn.execute("SELECT memory_text FROM user_memory WHERE user_id=?", (user_id,)).fetchone()
         stored_blocks = _legacy_memory_blocks(stored_legacy["memory_text"] if stored_legacy else "")
         if any(_memory_digest(block) == key for block in stored_blocks):
@@ -2822,9 +2950,21 @@ def add_mcp_audit_log(
 def list_mcp_audit_log(user_id: int, limit: int = 100) -> list[dict]:
     with get_conn() as conn:
         rows = conn.execute(
-            """SELECT id, token_id, tool_name, success, error, duration_ms, risk,
+            """SELECT id, token_id, tool_name, success, error, duration_ms, risk, arguments,
                       decision, approval_id, required_scope, created_at
                FROM mcp_audit_log WHERE user_id=? ORDER BY id DESC LIMIT ?""",
             (user_id, max(1, min(int(limit), 500))),
         ).fetchall()
-    return [dict(row) for row in rows]
+    from core.read_diagnostics import AUDIT_DIAGNOSTIC_KEY, public_read_diagnostics
+    result = []
+    for row in rows:
+        item = dict(row)
+        raw = item.pop("arguments", "")
+        try:
+            diagnostics = public_read_diagnostics(json.loads(raw).get(AUDIT_DIAGNOSTIC_KEY))
+            if diagnostics:
+                item["read_diagnostics"] = diagnostics
+        except (TypeError, ValueError, AttributeError):
+            pass  # Old or truncated audit JSON has no known diagnostics.
+        result.append(item)
+    return result
