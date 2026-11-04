@@ -521,10 +521,78 @@ async def update_fields(access_token: str, file_id: str, sheet_id: int,
 
 async def delete_fields(access_token: str, file_id: str, sheet_id: int,
                         field_ids: list) -> dict:
-    result = await _post(access_token,
-                         f"/v7/coop/dbsheet/{file_id}/sheets/{sheet_id}/fields/delete",
-                         {"field_ids": field_ids})
-    return result.get("data", result)
+    """Submit once using WPS's `fields` body, then verify against fresh schema."""
+    if (not isinstance(field_ids, list) or not field_ids
+            or any(not isinstance(fid, str) or not fid.strip() for fid in field_ids)
+            or len(set(field_ids)) != len(field_ids)):
+        return {"ok": False, "verified": False, "write_submitted": False,
+                "error": "field_ids 必须是非空且不重复的字段ID数组；请先读取结构取得实际ID。"}
+    from agent.record_analyzer import invalidate_record_cache
+
+    state = {"ok": False, "verified": False, "write_submitted": True,
+             "deleted_ids": [], "verification": {"status": "unknown"},
+             "message": "删除尚未确认；请读取目标工作表结构核对，不要自动重复删除或改用字段名。"}
+    try:
+        result = await _post(access_token,
+                             f"/v7/coop/dbsheet/{file_id}/sheets/{sheet_id}/fields/delete",
+                             {"fields": list(field_ids)}, signed=True)
+    except Exception as exc:
+        return {**state, "write_submitted": None,
+                "verification": {"status": "submission_unknown", "error_type": type(exc).__name__}}
+    finally:
+        # Even a timeout can follow a committed remote mutation.
+        invalidate_record_cache(file_id, sheet_id)
+
+    if not isinstance(result, dict) or result.get("code") not in (0, "0"):
+        code = result.get("code") if isinstance(result, dict) else None
+        return {**state, "error": f"WPS 删除字段接口未返回成功回执（code={code}）；请核对原始错误。",
+                "detail": result}
+    data = result.get("data")
+    data = data if isinstance(data, dict) else {}
+    items = data.get("fields")
+    items = items if isinstance(items, list) else []
+    acknowledged = []
+    for fid in field_ids:
+        matches = [item for item in items if isinstance(item, dict) and item.get("id") == fid]
+        if len(matches) == 1 and matches[0].get("deleted") is True:
+            acknowledged.append(fid)
+    state = {**data, **state, "api_deleted_ids": acknowledged}
+    try:
+        remaining = _schema_field_ids(await get_schema(access_token, file_id), sheet_id)
+    except Exception as exc:
+        return {**state, "verification": {"status": "unknown", "error_type": type(exc).__name__}}
+    # Neither an empty response nor a missing/invalid schema is proof of deletion.
+    deleted = [fid for fid in acknowledged if fid not in remaining]
+    verified = len(deleted) == len(field_ids)
+    return {**state, "ok": verified, "verified": verified, "deleted_ids": deleted,
+            "verification": {"status": "verified" if verified else "partial" if deleted else "unverified",
+                             "remaining_ids": [fid for fid in field_ids if fid in remaining],
+                             "unconfirmed_ids": [fid for fid in field_ids if fid not in deleted]},
+            "message": "目标字段已逐项收到删除回执，并已回读结构确认不存在。" if verified else state["message"]}
+
+
+def _schema_field_ids(schema: dict, sheet_id: int) -> set[str]:
+    """Only an explicit, complete field list for this sheet can prove absence."""
+    if (not isinstance(schema, dict) or schema.get("error") or schema.get("ok") is False
+            or schema.get("code", 0) not in (0, "0")
+            or schema.get("has_more") or schema.get("is_complete") is False):
+        raise ValueError("Invalid schema")
+    sheets = schema.get("sheets")
+    if not isinstance(sheets, list):
+        raise ValueError("Missing sheets")
+    matches = [s for s in sheets if isinstance(s, dict)
+               and str(s.get("id", s.get("sheet_id"))) == str(sheet_id)]
+    if len(matches) != 1:
+        raise ValueError("Missing or ambiguous target sheet")
+    sheet = matches[0]
+    fields = sheet.get("fields")
+    if (not isinstance(fields, list) or sheet.get("has_more") or sheet.get("is_complete") is False
+            or any(not isinstance(f, dict) or not isinstance(f.get("id"), str) or not f["id"] for f in fields)):
+        raise ValueError("Missing or incomplete fields")
+    ids = {f["id"] for f in fields}
+    if len(ids) != len(fields):
+        raise ValueError("Ambiguous field identities")
+    return ids
 
 
 # ── 视图（需要 KSO-1 签名）─────────────────────────────────
