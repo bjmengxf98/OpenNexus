@@ -1609,6 +1609,17 @@ def delete_knowledge(kid: int):
         conn.execute("DELETE FROM org_knowledge WHERE id=?", (kid,))
 
 
+def get_enabled_knowledge(knowledge_id: int) -> dict | None:
+    """Read one shared knowledge document; disabled/deleted entries stay unavailable."""
+    from contextlib import closing
+    with closing(get_conn()) as conn:
+        row = conn.execute(
+            "SELECT id, title, content, file_name FROM org_knowledge WHERE id=? AND is_enabled=1",
+            (knowledge_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
 def search_knowledge(query: str, limit: int = 5) -> list:
     """简单关键词搜索，返回最多 limit 条匹配的知识条目（仅已启用）"""
     if not query or not query.strip():
