@@ -870,6 +870,7 @@ def _compact_tool_receipt(content: Any) -> str:
         "next_row_offset", "continuation_error", "_note", "_completeness",
         "_record_window", "_record_field", "_cached_analysis",
         "_record_receipt",
+        "_knowledge_read",
         "_record_scope", "_analysis_scope", "_analysis_window", "total_is_known", "total_basis",
         "_statistics_scope",
         "filter_unknown_records", "matched_records_is_exact", "source_total", "source_total_is_known",
@@ -884,6 +885,8 @@ def _compact_tool_receipt(content: Any) -> str:
         "有 _record_window 时可调用 read_record_window；不要将窗口或摘要当成完整数据。"
     )
     _retain_statistics_in_receipt(receipt, data)
+    if data.get("_knowledge_read"):
+        receipt["_instruction"] += " 知识原文可用search_knowledge按_knowledge_read参数恢复当前原文页或开始全文读取；片段与尾页不代表整篇已读。"
     return json.dumps(receipt, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
